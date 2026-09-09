@@ -1,0 +1,79 @@
+healthCheckTimeout: 300
+logRequests: true
+startPort: 10001
+globalTTL: 0
+unloadTimeout: 30
+
+models:
+
+  embedding:
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: |
+      docker run --name ${MODEL_ID} --init --rm \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -p ${PORT}:8080 \
+        -v /mnt/nvme/models:/models \
+        ghcr.io/ggml-org/llama.cpp:server-cuda \
+        -m /models/embedding.gguf \
+        --host 0.0.0.0 --port 8080
+    cmdStop: docker stop ${MODEL_ID}
+    checkEndpoint: /health
+
+  reranker:
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: |
+      docker run --name ${MODEL_ID} --init --rm \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -p ${PORT}:8080 \
+        -v /mnt/nvme/models:/models \
+        ghcr.io/ggml-org/llama.cpp:server-cuda \
+        -m /models/reranker.gguf \
+        --host 0.0.0.0 --port 8080
+    cmdStop: docker stop ${MODEL_ID}
+    checkEndpoint: /health
+
+  qwen-small:
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: |
+      docker run --name ${MODEL_ID} --init --rm \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -p ${PORT}:8080 \
+        -v /mnt/nvme/models:/models \
+        ghcr.io/ggml-org/llama.cpp:server-cuda \
+        -m /models/qwen-small.gguf \
+        --host 0.0.0.0 --port 8080 \
+        --ctx-size 16384 --n-gpu-layers 99 --jinja
+    cmdStop: docker stop ${MODEL_ID}
+    checkEndpoint: /health
+
+  qwen-large:
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: |
+      docker run --name ${MODEL_ID} --init --rm \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -p ${PORT}:8080 \
+        -v /mnt/nvme/models:/models \
+        ghcr.io/ggml-org/llama.cpp:server-cuda \
+        -m /models/qwen-large.gguf \
+        --host 0.0.0.0 --port 8080 \
+        --ctx-size 32768 --n-gpu-layers 99 --jinja
+    cmdStop: docker stop ${MODEL_ID}
+    checkEndpoint: /health
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        all-managed:
+          swap: false
+          exclusive: false
+          members:
+            - embedding
+            - reranker
+            - qwen-small
+            - qwen-large

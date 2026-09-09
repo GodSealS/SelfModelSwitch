@@ -1,0 +1,71 @@
+server:
+  host: 127.0.0.1
+  port: 8090
+
+llama_swap:
+  base_url: http://127.0.0.1:8080
+  timeout_seconds: 30
+  load_timeout_seconds: 900
+
+scheduler:
+  poll_interval_seconds: 2
+  resource_safety_margin: 0.15
+  min_free_memory_bytes: 2147483648   # 2 GiB hard floor
+  max_evictions_per_request: 8
+  request_queue_timeout_seconds: 1800
+  heat:
+    half_life_seconds: 1800
+    request_weight: 1.0
+    token_weight: 0.0001
+    active_bonus: 2.0
+  thrash:
+    switch_window_seconds: 10
+    max_switches_in_window: 3
+    cooldown_seconds: 15
+
+resources:
+  # For AGX Thor, unified memory is the primary scheduling resource.
+  # "auto" tries tegrastats first, then psutil. nvidia-smi is used when available.
+  provider: auto
+  total_memory_bytes: 0   # 0 = detect automatically
+
+models:
+  embedding:
+    memory:
+      reserved_bytes: 4294967296       # 4 GiB
+    scheduling:
+      priority: 100
+      evictable: false
+      pinned: true
+    lifecycle:
+      ttl_seconds: 0
+
+  reranker:
+    memory:
+      reserved_bytes: 6442450944       # 6 GiB
+    scheduling:
+      priority: 80
+      evictable: true
+      pinned: false
+    lifecycle:
+      ttl_seconds: 900
+
+  qwen-small:
+    memory:
+      reserved_bytes: 10737418240      # 10 GiB
+    scheduling:
+      priority: 50
+      evictable: true
+      pinned: false
+    lifecycle:
+      ttl_seconds: 900
+
+  qwen-large:
+    memory:
+      reserved_bytes: 32212254720      # 30 GiB
+    scheduling:
+      priority: 40
+      evictable: true
+      pinned: false
+    lifecycle:
+      ttl_seconds: 1800
