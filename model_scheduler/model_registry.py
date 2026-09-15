@@ -166,6 +166,30 @@ class Book:
             result.append(Operation(runtime.operation_id, model_id, runtime.generation, self.epoch))
         return result
 
+    def freeze_for_switch(self, model_ids: list[str]) -> None:
+        """Prevent new leases while a cold target waits for these models to drain.
+
+        A freeze deliberately leaves existing leases intact.  It is an atomic
+        reservation of *admission*, rather than a stop request, so a switch
+        cannot strand an in-flight inference.
+        """
+        if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):
+            raise Conflict("invalid switch freeze")
+        for model_id in model_ids:
+            runtime, spec = self.runtime[model_id], self.specs[model_id]
+            if (runtime.state is not State.READY or runtime.admission_blocked
+                    or runtime.operation_id or spec.pinned or not spec.evictable):
+                raise Conflict("switch candidate changed")
+        for model_id in model_ids:
+            self.runtime[model_id].admission_blocked = True
+
+    def unfreeze_switch(self, model_ids: list[str]) -> None:
+        """Release a previously established switch intent without changing leases."""
+        for model_id in model_ids:
+            runtime = self.runtime[model_id]
+            if runtime.state is State.READY and runtime.operation_id is None:
+                runtime.admission_blocked = False
+
     def begin_cleanup(self, model_ids: list[str]) -> list[Operation]:
         """Stop idle READY or ERROR models during recovery or process shutdown."""
         if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):

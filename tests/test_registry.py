@@ -103,3 +103,17 @@ def test_ready_admission_requires_a_fresh_sample_and_free_floor() -> None:
     assert book.can_admit_ready("a", MemorySample(1_000, 20, 0), 1)
     assert not book.can_admit_ready("a", MemorySample(1_000, 19, 0), 1)
     assert not book.can_admit_ready("a", MemorySample(1_000, 900, -10), 1)
+
+
+def test_switch_freeze_blocks_new_leases_without_revoking_existing_lease() -> None:
+    book = make_book(concurrency=2)
+    load(book, "a")
+    active = book.acquire_ready("a", "active", 0)
+
+    book.freeze_for_switch(["a"])
+
+    assert active.lease_id in book.runtime["a"].leases
+    with pytest.raises(Conflict):
+        book.acquire_ready("a", "new", 1)
+    book.unfreeze_switch(["a"])
+    assert book.acquire_ready("a", "new", 1).model_id == "a"
