@@ -66,6 +66,21 @@ def test_manual_unload_does_not_return_success_without_stop_evidence() -> None:
     assert response.json()["error"]["code"] == "stop_unverified"
 
 
+def test_manual_unload_rejects_a_nonempty_body_before_scheduling() -> None:
+    class UnloadScheduler:
+        called = False
+
+        async def unload(self, model_id, deadline):
+            self.called = True
+
+    scheduler = UnloadScheduler()
+    with TestClient(create_app(scheduler=scheduler)) as client:
+        response = client.post("/api/models/qwen-small/unload", content=b'{"force":true}', headers={"content-type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert scheduler.called is False
+
+
 def test_explicit_recovery_uses_the_scheduler_storage_recovery_port() -> None:
     class RecoverableScheduler:
         called = False

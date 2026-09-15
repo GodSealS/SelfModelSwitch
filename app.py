@@ -110,6 +110,24 @@ async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float
     return payload
 
 
+async def _require_empty_body(request: Request, *, timeout_seconds: float) -> None:
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            declared_length = int(length)
+        except ValueError as exc:
+            raise BodyError(400, "invalid_content_length", "Content-Length is invalid") from exc
+        if declared_length != 0:
+            raise BodyError(400, "invalid_request", "Request body must be empty")
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            async for chunk in request.stream():
+                if chunk:
+                    raise BodyError(400, "invalid_request", "Request body must be empty")
+    except asyncio.TimeoutError as exc:
+        raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
+
+
 def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover."""
     if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
@@ -279,8 +297,12 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         return (await app.state.scheduler.status())["models"]
 
     @app.post("/api/models/{model_id}/unload")
-    async def unload(model_id: str):
+    async def unload(model_id: str, request: Request):
         request_id = str(uuid4())
+        try:
+            await _require_empty_body(request, timeout_seconds=config.server.body_timeout_seconds)
+        except BodyError as exc:
+            return _error(exc.status, exc.code, str(exc), request_id)
         if model_id not in config.models:
             return _error(404, "model_not_found", "Unknown model", request_id, "model")
         if app.state.scheduler is None:
