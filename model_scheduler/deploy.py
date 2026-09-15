@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import platform
 import re
+import subprocess
 import sys
 from typing import Any
 
@@ -154,16 +156,40 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[
     return {"ok": True, "deployment_id": manifest["deployment_id"], "models": sorted(config.models)}
 
 
+def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str, Any]:
+    """Record only read-only host facts; this command starts no models or services."""
+    destination = Path(output)
+    if destination.exists():
+        raise DeployError("facts output already exists")
+    command = runner or (lambda argv: subprocess.check_output(argv, text=True, timeout=10).strip())
+    try:
+        facts = {
+            "uname": command(["uname", "-a"]),
+            "python": platform.python_version(),
+            "docker": command(["docker", "version", "--format", "{{.Server.Version}}"]),
+            "storage": command(["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"]),
+            "jetpack_release": Path("/etc/nv_tegra_release").read_text(encoding="utf-8").strip() if Path("/etc/nv_tegra_release").is_file() else None,
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DeployError("cannot collect host facts") from exc
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return facts
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
     render_parser = sub.add_parser("render"); render_parser.add_argument("--input", required=True); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True)
     preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
+    collect_parser = sub.add_parser("collect"); collect_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
             render(args.input, args.mode, args.output)
-        else:
+        elif args.command == "preflight":
             print(json.dumps(preflight(args.manifest), sort_keys=True))
+        else:
+            print(json.dumps(collect_facts(args.output), sort_keys=True))
     except DeployError as exc: print(f"deployment error: {exc}", file=sys.stderr); return 78
     return 0
 

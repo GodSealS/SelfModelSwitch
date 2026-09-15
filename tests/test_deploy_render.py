@@ -5,7 +5,7 @@ import json
 import pytest
 
 from model_scheduler.config import load_config
-from model_scheduler.deploy import DeployError, preflight, render
+from model_scheduler.deploy import DeployError, collect_facts, preflight, render
 from model_scheduler.storage_monitor import StorageSnapshot
 
 
@@ -67,3 +67,13 @@ def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:
             return StorageSnapshot(True, None, 0, {})
     result = preflight(output / "manifest.json", storage=Storage())
     assert result["ok"] is True
+
+
+def test_collect_writes_read_only_device_facts_once(tmp_path) -> None:
+    output = tmp_path / "facts.json"
+    calls: list[list[str]] = []
+    facts = collect_facts(output, runner=lambda argv: calls.append(argv) or "value")
+    assert facts["uname"] == "value"
+    assert ["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"] in calls
+    with pytest.raises(DeployError, match="already exists"):
+        collect_facts(output, runner=lambda _: "value")
