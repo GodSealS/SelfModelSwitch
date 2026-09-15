@@ -35,6 +35,19 @@ class Recovery:
         return RecoveryResult(True, "complete", None, ("chat",))
 
 
+class ReclaimingResources:
+    def __init__(self): self.available = 110
+    async def snapshot(self): return MemorySample(1_000, self.available, asyncio.get_running_loop().time())
+
+
+class ReclaimingBackend:
+    def __init__(self, resources): self.resources = resources; self.stops: list[str] = []
+    async def load(self, operation, deadline): return Observation(Presence.RUNNING, operation.model_id, True, 0)
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id); self.resources.available = 1_000
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
 def book() -> Book:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
     result = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
@@ -117,3 +130,21 @@ async def test_scheduler_recovery_uses_injected_control_port() -> None:
     scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=Recovery())
     await scheduler.recover(asyncio.get_running_loop().time() + 1)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_cold_load_evicts_a_complete_idle_prefix_before_loading() -> None:
+    specs = {
+        "resident": ModelSpec("resident", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, priority=1),
+        "target": ModelSpec("target", "http://127.0.0.1:10002", frozenset({Capability.CHAT}), 100, priority=1),
+    }
+    registry = Book(specs, model_budget=150, free_floor=20, margin=0)
+    for model_id in specs: registry.bootstrap_stopped(model_id)
+    operation = registry.begin_load("resident", MemorySample(1_000, 1_000, 0), 0)
+    registry.loaded(operation, 0)
+    resources = ReclaimingResources(); backend = ReclaimingBackend(resources)
+    scheduler = ModelScheduler(registry, resources, backend)
+    lease = await scheduler.acquire("target", "target-request", asyncio.get_running_loop().time() + 1)
+    assert backend.stops == ["resident"]
+    assert registry.runtime["resident"].state.value == "unloaded"
+    assert lease.model_id == "target"

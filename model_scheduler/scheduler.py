@@ -5,6 +5,7 @@ import asyncio
 from time import monotonic
 
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
+from .eviction_policy import EvictionPolicy
 from .model_registry import Book, Conflict, StaleOperation
 
 
@@ -19,16 +20,18 @@ class ModelUnavailable(RuntimeError):
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, recovery: ControlRecoveryPort | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
         self.book = book
         self.resources = resources
         self.backend = backend
         self.recovery = recovery
         self.queue_capacity = queue_capacity
+        self.eviction_policy = EvictionPolicy(book, max_evictions=max_evictions)
         self._condition = asyncio.Condition()
         self._waiters: set[str] = set()
         self._waiter_models: dict[str, str] = {}
         self._loads: dict[str, asyncio.Task[None]] = {}
+        self._eviction: asyncio.Task[tuple[str, ...]] | None = None
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
         if model_id not in self.book.specs:
@@ -52,7 +55,8 @@ class ModelScheduler:
                         runtime = self.book.runtime[model_id]
                         if runtime.state.value == "error":
                             raise ModelUnavailable(runtime.last_error or "model_error")
-                        needs_sample = runtime.state.value == "unloaded" and model_id not in self._loads
+                        needs_sample = (runtime.state.value == "unloaded" and model_id not in self._loads
+                                        and self._eviction is None)
                     else:
                         return lease
                 if needs_sample:
@@ -63,8 +67,15 @@ class ModelScheduler:
                     async with self._condition:
                         runtime = self.book.runtime[model_id]
                         if runtime.state.value == "unloaded" and model_id not in self._loads:
-                            operation = self.book.begin_load(model_id, sample, monotonic())
-                            self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                            now = monotonic()
+                            if self.book.can_load(model_id, sample, now):
+                                operation = self.book.begin_load(model_id, sample, now)
+                                self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                            elif self._eviction is None:
+                                candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
+                                if candidates:
+                                    operations = self.book.begin_eviction([candidate.model_id for candidate in candidates])
+                                    self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
                         self._condition.notify_all()
                     continue
                 async with self._condition:
@@ -103,6 +114,44 @@ class ModelScheduler:
             async with self._condition:
                 self._loads.pop(operation.model_id, None)
                 self._condition.notify_all()
+
+    def _load_deficit(self, model_id: str, sample: MemorySample) -> int:
+        required = self.book.required(model_id)
+        return max(0, self.book.free_floor + required - sample.available_bytes,
+                   self.book.committed + required - self.book.model_budget)
+
+    async def _run_eviction(self, operations, deadline: float) -> tuple[str, ...]:
+        try:
+            return await self._finish_eviction(operations, deadline)
+        finally:
+            async with self._condition:
+                self._eviction = None
+                self._condition.notify_all()
+
+    async def _finish_eviction(self, operations, deadline: float) -> tuple[str, ...]:
+        stopped: list[str] = []
+        for index, operation in enumerate(operations):
+            try:
+                observation = await self.backend.stop(operation, deadline)
+            except asyncio.CancelledError:
+                async with self._condition:
+                    self.book.failed(operation, "stop_unverified")
+                    self._rollback_pending(operations[index + 1:])
+                    self._condition.notify_all()
+                raise
+            except Exception:
+                observation = None
+            async with self._condition:
+                if observation is not None and observation.presence is Presence.STOPPED:
+                    self.book.stopped(operation)
+                    stopped.append(operation.model_id)
+                else:
+                    self.book.failed(operation, observation.detail_code if observation else "stop_unverified")
+                    self._rollback_pending(operations[index + 1:])
+                    self._condition.notify_all()
+                    return tuple(stopped)
+                self._condition.notify_all()
+        return tuple(stopped)
 
     async def release(self, lease: Lease, outcome: Outcome, tokens: int | None = None) -> None:
         async with self._condition:
@@ -163,6 +212,8 @@ class ModelScheduler:
         """Stop due idle models, without allowing TTL to outrun queued demand."""
         now = monotonic()
         async with self._condition:
+            if self._eviction is not None:
+                return ()
             waiting_models = set(self._waiter_models.values())
             model_ids = [
                 model_id for model_id in self.book.specs
@@ -171,31 +222,10 @@ class ModelScheduler:
             if not model_ids:
                 return ()
             operations = self.book.begin_eviction(model_ids)
+            task = asyncio.create_task(self._run_eviction(operations, deadline))
+            self._eviction = task
             self._condition.notify_all()
-
-        stopped: list[str] = []
-        for index, operation in enumerate(operations):
-            try:
-                observation = await self.backend.stop(operation, deadline)
-            except asyncio.CancelledError:
-                async with self._condition:
-                    self.book.failed(operation, "stop_unverified")
-                    self._rollback_pending(operations[index + 1:])
-                    self._condition.notify_all()
-                raise
-            except Exception:
-                observation = None
-            async with self._condition:
-                if observation is not None and observation.presence is Presence.STOPPED:
-                    self.book.stopped(operation)
-                    stopped.append(operation.model_id)
-                else:
-                    self.book.failed(operation, observation.detail_code if observation else "stop_unverified")
-                    self._rollback_pending(operations[index + 1:])
-                    self._condition.notify_all()
-                    return tuple(stopped)
-                self._condition.notify_all()
-        return tuple(stopped)
+        return await task
 
     def _rollback_pending(self, operations) -> None:
         for operation in operations:
