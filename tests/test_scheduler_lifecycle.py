@@ -55,6 +55,13 @@ def book() -> Book:
     return result
 
 
+def two_model_book() -> Book:
+    specs = {model_id: ModelSpec(model_id, f"http://127.0.0.1:{10003 + index}", frozenset({Capability.CHAT}), 100) for index, model_id in enumerate(("first", "second"))}
+    result = Book(specs, model_budget=1_000, free_floor=20, margin=0)
+    for model_id in specs: result.bootstrap_stopped(model_id)
+    return result
+
+
 @pytest.mark.asyncio
 async def test_shared_load_grants_one_lease_without_holding_condition_for_io() -> None:
     backend = Backend()
@@ -82,6 +89,35 @@ async def test_waiter_capacity_is_bounded() -> None:
     backend.finish.set()
     lease = await first
     await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_is_removed_before_a_shared_load_finishes() -> None:
+    backend = Backend()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    waiting = asyncio.create_task(scheduler.acquire("chat", "cancelled", asyncio.get_running_loop().time() + 1))
+    await backend.started.wait()
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert scheduler._queue.size == 0
+    backend.finish.set()
+
+
+@pytest.mark.asyncio
+async def test_only_one_cold_load_runs_across_different_models() -> None:
+    backend = Backend()
+    scheduler = ModelScheduler(two_model_book(), Resources(), backend)
+    first = asyncio.create_task(scheduler.acquire("first", "first-request", asyncio.get_running_loop().time() + 1))
+    await backend.started.wait()
+    second = asyncio.create_task(scheduler.acquire("second", "second-request", asyncio.get_running_loop().time() + 1))
+    await asyncio.sleep(0)
+    assert backend.loads == 1
+    backend.finish.set()
+    first_lease, second_lease = await first, await second
+    assert backend.loads == 2
+    await scheduler.release(first_lease, Outcome.SUCCESS)
+    await scheduler.release(second_lease, Outcome.SUCCESS)
 
 
 @pytest.mark.asyncio
