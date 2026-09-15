@@ -56,6 +56,13 @@ class RecoveringReadyResources:
         return MemorySample(10_000, available, asyncio.get_running_loop().time())
 
 
+class RecoveringAdmissionGuard:
+    def __init__(self): self.calls = 0
+    async def __call__(self):
+        self.calls += 1
+        return self.calls > 1
+
+
 def book() -> Book:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
     result = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
@@ -240,3 +247,15 @@ async def test_ready_admission_waits_for_fresh_free_memory_sample() -> None:
     scheduler = ModelScheduler(registry, RecoveringReadyResources(), Backend(), poll_interval_seconds=0.001)
     lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
     assert lease.model_id == "chat"
+
+
+@pytest.mark.asyncio
+async def test_ready_admission_waits_for_storage_guard() -> None:
+    registry = book()
+    operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)
+    registry.loaded(operation, 0)
+    guard = RecoveringAdmissionGuard()
+    scheduler = ModelScheduler(registry, Resources(), Backend(), poll_interval_seconds=0.001, admission_guard=guard)
+    lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    assert lease.model_id == "chat"
+    assert guard.calls >= 2

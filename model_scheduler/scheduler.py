@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from time import monotonic
 
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
@@ -21,13 +22,14 @@ class ModelUnavailable(RuntimeError):
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None, admission_guard=None):
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
         self.book = book
         self.resources = resources
         self.backend = backend
         self.recovery = recovery
+        self.admission_guard = admission_guard
         self.queue_capacity = queue_capacity
         self.poll_interval_seconds = poll_interval_seconds
         self.eviction_policy = EvictionPolicy(book, max_evictions=max_evictions)
@@ -55,6 +57,7 @@ class ModelScheduler:
             while True:
                 snapshot = await self.resources.snapshot()
                 sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
+                admitted = await self._admission_allowed()
                 needs_sample = False
                 async with self._condition:
                     now = monotonic()
@@ -65,7 +68,7 @@ class ModelScheduler:
                         raise TimeoutError("queue deadline elapsed")
                     if self._queue.is_head(request_id, now):
                         try:
-                            if not self.book.can_admit_ready(model_id, sample, now):
+                            if not admitted or not self.book.can_admit_ready(model_id, sample, now):
                                 raise Conflict("ready admission blocked")
                             lease = self.book.acquire_ready(model_id, request_id, now)
                         except Conflict:
@@ -82,7 +85,7 @@ class ModelScheduler:
                     # re-check state before committing the operation below.
                     async with self._condition:
                         runtime = self.book.runtime[model_id]
-                        if runtime.state.value == "unloaded" and model_id not in self._loads:
+                        if admitted and runtime.state.value == "unloaded" and model_id not in self._loads:
                             now = monotonic()
                             if self.book.can_load(model_id, sample, now):
                                 operation = self.book.begin_load(model_id, sample, now)
@@ -130,6 +133,17 @@ class ModelScheduler:
             async with self._condition:
                 self._loads.pop(operation.model_id, None)
                 self._condition.notify_all()
+
+    async def _admission_allowed(self) -> bool:
+        if self.admission_guard is None:
+            return True
+        try:
+            value = self.admission_guard()
+            if inspect.isawaitable(value):
+                value = await value
+            return value is True
+        except Exception:
+            return False
 
     def _load_deficit(self, model_id: str, sample: MemorySample) -> int:
         required = self.book.required(model_id)
