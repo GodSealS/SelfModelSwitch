@@ -74,6 +74,8 @@ def test_collect_writes_read_only_device_facts_once(tmp_path) -> None:
     calls: list[list[str]] = []
     facts = collect_facts(output, runner=lambda argv: calls.append(argv) or "value")
     assert facts["uname"] == "value"
+    assert facts["llama_swap_version"] == "value"
+    assert facts["gpu_runtime"] == "value"
     assert ["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"] in calls
     with pytest.raises(DeployError, match="already exists"):
         collect_facts(output, runner=lambda _: "value")

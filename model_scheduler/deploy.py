@@ -168,6 +168,12 @@ def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str,
     if destination.exists():
         raise DeployError("facts output already exists")
     command = runner or (lambda argv: subprocess.check_output(argv, text=True, timeout=10).strip())
+    def optional(argv: list[str]) -> str | None:
+        try:
+            return command(argv)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
     try:
         facts = {
             "uname": command(["uname", "-a"]),
@@ -175,6 +181,8 @@ def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str,
             "docker": command(["docker", "version", "--format", "{{.Server.Version}}"]),
             "storage": command(["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"]),
             "jetpack_release": Path("/etc/nv_tegra_release").read_text(encoding="utf-8").strip() if Path("/etc/nv_tegra_release").is_file() else None,
+            "llama_swap_version": optional(["llama-swap", "--version"]),
+            "gpu_runtime": optional(["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"]),
         }
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployError("cannot collect host facts") from exc
