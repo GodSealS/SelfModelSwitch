@@ -5,8 +5,7 @@ from typing import List
 
 from .config import SchedulerConfig
 from .heat_tracker import HeatTracker
-from .model_registry import ModelRegistry
-from .models import ModelRuntime
+from .model_registry import Book
 
 
 @dataclass(frozen=True)
@@ -31,7 +30,7 @@ class EvictionPolicy:
     scheduler with a small model count this is predictable and fast.
     """
 
-    def __init__(self, registry: ModelRegistry, heat: HeatTracker, cfg: SchedulerConfig):
+    def __init__(self, registry: Book, heat: HeatTracker, cfg: SchedulerConfig):
         self.registry = registry
         self.heat = heat
         self.cfg = cfg

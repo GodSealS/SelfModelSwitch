@@ -9,7 +9,7 @@ from .config import SchedulerConfig
 from .eviction_policy import EvictionPolicy
 from .heat_tracker import HeatTracker
 from .llama_swap_client import LlamaSwapClient, LlamaSwapError
-from .model_registry import ModelRegistry
+from .model_registry import Book
 from .models import ModelState
 from .resource_monitor import ResourceMonitor
 
@@ -21,7 +21,7 @@ class ResourceError(RuntimeError):
 class ModelScheduler:
     def __init__(
         self,
-        registry: ModelRegistry,
+        registry: Book,
         resources: ResourceMonitor,
         heat: HeatTracker,
         eviction: EvictionPolicy,
