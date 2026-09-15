@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import hashlib
+import json
 from pathlib import Path
+import sys
+from types import ModuleType
 
 import pytest
 
@@ -10,6 +15,7 @@ from model_scheduler.contracts import MemorySample
 from model_scheduler.llama_swap_client import LlamaSwapControlContract
 from model_scheduler.runtime import RuntimeCompositionError, build_backend, build_scheduler
 from app import create_app
+from run import main
 
 
 
@@ -95,3 +101,59 @@ def test_runtime_backend_refuses_manifest_config_or_container_identity_mismatche
     manifest = _manifest(config, "c" * 64)
     with pytest.raises(RuntimeCompositionError, match="runtime manifest identity"):
         build_backend(config, manifest, digest, _control_contract())
+
+
+def test_process_entrypoint_refuses_to_start_without_the_t00_control_contract(monkeypatch, capsys) -> None:
+    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("uvicorn must not start without the control contract")
+
+    monkeypatch.setattr("run.uvicorn.run", should_not_run)
+    assert main(["--config", str(config_path)]) == 78
+    assert "fixed llama-swap control contract" in capsys.readouterr().err
+
+
+def test_process_entrypoint_rejects_a_configuration_changed_while_loading(monkeypatch, tmp_path, capsys) -> None:
+    source = Path(__file__).resolve().parent.parent / "config.yaml"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_bytes(source.read_bytes())
+    real_load = load_config
+
+    def changing_load(path):
+        result = real_load(path)
+        config_path.write_bytes(config_path.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr("run.load_config", changing_load)
+    assert main(["--config", str(config_path), "--check-config"]) == 78
+    assert "configuration changed while loading" in capsys.readouterr().err
+
+
+def test_process_entrypoint_builds_and_injects_a_manifest_bound_backend(monkeypatch, tmp_path) -> None:
+    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    config = load_config(config_path)
+    digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(_manifest(config, digest)))
+    contract = _control_contract()
+    module = ModuleType("model_scheduler.llama_swap_contract")
+    module.CONTROL_CONTRACT = contract
+    seen = {}
+
+    def app_factory(_path, *, backend, config):
+        seen["backend"] = backend
+        seen["config"] = config
+        return object()
+
+    monkeypatch.setitem(sys.modules, "model_scheduler.llama_swap_contract", module)
+    monkeypatch.setattr("run._MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr("run.acquire", lambda _: nullcontext())
+    monkeypatch.setattr("run.create_app", app_factory)
+    monkeypatch.setattr("run.uvicorn.run", lambda app, **_: seen.setdefault("app", app))
+
+    assert main(["--config", str(config_path)]) == 0
+    assert seen["backend"].control.contract is contract
+    assert seen["backend"].observer.config_sha256 == digest
+    assert seen["config"] == config
+    assert seen["app"] is not None

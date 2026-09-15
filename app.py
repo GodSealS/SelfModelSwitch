@@ -24,7 +24,7 @@ from pydantic import BaseModel, ValidationError
 import httpx
 
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
-from model_scheduler.config import ConfigError, load_config
+from model_scheduler.config import AppConfig, ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.model_registry import Conflict
 from model_scheduler.gateway import DirectInferenceGateway
@@ -176,11 +176,11 @@ async def _require_empty_body(request: Request, *, timeout_seconds: float) -> No
         raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
 
 
-def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover."""
     if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
         raise ValueError("preload_retry_delays must contain positive values")
-    config = load_config(_config_path(config_path))
+    config = config or load_config(_config_path(config_path))
     owned_client = None
     if scheduler is None and backend is not None:
         scheduler = build_scheduler(config, backend, resources=resources, storage_guard=storage_guard, recovery=recovery)
