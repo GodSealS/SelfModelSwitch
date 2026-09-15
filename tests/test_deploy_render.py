@@ -5,7 +5,8 @@ import json
 import pytest
 
 from model_scheduler.config import load_config
-from model_scheduler.deploy import DeployError, render
+from model_scheduler.deploy import DeployError, preflight, render
+from model_scheduler.storage_monitor import StorageSnapshot
 
 
 def input_data(measured: bool = False) -> dict:
@@ -55,3 +56,14 @@ def test_production_report_must_match_manifest_model_measurements(tmp_path) -> N
     source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="validation report"):
         render(source, "production", tmp_path / "out-2")
+
+
+def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:
+    source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
+    output = tmp_path / "out"; render(source, "lab", output)
+    class Storage:
+        def check(self, models):
+            assert models["embedding"].sha256 == "a" * 64
+            return StorageSnapshot(True, None, 0, {})
+    result = preflight(output / "manifest.json", storage=Storage())
+    assert result["ok"] is True

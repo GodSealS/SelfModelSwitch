@@ -10,6 +10,9 @@ from typing import Any
 
 import yaml
 
+from .config import ConfigError, load_config
+from .storage_monitor import StorageMonitor
+
 
 class DeployError(ValueError):
     pass
@@ -130,11 +133,37 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     return manifest
 
 
+def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[str, Any]:
+    """Perform only read-only cross checks on a rendered deployment directory."""
+    path = Path(manifest_path)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("deployment_id"), str) or set(manifest.get("models", {})) != _MODELS:
+            raise DeployError("invalid rendered manifest")
+        config = load_config(path.parent / "config.yaml")
+    except (OSError, json.JSONDecodeError, ConfigError) as exc:
+        raise DeployError("cannot read rendered deployment") from exc
+    for model_id, model in config.models.items():
+        rendered = manifest["models"].get(model_id)
+        if not isinstance(rendered, dict) or rendered.get("file") != model.file or rendered.get("sha256") != model.sha256:
+            raise DeployError("manifest/config model mismatch")
+    monitor = storage or StorageMonitor(config.storage.mount_path, config.storage.model_directory, config.storage.expected_uuid, config.storage.filesystem)
+    snapshot = monitor.check(config.models)
+    if not snapshot.ready:
+        raise DeployError(f"storage preflight failed: {snapshot.reason}")
+    return {"ok": True, "deployment_id": manifest["deployment_id"], "models": sorted(config.models)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
     render_parser = sub.add_parser("render"); render_parser.add_argument("--input", required=True); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True)
+    preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
     args = parser.parse_args(argv)
-    try: render(args.input, args.mode, args.output)
+    try:
+        if args.command == "render":
+            render(args.input, args.mode, args.output)
+        else:
+            print(json.dumps(preflight(args.manifest), sort_keys=True))
     except DeployError as exc: print(f"deployment error: {exc}", file=sys.stderr); return 78
     return 0
 
