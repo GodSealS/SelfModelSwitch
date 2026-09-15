@@ -16,6 +16,51 @@ def input_data(measured: bool = False) -> dict:
     return {"deployment_id": "thor-local", "ssd_uuid": "uuid", "ssd_filesystem": "ext4", "jetpack_version": "7", "llama_swap_version": "v1", "llama_swap_sha256": "b" * 64, "image": "repo/image@sha256:" + "c" * 64, "validation_report": None, "models": models}
 
 
+def validation_report(payload: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "timestamp_utc": "2026-09-16T00:00:00Z",
+        "source_commit": "a" * 40,
+        "deployment_id": payload["deployment_id"],
+        "jetpack_version": payload["jetpack_version"],
+        "image_digest": payload["image"],
+        "llama_swap_version": payload["llama_swap_version"],
+        "llama_swap_sha256": payload["llama_swap_sha256"],
+        "ssd_uuid": payload["ssd_uuid"],
+        "models": {
+            name: {
+                "sha256": model["sha256"],
+                "context_size": model["context_size"],
+                "parallel": model["parallel"],
+                "batch_size": 512,
+                "ubatch_size": 128,
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "gpu_layers": 99,
+                "fit": False,
+                "reserved_bytes": model["reserved_bytes"],
+                "peak_deltas_bytes": [1, 2, 3],
+                "gpu_verified": True,
+                "capability_verified": True,
+                "cold_load_seconds": 0.0,
+            }
+            for name, model in payload["models"].items()
+        },
+        "scenarios": {f"A{index:02d}": "passed" for index in range(1, 21)},
+        "soak": {
+            "duration_seconds": 1800,
+            "http_500_count": 0,
+            "oom_count": 0,
+            "lease_leaks": 0,
+            "unsafe_evictions": 0,
+            "request_count": 1,
+            "http_429_count": 0,
+            "http_504_count": 0,
+            "queue_final": 0,
+            "leases_final": 0,
+        },
+    }
+
 def test_lab_render_writes_consistent_deployment_artifacts(tmp_path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
     output = tmp_path / "out"
@@ -48,7 +93,7 @@ def test_rejects_capability_pooling_mismatch(tmp_path) -> None:
 def test_production_report_must_match_manifest_model_measurements(tmp_path) -> None:
     payload = input_data(True)
     report = tmp_path / "measurements.json"
-    report.write_text(json.dumps({"image": payload["image"], "models": {name: {"sha256": model["sha256"], "context_size": model["context_size"], "parallel": model["parallel"]} for name, model in payload["models"].items()}}))
+    report.write_text(json.dumps(validation_report(payload)))
     payload["validation_report"] = str(report)
     source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
     render(source, "production", tmp_path / "out")
@@ -56,6 +101,17 @@ def test_production_report_must_match_manifest_model_measurements(tmp_path) -> N
     source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="validation report"):
         render(source, "production", tmp_path / "out-2")
+
+
+def test_production_rejects_a_report_without_all_hardware_acceptance_evidence(tmp_path) -> None:
+    payload = input_data(True)
+    report = validation_report(payload)
+    report["scenarios"]["A20"] = "not_run"
+    report_path = tmp_path / "measurements.json"; report_path.write_text(json.dumps(report))
+    payload["validation_report"] = str(report_path)
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "out")
 
 
 def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:

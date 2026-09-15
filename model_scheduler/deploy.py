@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import platform
 import re
@@ -35,12 +36,89 @@ _LEGACY_MODEL_SETTINGS = {
     "qwen-small": (10003, ["chat"], "qwen-small.gguf"),
     "qwen-large": (10004, ["chat"], "qwen-large.gguf"),
 }
+_SCENARIOS = frozenset(f"A{index:02d}" for index in range(1, 21))
+_REPORT_MODEL_FIELDS = frozenset({
+    "sha256", "context_size", "parallel", "batch_size", "ubatch_size",
+    "cache_type_k", "cache_type_v", "gpu_layers", "fit", "reserved_bytes",
+    "peak_deltas_bytes", "gpu_verified", "capability_verified", "cold_load_seconds",
+})
+_REPORT_SOAK_FIELDS = frozenset({
+    "duration_seconds", "http_500_count", "oom_count", "lease_leaks",
+    "unsafe_evictions", "request_count", "http_429_count", "http_504_count",
+    "queue_final", "leases_final",
+})
 
 
 def _require(value: Any, name: str) -> str:
     if type(value) is not str or not value or "REQUIRED" in value:
         raise DeployError(f"{name} is required")
     return value
+
+
+def _positive_int(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
+def _nonnegative_finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def validate_thor_report(report: Any) -> dict[str, Any]:
+    """Validate the prompt-free hardware evidence needed for production render."""
+    required = {
+        "schema_version", "timestamp_utc", "source_commit", "deployment_id",
+        "jetpack_version", "image_digest", "llama_swap_version", "llama_swap_sha256",
+        "ssd_uuid", "models", "scenarios", "soak",
+    }
+    if not isinstance(report, dict) or not required <= set(report) or report.get("schema_version") != 1:
+        raise DeployError("invalid Thor report")
+    for key in required - {"schema_version", "models", "scenarios", "soak"}:
+        _require(report[key], f"Thor report {key}")
+    if not _HASH.fullmatch(report["llama_swap_sha256"]) or not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", report["image_digest"]):
+        raise DeployError("invalid Thor report identity")
+    models = report["models"]
+    if not isinstance(models, dict) or set(models) != _MODELS:
+        raise DeployError("invalid Thor report models")
+    for model in models.values():
+        if not isinstance(model, dict) or not _REPORT_MODEL_FIELDS <= set(model):
+            raise DeployError("invalid Thor report model")
+        if (
+            not isinstance(model["sha256"], str)
+            or not _HASH.fullmatch(model["sha256"])
+            or not _positive_int(model["context_size"])
+            or not _positive_int(model["parallel"])
+            or model["batch_size"] != 512
+            or model["ubatch_size"] != 128
+            or model["cache_type_k"] != "f16"
+            or model["cache_type_v"] != "f16"
+            or model["gpu_layers"] != 99
+            or model["fit"] is not False
+            or not _positive_int(model["reserved_bytes"])
+            or not isinstance(model["peak_deltas_bytes"], list)
+            or len(model["peak_deltas_bytes"]) < 3
+            or not all(_positive_int(value) for value in model["peak_deltas_bytes"])
+            or model["gpu_verified"] is not True
+            or model["capability_verified"] is not True
+            or not _nonnegative_finite_number(model["cold_load_seconds"])
+        ):
+            raise DeployError("invalid Thor report model")
+    scenarios = report["scenarios"]
+    if not isinstance(scenarios, dict) or set(scenarios) != _SCENARIOS or any(value != "passed" for value in scenarios.values()):
+        raise DeployError("Thor acceptance scenarios are incomplete")
+    soak = report["soak"]
+    if not isinstance(soak, dict) or not _REPORT_SOAK_FIELDS <= set(soak):
+        raise DeployError("invalid Thor soak report")
+    zero_fields = {"http_500_count", "oom_count", "lease_leaks", "unsafe_evictions", "queue_final", "leases_final"}
+    nonnegative_fields = {"http_429_count", "http_504_count"}
+    if (
+        not _nonnegative_finite_number(soak["duration_seconds"])
+        or soak["duration_seconds"] < 1800
+        or not _positive_int(soak["request_count"])
+        or any(type(soak[key]) is not int or soak[key] != 0 for key in zero_fields)
+        or any(type(soak[key]) is not int or soak[key] < 0 for key in nonnegative_fields)
+    ):
+        raise DeployError("Thor soak report did not pass")
+    return report
 
 
 def _validate_report(path_value: Any, data: dict[str, Any]) -> None:
@@ -50,11 +128,23 @@ def _validate_report(path_value: Any, data: dict[str, Any]) -> None:
         report = json.loads(Path(path_value).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DeployError("cannot read validation report") from exc
-    if not isinstance(report, dict) or report.get("image") != data["image"] or not isinstance(report.get("models"), dict):
+    try:
+        report = validate_thor_report(report)
+    except DeployError as exc:
+        raise DeployError("validation report does not meet hardware acceptance") from exc
+    expected_identity = {
+        "deployment_id": data["deployment_id"],
+        "jetpack_version": data["jetpack_version"],
+        "image_digest": data["image"],
+        "llama_swap_version": data["llama_swap_version"],
+        "llama_swap_sha256": data["llama_swap_sha256"],
+        "ssd_uuid": data["ssd_uuid"],
+    }
+    if any(report[key] != value for key, value in expected_identity.items()):
         raise DeployError("validation report does not match deployment input")
     for model_id, model in data["models"].items():
         measured = report["models"].get(model_id)
-        expected = {"sha256": model["sha256"], "context_size": model["context_size"], "parallel": model["parallel"]}
+        expected = {"sha256": model["sha256"], "context_size": model["context_size"], "parallel": model["parallel"], "reserved_bytes": model["reserved_bytes"]}
         if not isinstance(measured, dict) or any(measured.get(key) != value for key, value in expected.items()):
             raise DeployError("validation report does not match deployment input")
 
