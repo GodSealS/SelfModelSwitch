@@ -1,8 +1,21 @@
+import importlib.util
+import json
+from pathlib import Path
+
 import pytest
 import signal
 
 from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_container_identity, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
 from model_scheduler.storage_monitor import StorageSnapshot
+
+
+def _deploy_runner_module():
+    path = Path(__file__).resolve().parent.parent / "deploy" / "model-runner.py"
+    spec = importlib.util.spec_from_file_location("deploy_model_runner", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_runner_only_stops_exact_manifest_container() -> None:
@@ -89,3 +102,30 @@ def test_runner_requires_all_three_manifest_identity_labels_before_stop() -> Non
     labels["io.self-model-switch.config-sha256"] = "b" * 64
     with pytest.raises(RunnerError, match="container identity"):
         require_container_identity(labels, "thor-local", "qwen-small", "a" * 64)
+
+
+def test_deploy_runner_does_not_stop_a_container_with_a_stale_config_label(monkeypatch) -> None:
+    runner = _deploy_runner_module()
+    calls: list[list[str]] = []
+    record = {
+        "Config": {
+            "Labels": {
+                "io.self-model-switch.deployment": "thor-local",
+                "io.self-model-switch.model": "qwen-small",
+                "io.self-model-switch.config-sha256": "b" * 64,
+            }
+        }
+    }
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps([record])
+
+    def fake_run(argv: list[str], **_: object) -> Result:
+        calls.append(argv)
+        return Result()
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    with pytest.raises(RunnerError, match="container identity"):
+        runner._stop("sms-thor-local-qwen-small", "thor-local", "qwen-small", "a" * 64)
+    assert calls == [["docker", "inspect", "sms-thor-local-qwen-small"]]
