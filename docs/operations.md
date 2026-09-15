@@ -50,10 +50,12 @@ After the physical device is restored and its UUID is verified:
 
 ```bash
 sudo mount /mnt/model-ssd
-sudo systemctl start llama-swap.service model-scheduler.service
+curl --fail -X POST http://127.0.0.1:8090/api/recover
 ```
 
-Revalidate file metadata and SHA256 before preloading. Do not treat an empty
+The recovery endpoint revalidates file metadata and SHA256 before it invokes
+the constrained control recovery and configured preload. If the scheduler is
+not running, start both mount-bound services instead; do not treat an empty
 root-disk directory as a model mount.
 
 ## Control recovery and rollback

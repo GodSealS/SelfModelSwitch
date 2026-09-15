@@ -7,7 +7,13 @@ never goes through its automatic router.
 
 The HTTP listener is loopback-only. Public interfaces are `/live`, `/health`,
 `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`,
-`/api/status`, `/api/models`, and `POST /api/models/{model_id}/unload`.
+`/api/status`, `/api/models`, `POST /api/models/{model_id}/unload`, and
+`POST /api/recover`.
+
+`POST /api/recover` is a loopback-only administrative operation. It does not
+blindly reopen inference after an SSD fault: it revalidates storage, invokes
+the constrained control-plane recovery port, and then retries configured
+preloads. A failed validation or recovery keeps admission closed.
 
 ## Local verification
 

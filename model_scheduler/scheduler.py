@@ -453,6 +453,19 @@ class ModelScheduler:
             self._condition.notify_all()
         return await task
 
+    async def storage_recovered(self, deadline: float) -> tuple[str, ...]:
+        """Explicitly reopen storage only after fresh validation and recovery."""
+        if not await self._admission_allowed():
+            raise ModelUnavailable("storage_unavailable")
+        async with self._condition:
+            if not self._storage_unavailable:
+                return ()
+        await self.recover(deadline)
+        async with self._condition:
+            self._storage_unavailable = False
+            self._condition.notify_all()
+        return await self.preload(deadline)
+
     async def unload(self, model_id: str, deadline: float) -> None:
         async with self._condition:
             if model_id not in self.book.specs: raise KeyError(model_id)

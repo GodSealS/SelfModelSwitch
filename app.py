@@ -238,6 +238,24 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         except ModelUnavailable:
             return _error(502, "stop_unverified", "Model stop could not be verified", request_id)
 
+    @app.post("/api/recover")
+    async def recover_storage():
+        request_id = str(uuid4())
+        scheduler = app.state.scheduler
+        recovery = getattr(scheduler, "storage_recovered", None) if scheduler is not None else None
+        if not callable(recovery):
+            return _error(503, "recovery_unavailable", "Storage recovery is unavailable", request_id)
+        try:
+            preloaded = await recovery(monotonic() + config.llama_swap.load_timeout_seconds)
+            return JSONResponse(
+                content={"ok": True, "preloaded": list(preloaded)},
+                headers={"X-Request-ID": request_id},
+            )
+        except Conflict as exc:
+            return _error(409, str(exc), "Recovery cannot run while models are busy", request_id)
+        except ModelUnavailable as exc:
+            return _error(503, str(exc), "Storage recovery did not complete", request_id)
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         request_id = str(uuid4())

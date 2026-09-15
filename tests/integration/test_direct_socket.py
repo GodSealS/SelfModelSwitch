@@ -42,7 +42,10 @@ async def test_gateway_preserves_sse_utf8_bytes_split_across_real_socket_writes(
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.readuntil(b"\r\n\r\n")
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            + f"Content-Length: {len(expected)}\r\nConnection: close\r\n\r\n".encode()
+        )
         writer.write(expected[:18])
         await writer.drain()
         writer.write(expected[18:20])

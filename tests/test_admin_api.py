@@ -65,6 +65,22 @@ def test_manual_unload_does_not_return_success_without_stop_evidence() -> None:
     assert response.json()["error"]["code"] == "stop_unverified"
 
 
+def test_explicit_recovery_uses_the_scheduler_storage_recovery_port() -> None:
+    class RecoverableScheduler:
+        called = False
+
+        async def storage_recovered(self, deadline):
+            self.called = True
+            return ("embedding",)
+
+    scheduler = RecoverableScheduler()
+    with TestClient(create_app(scheduler=scheduler)) as client:
+        response = client.post("/api/recover")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "preloaded": ["embedding"]}
+    assert scheduler.called is True
+
+
 def test_lifespan_starts_injected_preload_without_blocking_live_endpoint() -> None:
     class PreloadingScheduler:
         called = False

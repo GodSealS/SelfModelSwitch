@@ -441,6 +441,38 @@ async def test_preload_fails_immediately_after_storage_loss() -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_storage_recovery_revalidates_then_reopens_admission() -> None:
+    class Guard:
+        allowed = True
+
+        async def __call__(self):
+            return self.allowed
+
+    guard = Guard()
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend, admission_guard=guard, recovery=Recovery())
+    await scheduler.storage_lost(asyncio.get_running_loop().time() + 1)
+
+    await scheduler.storage_recovered(asyncio.get_running_loop().time() + 1)
+    lease = await scheduler.acquire("chat", "after-recovery", asyncio.get_running_loop().time() + 1)
+    assert lease.model_id == "chat"
+
+
+@pytest.mark.asyncio
+async def test_storage_recovery_refuses_to_reopen_when_revalidation_fails() -> None:
+    class Guard:
+        async def __call__(self):
+            return False
+
+    scheduler = ModelScheduler(book(), Resources(), Backend(), admission_guard=Guard(), recovery=Recovery())
+    await scheduler.storage_lost(asyncio.get_running_loop().time() + 1)
+
+    with pytest.raises(ModelUnavailable, match="storage_unavailable"):
+        await scheduler.storage_recovered(asyncio.get_running_loop().time() + 1)
+    assert (await scheduler.status())["admission"]["storage_unavailable"] is True
+
+
+@pytest.mark.asyncio
 async def test_ready_admission_waits_for_fresh_free_memory_sample() -> None:
     registry = book()
     operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)
