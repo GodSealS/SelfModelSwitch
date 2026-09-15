@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+import signal
+import subprocess
+from typing import Any, Callable, Mapping
 
 
 class RunnerError(ValueError):
@@ -11,6 +13,28 @@ class RunnerError(ValueError):
 
 _PORTS = {"embedding": 10001, "reranker": 10002, "qwen-small": 10003, "qwen-large": 10004}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def run_child_with_signal_forwarding(
+    argv: list[str],
+    *,
+    popen: Callable[[list[str]], Any] = subprocess.Popen,
+    set_handler: Callable[[int, Any], Any] = signal.signal,
+) -> int:
+    """Wait for one argv-only child while relaying service stop signals to it."""
+    child = popen(argv)
+    previous: dict[int, Any] = {}
+
+    def forward(signum: int, _frame: Any) -> None:
+        child.send_signal(signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = set_handler(signum, forward)
+        return child.wait()
+    finally:
+        for signum, handler in previous.items():
+            set_handler(signum, handler)
 
 
 def docker_stop_argv(requested_name: str, manifest_name: str) -> list[str] | None:

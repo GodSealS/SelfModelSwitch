@@ -1,6 +1,7 @@
 import pytest
+import signal
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, run_child_with_signal_forwarding
 
 
 def test_runner_only_stops_exact_manifest_container() -> None:
@@ -21,3 +22,30 @@ def test_docker_run_argv_rejects_a_manifest_name_mismatch() -> None:
     manifest = {"deployment_id": "thor-local", "image": "repo/image@sha256:" + "c" * 64, "models": {"qwen-small": {"container_name": "other", "file": "qwen-small.gguf", "context_size": 2048, "parallel": 1}}}
     with pytest.raises(RunnerError, match="container"):
         docker_run_argv(manifest, "qwen-small", "d" * 64)
+
+
+def test_runner_forwards_service_termination_to_its_own_docker_child_and_waits() -> None:
+    handlers = {}
+
+    class Child:
+        sent: list[int] = []
+        waited = False
+
+        def send_signal(self, signum: int) -> None:
+            self.sent.append(signum)
+
+        def wait(self) -> int:
+            self.waited = True
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return 143
+
+    child = Child()
+
+    def set_handler(signum, handler):
+        previous = handlers.get(signum)
+        handlers[signum] = handler
+        return previous
+
+    assert run_child_with_signal_forwarding(["docker", "run"], popen=lambda _: child, set_handler=set_handler) == 143
+    assert child.waited is True
+    assert child.sent == [signal.SIGTERM]

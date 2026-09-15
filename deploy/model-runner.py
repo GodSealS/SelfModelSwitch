@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, run_child_with_signal_forwarding
 
 
 MANIFEST = Path("/etc/self-model-switch/manifest.json")
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(deployment_id, str):
                 raise RunnerError("invalid manifest deployment")
             return _stop(name, deployment_id, args.model_id)
-        return subprocess.run(docker_run_argv(manifest, args.model_id, _config_digest()), timeout=None).returncode
+        return run_child_with_signal_forwarding(docker_run_argv(manifest, args.model_id, _config_digest()))
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         print(f"model runner error: {exc}", file=sys.stderr)
         return 78
