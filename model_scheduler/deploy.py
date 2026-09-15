@@ -234,6 +234,7 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     manifest = json.loads(json.dumps(validated))
     if report_bytes is not None:
         manifest["validation_report"] = "thor-report.json"
+        manifest["thor_report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
     for model_id in _MODELS:
         manifest["models"][model_id]["container_name"] = f"sms-{manifest['deployment_id']}-{model_id}"
     if destination.exists() and any(destination.iterdir()): raise DeployError("output directory must be empty")

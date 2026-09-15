@@ -101,6 +101,7 @@ def test_production_report_must_match_manifest_model_measurements(tmp_path) -> N
     manifest = render(source, "production", tmp_path / "out")
     assert manifest["validation_report"] == "thor-report.json"
     assert (tmp_path / "out" / "thor-report.json").read_text() == report.read_text()
+    assert manifest["thor_report_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest()
     payload["models"]["qwen-small"]["parallel"] = 2
     source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="validation report"):

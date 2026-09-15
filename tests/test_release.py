@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -34,8 +35,25 @@ def test_release_archive_is_auditable_and_excludes_workspace_state(tmp_path: Pat
 def test_release_archive_retains_a_verified_thor_report_when_present(tmp_path: Path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(_input()))
     deployment = tmp_path / "deployment"; render(source, "lab", deployment)
-    (deployment / "thor-report.json").write_text('{"schema_version":1}\n')
+    report = deployment / "thor-report.json"; report.write_text('{"schema_version":1}\n')
+    manifest_path = deployment / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["thor_report_sha256"] = hashlib.sha256(report.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
     output = tmp_path / "releases"
     subprocess.run([".venv/bin/python", "scripts/build-release.py", "--deployment", str(deployment), "--output", str(output), "--release-id", "test-2"], text=True, capture_output=True, check=True)
     with tarfile.open(output / "self-model-switch-test-2.tar.gz") as bundle:
         assert "self-model-switch-test-2/deployment/thor-report.json" in bundle.getnames()
+
+
+def test_release_archive_rejects_a_report_that_no_longer_matches_manifest_digest(tmp_path: Path) -> None:
+    source = tmp_path / "input.json"; source.write_text(json.dumps(_input()))
+    deployment = tmp_path / "deployment"; render(source, "lab", deployment)
+    report = deployment / "thor-report.json"; report.write_text('{"schema_version":1}\n')
+    manifest_path = deployment / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["thor_report_sha256"] = "a" * 64
+    manifest_path.write_text(json.dumps(manifest))
+    result = subprocess.run([".venv/bin/python", "scripts/build-release.py", "--deployment", str(deployment), "--output", str(tmp_path / "releases"), "--release-id", "test-3"], text=True, capture_output=True)
+    assert result.returncode == 78
+    assert "Thor report" in result.stderr
