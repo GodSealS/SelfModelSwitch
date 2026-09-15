@@ -105,6 +105,22 @@ class ModelScheduler:
             self.book.release(lease, outcome, monotonic(), tokens)
             self._condition.notify_all()
 
+    async def unload(self, model_id: str, deadline: float) -> None:
+        async with self._condition:
+            if model_id not in self.book.specs: raise KeyError(model_id)
+            spec, runtime = self.book.specs[model_id], self.book.runtime[model_id]
+            if spec.pinned: raise Conflict("model_pinned")
+            if runtime.state.value == "unloaded": return
+            if runtime.leases or runtime.operation_id or runtime.state.value != "ready": raise Conflict("model_busy")
+            operation = self.book.begin_eviction([model_id], automatic=False)[0]
+        observation = await self.backend.stop(operation, deadline)
+        async with self._condition:
+            if observation.presence is Presence.STOPPED:
+                self.book.stopped(operation)
+            else:
+                self.book.failed(operation, observation.detail_code or "stop_unverified")
+            self._condition.notify_all()
+
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()
         async with self._condition:

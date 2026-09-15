@@ -64,3 +64,13 @@ async def test_waiter_capacity_is_bounded() -> None:
     backend.finish.set()
     lease = await first
     await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_unload_requires_backend_stop_evidence() -> None:
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    await scheduler.unload("chat", asyncio.get_running_loop().time() + 1)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
