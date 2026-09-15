@@ -1,6 +1,7 @@
 """Validate that models are served from the configured mounted SSD only."""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
@@ -100,3 +101,14 @@ class StorageMonitor:
             for block in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
+
+
+class StorageAdmissionGuard:
+    """Async scheduler port that fails closed on mount or model-file uncertainty."""
+
+    def __init__(self, monitor: StorageMonitor, models: Mapping[str, Any]):
+        self.monitor = monitor
+        self.models = dict(models)
+
+    async def __call__(self) -> bool:
+        return (await asyncio.to_thread(self.monitor.check, self.models)).ready
