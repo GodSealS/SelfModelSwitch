@@ -32,6 +32,22 @@ def _require(value: Any, name: str) -> str:
     return value
 
 
+def _validate_report(path_value: Any, data: dict[str, Any]) -> None:
+    if not isinstance(path_value, str) or not path_value:
+        raise DeployError("production requires validation_report")
+    try:
+        report = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployError("cannot read validation report") from exc
+    if not isinstance(report, dict) or report.get("image") != data["image"] or not isinstance(report.get("models"), dict):
+        raise DeployError("validation report does not match deployment input")
+    for model_id, model in data["models"].items():
+        measured = report["models"].get(model_id)
+        expected = {"sha256": model["sha256"], "context_size": model["context_size"], "parallel": model["parallel"]}
+        if not isinstance(measured, dict) or any(measured.get(key) != value for key, value in expected.items()):
+            raise DeployError("validation report does not match deployment input")
+
+
 def validate(data: Any, mode: str) -> dict[str, Any]:
     if mode not in {"lab", "production"} or not isinstance(data, dict):
         raise DeployError("invalid deployment input")
@@ -50,7 +66,8 @@ def validate(data: Any, mode: str) -> dict[str, Any]:
         if model["pooling"] != _MODEL_SETTINGS[model_id][6]:
             raise DeployError(f"invalid {model_id} pooling")
         if mode == "production" and model["measured"] is not True: raise DeployError(f"{model_id} must be measured for production")
-    if mode == "production" and (not isinstance(data["validation_report"], str) or not data["validation_report"]): raise DeployError("production requires validation_report")
+    if mode == "production":
+        _validate_report(data["validation_report"], data)
     return data
 
 

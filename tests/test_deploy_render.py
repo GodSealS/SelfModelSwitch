@@ -42,3 +42,16 @@ def test_rejects_capability_pooling_mismatch(tmp_path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="pooling"):
         render(source, "lab", tmp_path / "out")
+
+
+def test_production_report_must_match_manifest_model_measurements(tmp_path) -> None:
+    payload = input_data(True)
+    report = tmp_path / "measurements.json"
+    report.write_text(json.dumps({"image": payload["image"], "models": {name: {"sha256": model["sha256"], "context_size": model["context_size"], "parallel": model["parallel"]} for name, model in payload["models"].items()}}))
+    payload["validation_report"] = str(report)
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+    render(source, "production", tmp_path / "out")
+    payload["models"]["qwen-small"]["parallel"] = 2
+    source.write_text(json.dumps(payload))
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "out-2")
