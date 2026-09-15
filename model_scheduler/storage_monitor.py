@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 from time import monotonic
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 
 class StorageError(RuntimeError):
@@ -19,6 +20,7 @@ class ModelFile:
     inode: int
     size: int
     mtime_ns: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class StorageMonitor:
     def _run_findmnt(args: list[str]) -> str:
         return subprocess.check_output(args, text=True, timeout=2)
 
-    def check(self, models: dict[str, str]) -> StorageSnapshot:
+    def check(self, models: Mapping[str, Any]) -> StorageSnapshot:
         now = monotonic()
         try:
             data = json.loads(self._runner(["findmnt", "--json", "--target", str(self.mount_path)]))
@@ -53,15 +55,44 @@ class StorageMonitor:
             if entry.get("target") != str(self.mount_path) or entry.get("uuid") != self.expected_uuid or entry.get("fstype") != self.filesystem:
                 raise StorageError("mount_identity_mismatch")
             files: dict[str, ModelFile] = {}
-            for model_id, filename in models.items():
+            for model_id, value in models.items():
+                filename, expected_hash = self._model_file(value)
                 candidate = self.model_directory / filename
                 stat = os.lstat(candidate)
                 if not candidate.is_file() or candidate.is_symlink() or not os.access(candidate, os.R_OK):
                     raise StorageError("model_file_unsafe")
-                files[model_id] = ModelFile(stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                digest = self._sha256(candidate)
+                after = os.lstat(candidate)
+                if (after.st_ino, after.st_size, after.st_mtime_ns) != (stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                    raise StorageError("model_file_changed")
+                observed = ModelFile(stat.st_ino, stat.st_size, stat.st_mtime_ns, digest)
+                if self._baseline is not None and self._baseline.get(model_id) != observed:
+                    raise StorageError("model_file_changed")
+                if expected_hash is not None and digest != expected_hash:
+                    raise StorageError("model_hash_mismatch")
+                files[model_id] = observed
             if self._baseline is not None and files != self._baseline:
                 raise StorageError("model_file_changed")
             self._baseline = files
             return StorageSnapshot(True, None, now, files)
         except (OSError, ValueError, subprocess.SubprocessError, StorageError) as exc:
             return StorageSnapshot(False, str(exc), now, {})
+
+    @staticmethod
+    def _model_file(value: Any) -> tuple[str, str | None]:
+        if isinstance(value, str):
+            return value, None
+        if isinstance(value, tuple) and len(value) == 2 and all(isinstance(item, str) for item in value):
+            return value
+        filename, digest = getattr(value, "file", None), getattr(value, "sha256", None)
+        if isinstance(filename, str) and isinstance(digest, str):
+            return filename, digest
+        raise StorageError("invalid_model_file")
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from model_scheduler.storage_monitor import StorageMonitor
@@ -34,3 +35,22 @@ def test_storage_rejects_wrong_uuid_or_symlink(tmp_path: Path) -> None:
     monitor = StorageMonitor(mount, models, "expected", "ext4", runner=lambda _: findmnt("wrong", str(mount)))
 
     assert monitor.check({"embedding": "embedding.gguf"}).ready is False
+
+
+def test_storage_hashes_expected_models_and_detects_content_change(tmp_path: Path) -> None:
+    mount = tmp_path / "ssd"; models = mount / "models"; models.mkdir(parents=True)
+    model = models / "embedding.gguf"; model.write_bytes(b"model")
+    digest = hashlib.sha256(b"model").hexdigest()
+    monitor = StorageMonitor(mount, models, "expected", "ext4", runner=lambda _: findmnt("expected", str(mount)))
+    assert monitor.check({"embedding": ("embedding.gguf", digest)}).ready is True
+    model.write_bytes(b"changed")
+    changed = monitor.check({"embedding": ("embedding.gguf", digest)})
+    assert changed.ready is False
+    assert changed.reason == "model_file_changed"
+
+
+def test_storage_rejects_expected_hash_mismatch(tmp_path: Path) -> None:
+    mount = tmp_path / "ssd"; models = mount / "models"; models.mkdir(parents=True)
+    (models / "embedding.gguf").write_bytes(b"model")
+    monitor = StorageMonitor(mount, models, "expected", "ext4", runner=lambda _: findmnt("expected", str(mount)))
+    assert monitor.check({"embedding": ("embedding.gguf", "0" * 64)}).ready is False
