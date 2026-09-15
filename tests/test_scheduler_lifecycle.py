@@ -119,8 +119,7 @@ async def test_ttl_sweep_does_not_stop_a_model_with_a_waiter() -> None:
     await scheduler.release(lease, Outcome.SUCCESS)
     await asyncio.sleep(0.002)
     async with scheduler._condition:
-        scheduler._waiters.add("waiting")
-        scheduler._waiter_models["waiting"] = "chat"
+        scheduler._queue.enqueue("waiting", "chat", 0, asyncio.get_running_loop().time() + 1, asyncio.get_running_loop().time())
     assert await scheduler.sweep_ttl(asyncio.get_running_loop().time() + 1) == ()
     assert registry.runtime["chat"].state.value == "ready"
 

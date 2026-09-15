@@ -7,6 +7,7 @@ from time import monotonic
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
 from .eviction_policy import EvictionPolicy
 from .model_registry import Book, Conflict, StaleOperation
+from .request_queue import RequestQueue, WaitState
 
 
 class QueueFull(RuntimeError):
@@ -20,7 +21,7 @@ class ModelUnavailable(RuntimeError):
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
         self.book = book
         self.resources = resources
         self.backend = backend
@@ -28,8 +29,7 @@ class ModelScheduler:
         self.queue_capacity = queue_capacity
         self.eviction_policy = EvictionPolicy(book, max_evictions=max_evictions)
         self._condition = asyncio.Condition()
-        self._waiters: set[str] = set()
-        self._waiter_models: dict[str, str] = {}
+        self._queue = RequestQueue(capacity=queue_capacity, aging_seconds=priority_aging_seconds)
         self._loads: dict[str, asyncio.Task[None]] = {}
         self._eviction: asyncio.Task[tuple[str, ...]] | None = None
 
@@ -39,26 +39,32 @@ class ModelScheduler:
         if deadline <= monotonic():
             raise TimeoutError("queue deadline elapsed")
         async with self._condition:
-            if request_id in self._waiters:
-                raise Conflict("duplicate waiter")
-            if len(self._waiters) >= self.queue_capacity:
+            try:
+                self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, monotonic())
+            except ValueError as exc:
+                raise Conflict("duplicate waiter") from exc
+            except OverflowError as exc:
                 raise QueueFull("queue_full")
-            self._waiters.add(request_id)
-            self._waiter_models[request_id] = model_id
         try:
             while True:
                 needs_sample = False
                 async with self._condition:
-                    try:
-                        lease = self.book.acquire_ready(model_id, request_id, monotonic())
-                    except Conflict:
-                        runtime = self.book.runtime[model_id]
-                        if runtime.state.value == "error":
-                            raise ModelUnavailable(runtime.last_error or "model_error")
-                        needs_sample = (runtime.state.value == "unloaded" and model_id not in self._loads
-                                        and self._eviction is None)
-                    else:
-                        return lease
+                    now = monotonic()
+                    if now >= deadline or not self._queue.contains(request_id):
+                        self._queue.remove(request_id, WaitState.EXPIRED)
+                        raise TimeoutError("queue deadline elapsed")
+                    if self._queue.is_head(request_id, now):
+                        try:
+                            lease = self.book.acquire_ready(model_id, request_id, now)
+                        except Conflict:
+                            runtime = self.book.runtime[model_id]
+                            if runtime.state.value == "error":
+                                raise ModelUnavailable(runtime.last_error or "model_error")
+                            needs_sample = (runtime.state.value == "unloaded" and model_id not in self._loads
+                                            and self._eviction is None)
+                        else:
+                            self._queue.remove(request_id, WaitState.CLAIMED)
+                            return lease
                 if needs_sample:
                     # Sampling is external I/O; take it outside the condition and
                     # re-check state before committing the operation below.
@@ -88,8 +94,7 @@ class ModelScheduler:
                         raise TimeoutError("queue deadline elapsed") from exc
         finally:
             async with self._condition:
-                self._waiters.discard(request_id)
-                self._waiter_models.pop(request_id, None)
+                self._queue.remove(request_id)
                 self._condition.notify_all()
 
     async def _finish_load(self, operation, deadline: float) -> None:
@@ -214,7 +219,7 @@ class ModelScheduler:
         async with self._condition:
             if self._eviction is not None:
                 return ()
-            waiting_models = set(self._waiter_models.values())
+            waiting_models = self._queue.waiting_models()
             model_ids = [
                 model_id for model_id in self.book.specs
                 if model_id not in waiting_models and self.book.ttl_due(model_id, now)
@@ -237,4 +242,4 @@ class ModelScheduler:
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()
         async with self._condition:
-            return {"resources": {"total_bytes": snapshot.total_bytes, "available_bytes": snapshot.available_bytes, "used_bytes": snapshot.used_bytes, "utilization": snapshot.utilization, "source": snapshot.source, "sample_age_seconds": snapshot.age_at(monotonic())}, "queue_size": len(self._waiters), "models": {model_id: {"state": runtime.state.value, "generation": runtime.generation, "in_flight": len(runtime.leases), "last_error": runtime.last_error} for model_id, runtime in self.book.runtime.items()}}
+            return {"resources": {"total_bytes": snapshot.total_bytes, "available_bytes": snapshot.available_bytes, "used_bytes": snapshot.used_bytes, "utilization": snapshot.utilization, "source": snapshot.source, "sample_age_seconds": snapshot.age_at(monotonic())}, "queue_size": self._queue.size, "models": {model_id: {"state": runtime.state.value, "generation": runtime.generation, "in_flight": len(runtime.leases), "last_error": runtime.last_error} for model_id, runtime in self.book.runtime.items()}}
