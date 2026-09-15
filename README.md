@@ -1,108 +1,54 @@
 # AGX Thor Model Scheduler
 
-A resource-aware Python scheduler in front of llama-swap.
+This service is a single-process scheduler for four local llama.cpp model
+servers. It owns residency, memory accounting, leases, and direct inference
+routing. llama-swap is a narrow lifecycle controller only: inference traffic
+never goes through its automatic router.
 
-## Architecture
+The HTTP listener is loopback-only. Public interfaces are `/live`, `/health`,
+`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`,
+`/api/status`, `/api/models`, and `POST /api/models/{model_id}/unload`.
 
-Client -> ModelScheduler -> llama-swap -> Docker model servers
+## Local verification
 
-The scheduler decides *when* a model may be resident. llama-swap remains responsible
-for model routing, Docker lifecycle, health checks, and proxying.
-
-## Install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Start llama-swap separately, using its own config.
-
-Then:
+Use Python 3.12 for releases. On a development machine, install the project
+test dependencies and run:
 
 ```bash
-python run.py
+python -m pytest tests -m 'not thor' -q
+python -m ruff check .
+python run.py --check-config
 ```
 
-The scheduler API is:
+`config.yaml` is a lab-only example. It contains non-production identifiers and
+model hashes; it is not a deployable Thor configuration.
 
-- `GET /health`
-- `GET /api/status`
-- `GET /api/models`
-- `POST /api/models/{model_id}/unload`
-- `POST /v1/chat/completions`
+## Deployment boundary
 
-Point your applications to:
+Create exactly one deployment input JSON, then render all derived files:
 
-`http://127.0.0.1:8090/v1`
-
-instead of directly to llama-swap.
-
-## Important llama-swap configuration
-
-Because this scheduler performs resource-based eviction itself, do NOT configure
-llama-swap to automatically swap models out according to an exclusive group.
-
-All models that this scheduler manages should be allowed to coexist. A minimal
-pattern is:
-
-```yaml
-routing:
-  router:
-    use: group
-    settings:
-      groups:
-        all-managed:
-          swap: false
-          exclusive: false
-          members:
-            - embedding
-            - reranker
-            - qwen-small
-            - qwen-large
+```bash
+python -m model_scheduler.deploy render --input deploy-input.json --mode lab --output build/deploy
 ```
 
-You can still use model TTL carefully, but it is usually better to let this scheduler
-own eviction so there is only one policy.
+The renderer refuses placeholders, floating images, unsafe model paths,
+unmeasured production budgets, and a non-empty output directory. It generates
+the manifest, strict scheduler YAML, llama-swap YAML, mount-bound systemd units,
+and an fstab *suggestion*. It never formats a disk, downloads a model, or edits
+`/etc/fstab`.
 
-## Warm-up
+For the full hand-operated installation, recovery, and rollback procedure, see
+[`docs/operations.md`](docs/operations.md). A release archive can be made only
+from a rendered deployment directory:
 
-Current llama-swap exposes `/running` and targeted unload APIs. It does not require a
-separate load API in the standard flow: dispatching a request to a model causes it to
-be loaded. For llama.cpp-backed models, this project uses:
-
-`GET /props?model=<id>`
-
-as a token-free dispatch/warm-up operation.
-
-If you add a non-llama.cpp backend, implement a backend-specific warm-up method in
-`llama_swap_client.py`.
-
-## Resource model
-
-The scheduler uses a reserved-memory estimate per model plus a safety margin.
-
-Example:
-
-```yaml
-models:
-  qwen-small:
-    memory:
-      reserved_bytes: 10737418240
+```bash
+python scripts/build-release.py --deployment build/deploy --output build/release --release-id <id>
 ```
 
-For AGX Thor, use unified/system memory as the primary resource. The resource monitor
-tries tegrastats first, then nvidia-smi, then psutil.
+## Current release status
 
-Do not treat GGUF file size as runtime memory. Measure actual model usage and set
-`reserved_bytes` conservatively.
-
-## Production notes
-
-1. Put the model files on local NVMe.
-2. Run llama-swap and this scheduler on the host for the first deployment.
-3. Do not expose either service directly to the LAN without authentication.
-4. Add persistent heat metrics/database after the scheduling policy is validated.
-5. Add request cancellation and per-model concurrency limits before exposing it to
-multiple users.
+This repository is **not production-ready** until the fixed ARM64 llama-swap
+release and real HTTP fixtures are recorded, Python 3.12/ARM64 locks install,
+and all Thor acceptance scenarios complete with a real SSD, GPU, model hashes,
+and `thor-report.json`. The repository deliberately does not contain device
+credentials, model files, or a claim that those checks have passed.

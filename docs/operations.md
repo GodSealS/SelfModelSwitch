@@ -1,0 +1,71 @@
+# Operations runbook
+
+This runbook is intentionally conservative: do not format a drive, pull an
+unverified image, alter model files, or operate containers outside the manifest.
+
+## Prepare deployment input
+
+Collect the Thor facts read-only, then produce one JSON deployment input with
+the actual SSD UUID, ext4 filesystem, fixed llama-swap ARM64 release and SHA256,
+image digest, model SHA256 values, and measured memory budgets. Production
+rendering additionally needs the measured validation report. Render it into a
+new, empty directory:
+
+```bash
+python -m model_scheduler.deploy render --input deploy-input.json --mode production --output build/deploy
+```
+
+Review `manifest.json`, `config.yaml`, `llama-swap.yaml`, both service units,
+and `fstab.fragment`. The fragment is a suggestion only; merge it into
+`/etc/fstab` manually after review. Never run a formatter from this project.
+
+## Install and start
+
+Create the `model-scheduler` service user, place root-owned configuration and
+manifest under `/etc/self-model-switch`, and install the release under
+`/opt/self-model-switch/releases/<release-id>`. Point `current` at the verified
+release atomically. Install the generated unit files, then verify them before
+starting:
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/model-scheduler.service /etc/systemd/system/llama-swap.service
+sudo systemctl daemon-reload
+sudo systemctl start llama-swap.service model-scheduler.service
+curl --fail http://127.0.0.1:8090/live
+curl --fail http://127.0.0.1:8090/health
+```
+
+The second request is expected to fail until storage, control-plane recovery,
+and pinned preload have completed. Inspect `journalctl -u model-scheduler -u
+llama-swap` rather than declaring readiness from process existence.
+
+## SSD loss and recovery
+
+When the SSD mount disappears, scheduler admission must fail before models are
+reused. It clears leases, attempts to stop only manifest-managed models, and
+then the mount-bound units stop. An unconfirmed stop remains ERROR and keeps
+its memory budget; do not force it to UNLOADED.
+
+After the physical device is restored and its UUID is verified:
+
+```bash
+sudo mount /mnt/model-ssd
+sudo systemctl start llama-swap.service model-scheduler.service
+```
+
+Revalidate file metadata and SHA256 before preloading. Do not treat an empty
+root-disk directory as a model mount.
+
+## Control recovery and rollback
+
+Only the root-owned, no-argument control helper may stop the control plane:
+
+```bash
+sudo -n /usr/local/libexec/sms-control-recover
+```
+
+It must hold an exclusive lock and emit only the documented JSON result. A
+failure leaves models accounted as errors. To roll back, stop the services,
+repointer `current` to the previously verified release, run `daemon-reload`,
+then start services and recheck `/health`. Never roll back model files or modify
+unrelated Docker containers as part of this procedure.
