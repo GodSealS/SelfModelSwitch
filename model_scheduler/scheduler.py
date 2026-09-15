@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 import inspect
 from time import monotonic
@@ -31,8 +32,8 @@ class SwitchIntent:
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, recovery: ControlRecoveryPort | None = None, admission_guard=None):
-        if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds) <= 0:
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None):
+        if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds, switch_window_seconds, cooldown_seconds) <= 0 or max_switches_in_window < 1:
             raise ValueError("scheduler intervals must be positive")
         self.book = book
         self.resources = resources
@@ -51,6 +52,11 @@ class ModelScheduler:
         self._switch_retry_seconds = switch_retry_seconds
         self._switch_intent: SwitchIntent | None = None
         self._next_switch_attempt: dict[str, float] = {}
+        self._switch_window_seconds = switch_window_seconds
+        self._max_switches_in_window = max_switches_in_window
+        self._cooldown_seconds = cooldown_seconds
+        self._switch_successes: deque[float] = deque()
+        self._cold_load_not_before = 0.0
         self._recovery_task: asyncio.Task[None] | None = None
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
@@ -130,7 +136,13 @@ class ModelScheduler:
                 self._condition.notify_all()
 
     def _cold_request_eligible(self, item) -> bool:
-        return monotonic() >= self._next_switch_attempt.get(item.model_id, 0)
+        runtime = self.book.runtime[item.model_id]
+        if runtime.state.value == "loading" or runtime.state.value == "evicting":
+            return False
+        if runtime.state.value == "unloaded":
+            now = monotonic()
+            return now >= self._cold_load_not_before and now >= self._next_switch_attempt.get(item.model_id, 0)
+        return True
 
     def _establish_or_advance_switch(self, request_id: str, model_id: str, sample: MemorySample, deadline: float, now: float) -> bool:
         """Freeze one complete eviction set, then stop it only after it drains."""
@@ -183,7 +195,9 @@ class ModelScheduler:
             observation: Observation = await self.backend.load(operation, deadline)
             async with self._condition:
                 if observation.presence is Presence.RUNNING and observation.healthy:
-                    self.book.loaded(operation, monotonic())
+                    now = monotonic()
+                    self.book.loaded(operation, now)
+                    self._record_cold_load(now)
                 else:
                     self.book.failed(operation, observation.detail_code or "load_unverified")
                     recover = self.recovery is not None and not self.book.recovering
@@ -204,6 +218,17 @@ class ModelScheduler:
                 self._condition.notify_all()
             if recover:
                 self._start_recovery(deadline)
+
+    def _record_cold_load(self, now: float) -> None:
+        self._switch_successes.append(now)
+        while self._switch_successes and now - self._switch_successes[0] > self._switch_window_seconds:
+            self._switch_successes.popleft()
+        if len(self._switch_successes) >= self._max_switches_in_window:
+            self._cold_load_not_before = max(
+                self._cold_load_not_before,
+                now + self._cooldown_seconds,
+                self._switch_successes[0] + self._switch_window_seconds,
+            )
 
     def _start_recovery(self, deadline: float) -> None:
         if self._recovery_task is None or self._recovery_task.done():

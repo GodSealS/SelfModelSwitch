@@ -38,6 +38,9 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         max_evictions=config.scheduler.max_evictions_per_request,
         switch_drain_timeout_seconds=config.scheduler.switch_drain_timeout_seconds,
         switch_retry_seconds=config.scheduler.switch_retry_seconds,
+        switch_window_seconds=config.scheduler.thrash.switch_window_seconds,
+        max_switches_in_window=config.scheduler.thrash.max_switches_in_window,
+        cooldown_seconds=config.scheduler.thrash.cooldown_seconds,
         recovery=recovery,
         admission_guard=storage_guard,
     )

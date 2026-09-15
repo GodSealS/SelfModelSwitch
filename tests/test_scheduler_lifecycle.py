@@ -154,6 +154,27 @@ async def test_only_one_cold_load_runs_across_different_models() -> None:
 
 
 @pytest.mark.asyncio
+async def test_switch_cooldown_delays_only_the_next_cold_load() -> None:
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(
+        two_model_book(), Resources(), backend, poll_interval_seconds=0.001,
+        switch_window_seconds=0.01, max_switches_in_window=1, cooldown_seconds=0.02,
+    )
+    first = await scheduler.acquire("first", "first-request", asyncio.get_running_loop().time() + 1)
+    await scheduler.release(first, Outcome.SUCCESS)
+
+    second_task = asyncio.create_task(scheduler.acquire("second", "second-request", asyncio.get_running_loop().time() + 1))
+    await asyncio.sleep(0.005)
+    assert backend.loads == 1
+    ready = await scheduler.acquire("first", "ready-request", asyncio.get_running_loop().time() + 1)
+    assert ready.model_id == "first"
+    await scheduler.release(ready, Outcome.SUCCESS)
+    second = await second_task
+    assert backend.loads == 2
+    await scheduler.release(second, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
 async def test_unload_requires_backend_stop_evidence() -> None:
     backend = Backend(); backend.finish.set()
     scheduler = ModelScheduler(book(), Resources(), backend)
