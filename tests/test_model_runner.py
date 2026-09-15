@@ -1,7 +1,7 @@
 import pytest
 import signal
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_container_identity, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
 from model_scheduler.storage_monitor import StorageSnapshot
 
 
@@ -77,3 +77,15 @@ def test_runner_refuses_to_label_a_container_with_a_config_not_bound_by_manifest
         require_manifest_config_digest(manifest, "b" * 64)
     with pytest.raises(RunnerError, match="config digest"):
         require_manifest_config_digest({}, "a" * 64)
+
+
+def test_runner_requires_all_three_manifest_identity_labels_before_stop() -> None:
+    labels = {
+        "io.self-model-switch.deployment": "thor-local",
+        "io.self-model-switch.model": "qwen-small",
+        "io.self-model-switch.config-sha256": "a" * 64,
+    }
+    require_container_identity(labels, "thor-local", "qwen-small", "a" * 64)
+    labels["io.self-model-switch.config-sha256"] = "b" * 64
+    with pytest.raises(RunnerError, match="container identity"):
+        require_container_identity(labels, "thor-local", "qwen-small", "a" * 64)

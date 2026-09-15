@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 from model_scheduler.config import ConfigError, load_config
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_container_identity, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
 from model_scheduler.storage_monitor import StorageMonitor
 
 
@@ -54,7 +54,7 @@ def _verify_storage() -> None:
     require_storage_ready(monitor, config.models)
 
 
-def _stop(name: str, deployment_id: str, model_id: str) -> int:
+def _stop(name: str, deployment_id: str, model_id: str, config_sha256: str) -> int:
     inspect = subprocess.run(["docker", "inspect", name], capture_output=True, text=True, timeout=10)
     if inspect.returncode:
         return 0
@@ -63,9 +63,7 @@ def _stop(name: str, deployment_id: str, model_id: str) -> int:
         labels = record["Config"]["Labels"]
     except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RunnerError("cannot verify container labels") from exc
-    if (labels.get("io.self-model-switch.deployment") != deployment_id
-            or labels.get("io.self-model-switch.model") != model_id):
-        raise RunnerError("refusing to stop unmanaged container")
+    require_container_identity(labels, deployment_id, model_id, config_sha256)
     return subprocess.run(["docker", "stop", "--time", "30", name], timeout=45).returncode
 
 
@@ -89,7 +87,11 @@ def main(argv: list[str] | None = None) -> int:
             deployment_id = manifest.get("deployment_id")
             if not isinstance(deployment_id, str):
                 raise RunnerError("invalid manifest deployment")
-            return _stop(name, deployment_id, args.model_id)
+            config_sha256 = manifest.get("config_sha256")
+            if not isinstance(config_sha256, str):
+                raise RunnerError("invalid manifest config digest")
+            require_manifest_config_digest(manifest, config_sha256)
+            return _stop(name, deployment_id, args.model_id, config_sha256)
         _verify_storage()
         config_digest = _config_digest()
         require_manifest_config_digest(manifest, config_digest)

@@ -50,6 +50,16 @@ def require_manifest_config_digest(manifest: Mapping[str, Any], config_digest: s
         raise RunnerError("manifest config digest mismatch")
 
 
+def require_container_identity(labels: Mapping[str, Any], deployment_id: str, model_id: str, config_sha256: str) -> None:
+    expected = {
+        "io.self-model-switch.deployment": deployment_id,
+        "io.self-model-switch.model": model_id,
+        "io.self-model-switch.config-sha256": config_sha256,
+    }
+    if any(labels.get(key) != value for key, value in expected.items()):
+        raise RunnerError("container identity mismatch")
+
+
 def docker_stop_argv(requested_name: str, manifest_name: str) -> list[str] | None:
     if requested_name != manifest_name or not manifest_name.startswith("sms-"):
         return None
