@@ -34,3 +34,13 @@ def test_manual_unload_does_not_return_success_without_stop_evidence() -> None:
         response = client.post("/api/models/qwen-small/unload")
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "stop_unverified"
+
+
+def test_lifespan_starts_injected_preload_without_blocking_live_endpoint() -> None:
+    class PreloadingScheduler:
+        called = False
+        async def preload(self, deadline): self.called = True
+    scheduler = PreloadingScheduler()
+    with TestClient(create_app(scheduler=scheduler)) as client:
+        assert client.get("/live").status_code == 200
+        assert scheduler.called is True

@@ -5,7 +5,7 @@ that would make imports perform control-plane I/O and hide startup failures.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import asyncio
 import inspect
 import json
@@ -79,10 +79,25 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.shutting_down = False
-        # T05 installs the scheduler recovery task here.  Do not block lifespan on
-        # model loading: /live must remain available when a dependency is down.
+        app.state.preload_error = None
+        app.state.preload_task = None
+        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "preload", None)):
+            task = asyncio.create_task(app.state.scheduler.preload(monotonic() + config.llama_swap.load_timeout_seconds))
+            app.state.preload_task = task
+            def record_preload(task: asyncio.Task) -> None:
+                with suppress(asyncio.CancelledError):
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        app.state.preload_error = str(exc)
+            task.add_done_callback(record_preload)
         yield
         app.state.shutting_down = True
+        task = app.state.preload_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     app = FastAPI(title="AGX Thor Model Scheduler", version="1.0", lifespan=lifespan)
     app.state.config = config
