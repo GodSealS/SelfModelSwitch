@@ -196,3 +196,16 @@ async def test_cold_load_evicts_a_complete_idle_prefix_before_loading() -> None:
     assert backend.stops == ["resident"]
     assert registry.runtime["resident"].state.value == "unloaded"
     assert lease.model_id == "target"
+
+
+@pytest.mark.asyncio
+async def test_preload_residency_does_not_create_a_user_lease_or_heat() -> None:
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, preload=True)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    assert await scheduler.preload(asyncio.get_running_loop().time() + 1) == ("chat",)
+    runtime = registry.runtime["chat"]
+    assert runtime.state.value == "ready"
+    assert runtime.total_requests == 0 and not runtime.leases and registry.heat("chat", 1) == 0

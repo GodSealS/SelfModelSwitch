@@ -43,6 +43,7 @@ class ModelSpec:
     max_concurrency: int = 1
     pinned: bool = False
     evictable: bool = True
+    preload: bool = False
     ttl_seconds: float = 0
 
 

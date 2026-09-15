@@ -163,6 +163,51 @@ class ModelScheduler:
             self.book.release(lease, outcome, monotonic(), tokens)
             self._condition.notify_all()
 
+    async def preload(self, deadline: float) -> tuple[str, ...]:
+        """Bring configured resident models to READY without granting user leases."""
+        ready: list[str] = []
+        for model_id, spec in self.book.specs.items():
+            if spec.preload:
+                await self._preload_one(model_id, deadline)
+                ready.append(model_id)
+        return tuple(ready)
+
+    async def _preload_one(self, model_id: str, deadline: float) -> None:
+        while True:
+            needs_sample = False
+            async with self._condition:
+                runtime = self.book.runtime[model_id]
+                if runtime.state.value == "ready":
+                    return
+                if runtime.state.value == "error":
+                    raise ModelUnavailable(runtime.last_error or "preload_failed")
+                needs_sample = (runtime.state.value == "unloaded" and not self._loads and self._eviction is None)
+            if needs_sample:
+                snapshot = await self.resources.snapshot()
+                sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
+                async with self._condition:
+                    runtime = self.book.runtime[model_id]
+                    now = monotonic()
+                    if runtime.state.value == "unloaded" and not self._loads and self._eviction is None:
+                        if self.book.can_load(model_id, sample, now):
+                            operation = self.book.begin_load(model_id, sample, now)
+                            self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                        else:
+                            candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
+                            if candidates:
+                                operations = self.book.begin_eviction([candidate.model_id for candidate in candidates])
+                                self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
+                    self._condition.notify_all()
+                continue
+            async with self._condition:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("preload deadline elapsed")
+                try:
+                    await asyncio.wait_for(self._condition.wait(), remaining)
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("preload deadline elapsed") from exc
+
     async def recover(self, deadline: float) -> None:
         """Reconcile all model accounting through the injected root-owned helper."""
         if self.recovery is None:
