@@ -49,6 +49,19 @@ def _error(status: int, code: str, message: str, request_id: str, param: str | N
     return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers=headers)
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_non_finite_json_constant(_: str) -> object:
+    raise ValueError("non-finite JSON number")
+
+
 async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float) -> dict[str, object]:
     content_type = request.headers.get("content-type", "")
     if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -71,8 +84,8 @@ async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float
     if len(raw) > max_bytes:
         raise BodyError(413, "request_too_large", "Request body exceeds the configured limit")
     try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(raw, object_pairs_hook=_unique_json_object, parse_constant=_reject_non_finite_json_constant)
+    except (UnicodeDecodeError, ValueError) as exc:
         raise BodyError(400, "invalid_json", "Request body is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise BodyError(400, "invalid_json", "Request body must be a JSON object")

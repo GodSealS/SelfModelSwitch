@@ -141,6 +141,24 @@ def test_chat_rejects_non_json_and_oversized_bodies_before_admission() -> None:
     assert scheduler.releases == []
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"model":"qwen-small","model":"qwen-large","messages":[]}',
+        b'{"model":"qwen-small","messages":[],"temperature":NaN}',
+        b'{"model":"qwen-small","messages":[],"temperature":Infinity}',
+    ],
+)
+def test_chat_rejects_duplicate_and_non_finite_json_values_before_admission(payload: bytes) -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=Gateway())) as client:
+        response = client.post("/v1/chat/completions", content=payload, headers={"content-type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert response.headers["x-request-id"] == response.json()["request_id"]
+    assert scheduler.releases == []
+
+
 def test_chat_maps_queue_full_and_queue_deadline_to_distinct_public_errors() -> None:
     class FullScheduler(Scheduler):
         async def acquire(self, model_id, request_id, deadline):
