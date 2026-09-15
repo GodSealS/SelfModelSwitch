@@ -46,7 +46,8 @@ def _config_path(explicit: str | Path | None) -> Path:
 
 def _error(status: int, code: str, message: str, request_id: str, param: str | None = None, extra_headers: dict[str, str] | None = None) -> JSONResponse:
     headers = {"X-Request-ID": request_id, **(extra_headers or {})}
-    return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers=headers)
+    error_type = "invalid_request_error" if status < 500 else "server_error" if status == 500 else "upstream_error"
+    return JSONResponse(status_code=status, content={"error": {"message": message, "type": error_type, "code": code, "param": param}, "request_id": request_id}, headers=headers)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -202,7 +203,12 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def framework_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
         request_id = str(uuid4())
         code = "not_found" if exc.status_code == 404 else "method_not_allowed" if exc.status_code == 405 else "http_error"
-        return _error(exc.status_code, code, str(exc.detail), request_id)
+        return _error(exc.status_code, code, str(exc.detail), request_id, extra_headers=dict(exc.headers or {}))
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(_: Request, __: Exception) -> JSONResponse:
+        request_id = str(uuid4())
+        return _error(500, "internal_error", "Internal server error", request_id)
 
     @app.get("/live")
     async def live() -> dict[str, bool]:

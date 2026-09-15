@@ -130,6 +130,25 @@ def test_framework_not_found_errors_use_the_standard_request_id_shape() -> None:
     assert response.json()["request_id"] == response.headers["x-request-id"]
 
 
+def test_framework_method_errors_preserve_allow_and_unhandled_errors_are_standardized() -> None:
+    app = create_app()
+
+    @app.get("/_test/unhandled")
+    async def unhandled():
+        raise RuntimeError("test failure")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        method_error = client.get("/v1/chat/completions")
+        server_error = client.get("/_test/unhandled")
+    assert method_error.status_code == 405
+    assert method_error.headers["allow"] == "POST"
+    assert method_error.json()["error"]["code"] == "method_not_allowed"
+    assert method_error.json()["request_id"] == method_error.headers["x-request-id"]
+    assert server_error.status_code == 500
+    assert server_error.json()["error"]["code"] == "internal_error"
+    assert server_error.json()["request_id"] == server_error.headers["x-request-id"]
+
+
 def test_lifespan_invokes_injected_scheduler_shutdown() -> None:
     class ShutdownScheduler:
         called = False
