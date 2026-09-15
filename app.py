@@ -5,6 +5,7 @@ that would make imports perform control-plane I/O and hide startup failures.
 """
 from __future__ import annotations
 
+import base64
 from contextlib import asynccontextmanager, suppress
 import asyncio
 import inspect
@@ -12,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import struct
 from time import monotonic
 from uuid import uuid4
 
@@ -344,20 +346,47 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         inputs = [body.input] if isinstance(body.input, str) else body.input
         if not inputs or len(inputs) > 256 or any(not value.strip() for value in inputs):
             return _error(400, "invalid_request", "Embedding input is invalid", request_id, "input")
-        context, error = await acquire_json(body.model, Capability.EMBEDDINGS, payload, request_id)
+        upstream_payload = dict(payload)
+        upstream_payload["encoding_format"] = "float"
+        context, error = await acquire_json(body.model, Capability.EMBEDDINGS, upstream_payload, request_id)
         if error: return error
         lease, opened, result = context
         data = result.get("data") if isinstance(result, dict) else None
-        if not isinstance(data, list) or len(data) != len(inputs) or {item.get("index") for item in data if isinstance(item, dict)} != set(range(len(inputs))):
+        if not isinstance(data, list) or len(data) != len(inputs) or not all(isinstance(item, dict) for item in data):
             await close_and_release(opened, lease, Outcome.ABORTED)
             return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+        vectors: list[tuple[int, list[int | float], bytes]] = []
+        expected_dimensions: int | None = None
         for item in data:
+            index = item.get("index")
             vector = item.get("embedding")
-            if not isinstance(vector, list) or not vector or any(type(x) not in (int, float) or not math.isfinite(x) for x in vector):
+            if type(index) is not int or not isinstance(vector, list) or not vector or any(type(x) not in (int, float) or not math.isfinite(x) for x in vector):
                 await close_and_release(opened, lease, Outcome.ABORTED)
                 return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+            if expected_dimensions is None:
+                expected_dimensions = len(vector)
+            if len(vector) != expected_dimensions:
+                await close_and_release(opened, lease, Outcome.ABORTED)
+                return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+            try:
+                packed = struct.pack(f"<{len(vector)}f", *vector)
+            except (OverflowError, struct.error):
+                await close_and_release(opened, lease, Outcome.ABORTED)
+                return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+            vectors.append((index, vector, packed))
+        if {index for index, _, _ in vectors} != set(range(len(inputs))):
+            await close_and_release(opened, lease, Outcome.ABORTED)
+            return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
         await close_and_release(opened, lease, Outcome.SUCCESS)
-        return JSONResponse(content={"object": "list", "data": sorted(data, key=lambda item: item["index"]), "model": body.model}, headers={"X-Request-ID": request_id})
+        encoded = [
+            {
+                "object": "embedding",
+                "index": index,
+                "embedding": base64.b64encode(packed).decode("ascii") if body.encoding_format == "base64" else vector,
+            }
+            for index, vector, packed in sorted(vectors)
+        ]
+        return JSONResponse(content={"object": "list", "data": encoded, "model": body.model}, headers={"X-Request-ID": request_id})
 
     @app.post("/v1/rerank")
     async def rerank(request: Request):

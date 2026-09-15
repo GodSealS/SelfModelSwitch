@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import struct
+
 from fastapi.testclient import TestClient
 
 from app import create_app
@@ -34,6 +37,34 @@ def test_embeddings_validates_and_returns_indexed_direct_response() -> None:
     assert response.status_code == 200
     assert response.json()["data"][0]["index"] == 0
     assert scheduler.outcomes == [Outcome.SUCCESS]
+
+
+def test_embeddings_convert_finite_float_vectors_to_little_endian_base64() -> None:
+    class RecordingGateway(Gateway):
+        async def open(self, lease, capability, payload, deadline):
+            assert payload["encoding_format"] == "float"
+            return await super().open(lease, capability, payload, deadline)
+
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=RecordingGateway())) as client:
+        response = client.post("/v1/embeddings", json={"model": "embedding", "input": "hello", "encoding_format": "base64"})
+    embedding = base64.b64decode(response.json()["data"][0]["embedding"])
+    assert response.status_code == 200
+    assert struct.unpack("<2f", embedding) == (1.0, 2.0)
+    assert scheduler.outcomes == [Outcome.SUCCESS]
+
+
+def test_embeddings_reject_vectors_with_inconsistent_dimensions() -> None:
+    class BadDimensionsGateway:
+        async def open(self, lease, capability, payload, deadline):
+            return Opened({"data": [{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": [2.0, 3.0]}]})
+
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=BadDimensionsGateway())) as client:
+        response = client.post("/v1/embeddings", json={"model": "embedding", "input": ["one", "two"]})
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_protocol_error"
+    assert scheduler.outcomes == [Outcome.ABORTED]
 
 
 def test_rerank_stably_sorts_scores_and_optionally_returns_documents() -> None:
