@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import threading
 
 from app import create_app
 from model_scheduler.scheduler import ModelUnavailable
@@ -99,6 +100,26 @@ def test_preload_failure_keeps_health_unready() -> None:
         response = client.get("/health")
     assert response.status_code == 503
     assert response.json()["checks"]["preload"] is False
+
+
+def test_lifespan_retries_failed_preload_and_only_then_reports_ready() -> None:
+    class RetryingScheduler:
+        calls = 0
+        completed = threading.Event()
+
+        async def preload(self, deadline):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("first preload failed")
+            self.completed.set()
+
+    checks = lambda: {"llama_swap": True, "storage": True, "resources": True, "preload": True, "control": True}
+    scheduler = RetryingScheduler()
+    with TestClient(create_app(scheduler=scheduler, health_checks=checks, preload_retry_delays=(0.001,))) as client:
+        assert scheduler.completed.wait(1)
+        response = client.get("/health")
+    assert scheduler.calls == 2
+    assert response.status_code == 200
 
 
 def test_framework_not_found_errors_use_the_standard_request_id_shape() -> None:

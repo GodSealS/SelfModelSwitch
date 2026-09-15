@@ -79,8 +79,10 @@ async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float
     return payload
 
 
-def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover."""
+    if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
+        raise ValueError("preload_retry_delays must contain positive values")
     config = load_config(_config_path(config_path))
     owned_client = None
     if scheduler is None and backend is not None:
@@ -94,6 +96,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def lifespan(app: FastAPI):
         app.state.shutting_down = False
         app.state.preload_error = None
+        app.state.preload_pending = False
         app.state.preload_task = None
         app.state.storage_watch_task = None
         if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "monitor_storage_once", None)):
@@ -110,15 +113,25 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                     await asyncio.sleep(config.resources.sample_interval_seconds)
             app.state.storage_watch_task = asyncio.create_task(watch_storage())
         if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "preload", None)):
-            task = asyncio.create_task(app.state.scheduler.preload(monotonic() + config.llama_swap.load_timeout_seconds))
-            app.state.preload_task = task
-            def record_preload(task: asyncio.Task) -> None:
-                with suppress(asyncio.CancelledError):
+            async def preload_with_backoff() -> None:
+                attempt = 0
+                while not app.state.shutting_down:
                     try:
-                        task.result()
+                        await app.state.scheduler.preload(monotonic() + config.llama_swap.load_timeout_seconds)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as exc:
                         app.state.preload_error = str(exc)
-            task.add_done_callback(record_preload)
+                        delay = preload_retry_delays[min(attempt, len(preload_retry_delays) - 1)]
+                        attempt += 1
+                        await asyncio.sleep(delay)
+                    else:
+                        app.state.preload_error = None
+                        app.state.preload_pending = False
+                        return
+            app.state.preload_pending = True
+            task = asyncio.create_task(preload_with_backoff())
+            app.state.preload_task = task
         yield
         app.state.shutting_down = True
         storage_task = app.state.storage_watch_task
@@ -204,7 +217,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                 }
             except Exception:
                 checks = {key: False for key in required}
-        if app.state.preload_error is not None:
+        if app.state.preload_pending or app.state.preload_error is not None:
             checks["preload"] = False
         ready = all(checks.values()) and not app.state.shutting_down
         return JSONResponse(status_code=200 if ready else 503, content={"ok": ready, "checks": checks, "reason": None if ready else "dependencies_unready"})
