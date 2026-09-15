@@ -230,7 +230,10 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     try: data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc: raise DeployError("cannot read deployment input") from exc
     validated = validate(data, mode)
+    report_bytes = Path(validated["validation_report"]).read_bytes() if mode == "production" else None
     manifest = json.loads(json.dumps(validated))
+    if report_bytes is not None:
+        manifest["validation_report"] = "thor-report.json"
     for model_id in _MODELS:
         manifest["models"][model_id]["container_name"] = f"sms-{manifest['deployment_id']}-{model_id}"
     if destination.exists() and any(destination.iterdir()): raise DeployError("output directory must be empty")
@@ -239,6 +242,8 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     manifest["config_sha256"] = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (destination / "config.yaml").write_text(config_text, encoding="utf-8")
+    if report_bytes is not None:
+        (destination / "thor-report.json").write_bytes(report_bytes)
     (destination / "llama-swap.yaml").write_text(yaml.safe_dump(_llama_swap_config(manifest), sort_keys=False), encoding="utf-8")
     (destination / "fstab.fragment").write_text(f"UUID={manifest['ssd_uuid']} /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n", encoding="utf-8")
     (destination / "model-scheduler.service").write_text(_render_unit("model-scheduler.service"), encoding="utf-8")

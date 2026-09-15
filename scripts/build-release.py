@@ -16,6 +16,7 @@ class ReleaseError(ValueError):
 
 
 _DEPLOYMENT_FILES = frozenset({"manifest.json", "config.yaml", "llama-swap.yaml", "fstab.fragment", "model-scheduler.service", "llama-swap.service"})
+_OPTIONAL_DEPLOYMENT_FILES = frozenset({"thor-report.json"})
 
 
 def _tracked_files(root: Path) -> list[Path]:
@@ -27,7 +28,8 @@ def _tracked_files(root: Path) -> list[Path]:
 def build(root: Path, deployment: Path, output: Path, release_id: str) -> Path:
     if not release_id or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for char in release_id):
         raise ReleaseError("invalid release id")
-    if not deployment.is_dir() or {path.name for path in deployment.iterdir()} != _DEPLOYMENT_FILES:
+    deployment_files = {path.name for path in deployment.iterdir()} if deployment.is_dir() else set()
+    if not _DEPLOYMENT_FILES <= deployment_files or deployment_files - _DEPLOYMENT_FILES - _OPTIONAL_DEPLOYMENT_FILES:
         raise ReleaseError("deployment directory is incomplete")
     if output.exists() and any(output.iterdir()):
         raise ReleaseError("release output directory must be empty")

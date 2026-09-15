@@ -29,3 +29,13 @@ def test_release_archive_is_auditable_and_excludes_workspace_state(tmp_path: Pat
     assert "self-model-switch-test-1/requirements.lock" in names
     assert "self-model-switch-test-1/requirements-dev.lock" in names
     assert not any(".venv" in name or name.endswith("config.yaml") for name in names if "/deployment/" not in name)
+
+
+def test_release_archive_retains_a_verified_thor_report_when_present(tmp_path: Path) -> None:
+    source = tmp_path / "input.json"; source.write_text(json.dumps(_input()))
+    deployment = tmp_path / "deployment"; render(source, "lab", deployment)
+    (deployment / "thor-report.json").write_text('{"schema_version":1}\n')
+    output = tmp_path / "releases"
+    subprocess.run([".venv/bin/python", "scripts/build-release.py", "--deployment", str(deployment), "--output", str(output), "--release-id", "test-2"], text=True, capture_output=True, check=True)
+    with tarfile.open(output / "self-model-switch-test-2.tar.gz") as bundle:
+        assert "self-model-switch-test-2/deployment/thor-report.json" in bundle.getnames()

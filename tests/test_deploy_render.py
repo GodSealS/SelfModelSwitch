@@ -98,7 +98,9 @@ def test_production_report_must_match_manifest_model_measurements(tmp_path) -> N
     report.write_text(json.dumps(validation_report(payload)))
     payload["validation_report"] = str(report)
     source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
-    render(source, "production", tmp_path / "out")
+    manifest = render(source, "production", tmp_path / "out")
+    assert manifest["validation_report"] == "thor-report.json"
+    assert (tmp_path / "out" / "thor-report.json").read_text() == report.read_text()
     payload["models"]["qwen-small"]["parallel"] = 2
     source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="validation report"):

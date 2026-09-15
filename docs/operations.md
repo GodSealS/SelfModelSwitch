@@ -18,6 +18,9 @@ python -m model_scheduler.deploy render --input deploy-input.json --mode product
 Review `manifest.json`, `config.yaml`, `llama-swap.yaml`, both service units,
 and `fstab.fragment`. The fragment is a suggestion only; merge it into
 `/etc/fstab` manually after review. Never run a formatter from this project.
+Production render copies its validated prompt-free hardware evidence as
+`thor-report.json` into the deployment directory; retain that file in the
+release archive with the manifest it validates.
 
 ## Install and start
 
