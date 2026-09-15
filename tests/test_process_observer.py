@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from model_scheduler.contracts import Presence
 from model_scheduler.process_observer import ProcessObserver
@@ -22,3 +23,18 @@ def test_stopped_needs_both_no_container_and_closed_port() -> None:
     result = observer.observe("qwen-small", "sms-thor-local-qwen-small", 10003)
 
     assert result.presence is Presence.UNKNOWN
+
+
+def test_default_health_probe_accepts_only_loopback_http_200() -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("model_scheduler.process_observer.urlopen", return_value=Response()) as request:
+        assert ProcessObserver._health_endpoint(10003) is True
+    assert request.call_args.args[0].full_url == "http://127.0.0.1:10003/health"

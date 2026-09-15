@@ -6,6 +6,8 @@ import socket
 import subprocess
 from time import monotonic
 from typing import Callable
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from .contracts import Observation, Presence
 
@@ -15,7 +17,7 @@ class ProcessObserver:
         self.deployment_id, self.image_digest, self.config_sha256 = deployment_id, image_digest, config_sha256
         self._inspect = inspect or self._docker_inspect
         self._port_open = port_open or self._port_is_open
-        self._health = health or (lambda _: False)
+        self._health = health or self._health_endpoint
 
     @staticmethod
     def _docker_inspect(args: list[str]) -> str:
@@ -26,6 +28,16 @@ class ProcessObserver:
         with socket.socket() as sock:
             sock.settimeout(0.5)
             return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    @staticmethod
+    def _health_endpoint(port: int) -> bool:
+        """Probe only the model's fixed loopback health endpoint."""
+        try:
+            request = Request(f"http://127.0.0.1:{port}/health", method="GET")
+            with urlopen(request, timeout=0.5) as response:  # noqa: S310 - fixed loopback URL
+                return response.status == 200
+        except (OSError, URLError):
+            return False
 
     def observe(self, model_id: str, container_name: str, port: int) -> Observation:
         try:
