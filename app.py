@@ -16,6 +16,7 @@ from time import monotonic
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -111,6 +112,12 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             await opened.aclose()
         finally:
             await app.state.scheduler.release(lease, outcome, tokens)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def framework_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+        request_id = str(uuid4())
+        code = "not_found" if exc.status_code == 404 else "method_not_allowed" if exc.status_code == 405 else "http_error"
+        return _error(exc.status_code, code, str(exc.detail), request_id)
 
     @app.get("/live")
     async def live() -> dict[str, bool]:

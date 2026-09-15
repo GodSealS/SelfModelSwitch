@@ -54,3 +54,11 @@ def test_preload_failure_keeps_health_unready() -> None:
         response = client.get("/health")
     assert response.status_code == 503
     assert response.json()["checks"]["preload"] is False
+
+
+def test_framework_not_found_errors_use_the_standard_request_id_shape() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/does-not-exist")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["request_id"] == response.headers["x-request-id"]
