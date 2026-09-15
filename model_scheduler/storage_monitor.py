@@ -106,9 +106,21 @@ class StorageMonitor:
 class StorageAdmissionGuard:
     """Async scheduler port that fails closed on mount or model-file uncertainty."""
 
-    def __init__(self, monitor: StorageMonitor, models: Mapping[str, Any]):
+    def __init__(self, monitor: StorageMonitor, models: Mapping[str, Any], *, sample_interval_seconds: float = 1):
+        if sample_interval_seconds <= 0:
+            raise ValueError("sample_interval_seconds must be positive")
         self.monitor = monitor
         self.models = dict(models)
+        self.sample_interval_seconds = sample_interval_seconds
+        self._lock = asyncio.Lock()
+        self._last_check_at = float("-inf")
+        self._last_snapshot: StorageSnapshot | None = None
 
     async def __call__(self) -> bool:
-        return (await asyncio.to_thread(self.monitor.check, self.models)).ready
+        async with self._lock:
+            now = monotonic()
+            if self._last_snapshot is not None and now - self._last_check_at < self.sample_interval_seconds:
+                return self._last_snapshot.ready
+            self._last_snapshot = await asyncio.to_thread(self.monitor.check, self.models)
+            self._last_check_at = now
+            return self._last_snapshot.ready

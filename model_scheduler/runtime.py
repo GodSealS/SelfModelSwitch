@@ -29,7 +29,7 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
     )
     for model_id in book.specs:
         book.bootstrap_stopped(model_id)
-    guard = storage_guard or StorageAdmissionGuard(
+    guard = storage_guard if storage_guard is not None else StorageAdmissionGuard(
         StorageMonitor(
             config.storage.mount_path,
             config.storage.model_directory,
@@ -37,6 +37,7 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
             config.storage.filesystem,
         ),
         config.models,
+        sample_interval_seconds=config.resources.sample_interval_seconds,
     )
     return ModelScheduler(
         book,

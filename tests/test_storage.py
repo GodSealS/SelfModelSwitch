@@ -6,7 +6,7 @@ from pathlib import Path
 
 import asyncio
 
-from model_scheduler.storage_monitor import StorageAdmissionGuard, StorageMonitor
+from model_scheduler.storage_monitor import StorageAdmissionGuard, StorageMonitor, StorageSnapshot
 
 
 def findmnt(uuid: str, target: str = "/mnt/model-ssd") -> str:
@@ -72,3 +72,21 @@ def test_async_storage_guard_exposes_monitor_readiness(tmp_path: Path) -> None:
     (models / "embedding.gguf").write_bytes(b"model")
     monitor = StorageMonitor(mount, models, "expected", "ext4", runner=lambda _: findmnt("expected", str(mount)))
     assert asyncio.run(StorageAdmissionGuard(monitor, {"embedding": "embedding.gguf"})()) is True
+
+
+def test_storage_guard_coalesces_concurrent_checks_within_its_sample_interval() -> None:
+    class Monitor:
+        calls = 0
+
+        def check(self, models):
+            self.calls += 1
+            return StorageSnapshot(True, None, 0, {})
+
+    monitor = Monitor()
+    guard = StorageAdmissionGuard(monitor, {"embedding": "embedding.gguf"}, sample_interval_seconds=60)
+
+    async def check_many() -> list[bool]:
+        return await asyncio.gather(*(guard() for _ in range(8)))
+
+    assert asyncio.run(check_many()) == [True] * 8
+    assert monitor.calls == 1
