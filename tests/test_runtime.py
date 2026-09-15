@@ -5,6 +5,7 @@ from pathlib import Path
 from model_scheduler.config import load_config
 from model_scheduler.contracts import MemorySample
 from model_scheduler.runtime import build_scheduler
+from app import create_app
 
 
 
@@ -24,3 +25,9 @@ def test_runtime_builder_wires_strict_config_to_single_scheduler_book(tmp_path) 
     assert scheduler.book.specs["embedding"].preload is True
     assert scheduler.queue_capacity == config.scheduler.queue_capacity
     assert scheduler.book.model_budget == 64 * 1024**3 - config.resources.system_reserve_bytes - config.scheduler.min_free_memory_bytes
+
+
+def test_app_factory_composes_runtime_when_control_backend_is_injected() -> None:
+    app = create_app(backend=Backend(), resources=Resources(), storage_guard=lambda: True)
+    assert app.state.scheduler.book.specs["embedding"].preload is True
+    assert app.state.gateway is not None

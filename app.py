@@ -19,11 +19,14 @@ from fastapi import FastAPI, Request
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
+import httpx
 
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
 from model_scheduler.config import ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.model_registry import Conflict
+from model_scheduler.gateway import DirectInferenceGateway
+from model_scheduler.runtime import build_scheduler
 from model_scheduler.scheduler import ModelUnavailable
 
 
@@ -73,9 +76,16 @@ async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float
     return payload
 
 
-def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover."""
     config = load_config(_config_path(config_path))
+    owned_client = None
+    if scheduler is None and backend is not None:
+        scheduler = build_scheduler(config, backend, resources=resources, storage_guard=storage_guard, recovery=recovery)
+    if gateway is None and scheduler is not None:
+        timeout = httpx.Timeout(config.gateway.inference_timeout_seconds, connect=config.gateway.connect_timeout_seconds, read=config.gateway.read_idle_timeout_seconds, write=config.gateway.write_idle_timeout_seconds, pool=config.gateway.pool_timeout_seconds)
+        owned_client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+        gateway = DirectInferenceGateway({model_id: model.upstream_url for model_id, model in config.models.items()}, owned_client)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -102,12 +112,15 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "shutdown", None)):
             with suppress(Exception):
                 await app.state.scheduler.shutdown(monotonic() + config.server.shutdown_grace_seconds)
+        if app.state.owned_client is not None:
+            await app.state.owned_client.aclose()
 
     app = FastAPI(title="AGX Thor Model Scheduler", version="1.0", lifespan=lifespan)
     app.state.config = config
     app.state.ready = False
     app.state.scheduler = scheduler
     app.state.gateway = gateway
+    app.state.owned_client = owned_client
     app.state.health_checks = health_checks
 
     async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
