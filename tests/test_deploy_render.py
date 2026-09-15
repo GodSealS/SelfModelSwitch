@@ -139,6 +139,16 @@ def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:
     assert result["ok"] is True
 
 
+def test_preflight_rejects_a_config_file_that_no_longer_matches_the_manifest_digest(tmp_path) -> None:
+    source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
+    output = tmp_path / "out"; render(source, "lab", output)
+    config_path = output / "config.yaml"
+    config_path.write_text(config_path.read_text() + "\n")
+
+    with pytest.raises(DeployError, match="config digest"):
+        preflight(output / "manifest.json")
+
+
 def test_collect_writes_read_only_device_facts_once(tmp_path) -> None:
     output = tmp_path / "facts.json"
     calls: list[list[str]] = []

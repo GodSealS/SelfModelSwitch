@@ -251,9 +251,15 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[
     path = Path(manifest_path)
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("deployment_id"), str) or set(manifest.get("models", {})) != _MODELS:
+        if (not isinstance(manifest, dict) or not isinstance(manifest.get("deployment_id"), str)
+                or not isinstance(manifest.get("config_sha256"), str) or not _HASH.fullmatch(manifest["config_sha256"])
+                or set(manifest.get("models", {})) != _MODELS):
             raise DeployError("invalid rendered manifest")
-        config = load_config(path.parent / "config.yaml")
+        config_path = path.parent / "config.yaml"
+        config_text = config_path.read_bytes()
+        if hashlib.sha256(config_text).hexdigest() != manifest["config_sha256"]:
+            raise DeployError("rendered config digest mismatch")
+        config = load_config(config_path)
     except (OSError, json.JSONDecodeError, ConfigError) as exc:
         raise DeployError("cannot read rendered deployment") from exc
     for model_id, model in config.models.items():
