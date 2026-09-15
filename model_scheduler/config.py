@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .contracts import Capability, ModelSpec
+
 
 class ConfigError(ValueError):
     """A configuration is missing, malformed, or unsafe to run."""
@@ -231,3 +233,22 @@ def load_config(path: str | Path) -> AppConfig:
             raise ConfigError(f"models.{model_id}: pinned models must be non-evictable, preloaded, and have ttl_seconds=0")
         models[model_id] = ModelConfig(model_id, _loopback_url(model["upstream_url"], f"models.{model_id}.upstream_url", ports), frozenset(capabilities), filename, digest, _string(model["container_name"], f"models.{model_id}.container_name"), MemoryConfig(_int(memory["reserved_bytes"], f"models.{model_id}.memory.reserved_bytes", 1)), scheduling_cfg, lifecycle_cfg)
     return AppConfig(1, server_cfg, swap_cfg, scheduler_cfg, resources_cfg, storage_cfg, gateway_cfg, models)
+
+
+def model_specs(config: AppConfig) -> dict[str, ModelSpec]:
+    """Project the strict file configuration into the scheduler's sole model contract."""
+    return {
+        model_id: ModelSpec(
+            model_id=model_id,
+            upstream_url=model.upstream_url,
+            capabilities=frozenset(Capability(capability) for capability in model.capabilities),
+            reserved_bytes=model.memory.reserved_bytes,
+            priority=model.scheduling.priority,
+            max_concurrency=model.scheduling.max_concurrency,
+            pinned=model.scheduling.pinned,
+            evictable=model.scheduling.evictable,
+            preload=model.lifecycle.preload,
+            ttl_seconds=model.lifecycle.ttl_seconds,
+        )
+        for model_id, model in config.models.items()
+    }

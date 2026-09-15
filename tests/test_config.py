@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from model_scheduler.config import ConfigError, load_config
+from model_scheduler.config import ConfigError, load_config, model_specs
 
 
 def write_config(tmp_path: Path, text: str) -> Path:
@@ -154,3 +154,10 @@ def test_rejects_pinned_model_with_evictable_or_nonpreload(tmp_path: Path) -> No
 
     with pytest.raises(ConfigError, match="pinned"):
         load_config(write_config(tmp_path, invalid))
+
+
+def test_model_specs_preserve_capabilities_and_preload_intent(tmp_path: Path) -> None:
+    specs = model_specs(load_config(write_config(tmp_path, VALID)))
+    assert specs["embedding"].preload is True
+    assert specs["embedding"].pinned is True
+    assert specs["qwen-small"].capabilities == frozenset({"chat"})
