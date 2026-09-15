@@ -13,10 +13,13 @@ from pathlib import Path
 import subprocess
 import sys
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, run_child_with_signal_forwarding
+from model_scheduler.config import ConfigError, load_config
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.storage_monitor import StorageMonitor
 
 
 MANIFEST = Path("/etc/self-model-switch/manifest.json")
+CONFIG = Path("/etc/self-model-switch/config.yaml")
 MODELS = frozenset({"embedding", "reranker", "qwen-small", "qwen-large"})
 
 
@@ -35,6 +38,20 @@ def _config_digest() -> str:
         return hashlib.sha256(Path("/etc/self-model-switch/config.yaml").read_bytes()).hexdigest()
     except OSError as exc:
         raise RunnerError("scheduler config unavailable") from exc
+
+
+def _verify_storage() -> None:
+    try:
+        config = load_config(CONFIG)
+    except ConfigError as exc:
+        raise RunnerError("scheduler config unavailable") from exc
+    monitor = StorageMonitor(
+        config.storage.mount_path,
+        config.storage.model_directory,
+        config.storage.expected_uuid,
+        config.storage.filesystem,
+    )
+    require_storage_ready(monitor, config.models)
 
 
 def _stop(name: str, deployment_id: str, model_id: str) -> int:
@@ -73,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(deployment_id, str):
                 raise RunnerError("invalid manifest deployment")
             return _stop(name, deployment_id, args.model_id)
+        _verify_storage()
         return run_child_with_signal_forwarding(docker_run_argv(manifest, args.model_id, _config_digest()))
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         print(f"model runner error: {exc}", file=sys.stderr)

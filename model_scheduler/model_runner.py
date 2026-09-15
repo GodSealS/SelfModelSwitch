@@ -37,6 +37,13 @@ def run_child_with_signal_forwarding(
             set_handler(signum, handler)
 
 
+def require_storage_ready(storage: Any, models: Mapping[str, Any]) -> None:
+    """Refuse to start Docker unless the SSD and every declared model verify."""
+    snapshot = storage.check(models)
+    if getattr(snapshot, "ready", None) is not True:
+        raise RunnerError("storage verification failed")
+
+
 def docker_stop_argv(requested_name: str, manifest_name: str) -> list[str] | None:
     if requested_name != manifest_name or not manifest_name.startswith("sms-"):
         return None

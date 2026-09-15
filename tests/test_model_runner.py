@@ -1,7 +1,8 @@
 import pytest
 import signal
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, run_child_with_signal_forwarding
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.storage_monitor import StorageSnapshot
 
 
 def test_runner_only_stops_exact_manifest_container() -> None:
@@ -49,3 +50,21 @@ def test_runner_forwards_service_termination_to_its_own_docker_child_and_waits()
     assert run_child_with_signal_forwarding(["docker", "run"], popen=lambda _: child, set_handler=set_handler) == 143
     assert child.waited is True
     assert child.sent == [signal.SIGTERM]
+
+
+def test_runner_requires_a_verified_storage_snapshot_before_docker_start() -> None:
+    class Storage:
+        def __init__(self, ready: bool) -> None:
+            self.ready = ready
+            self.seen = None
+
+        def check(self, models):
+            self.seen = models
+            return StorageSnapshot(self.ready, None if self.ready else "model_hash_mismatch", 0, {})
+
+    models = {"qwen-small": object()}
+    storage = Storage(True)
+    require_storage_ready(storage, models)
+    assert storage.seen is models
+    with pytest.raises(RunnerError, match="storage verification"):
+        require_storage_ready(Storage(False), models)
