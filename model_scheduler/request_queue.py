@@ -77,6 +77,9 @@ class RequestQueue:
     def waiting_models(self) -> frozenset[str]:
         return frozenset(item.model_id for item in self._items.values())
 
+    def waiting_count(self, model_id: str) -> int:
+        return sum(item.model_id == model_id for item in self._items.values())
+
     def clear(self, state: WaitState = WaitState.CANCELLED) -> tuple[QueuedRequest, ...]:
         items = tuple(self._items.values())
         self._items.clear()

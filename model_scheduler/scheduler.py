@@ -539,9 +539,25 @@ class ModelScheduler:
                 "queue_size": self._queue.size,
                 "models": {
                     model_id: {
-                        "state": runtime.state.value,
+                        "state": "active" if runtime.state.value == "ready" and runtime.leases else runtime.state.value,
                         "generation": runtime.generation,
                         "in_flight": len(runtime.leases),
+                        "waiting_requests": self._queue.waiting_count(model_id),
+                        "capabilities": sorted(capability.value for capability in self.book.specs[model_id].capabilities),
+                        "reserved_bytes": self.book.specs[model_id].reserved_bytes,
+                        "effective_reserved_bytes": self.book.required(model_id),
+                        "priority": self.book.specs[model_id].priority,
+                        "evictable": self.book.specs[model_id].evictable,
+                        "pinned": self.book.specs[model_id].pinned,
+                        "preload": self.book.specs[model_id].preload,
+                        "max_concurrency": self.book.specs[model_id].max_concurrency,
+                        "ttl_seconds": self.book.specs[model_id].ttl_seconds,
+                        "idle_seconds": None if runtime.leases or runtime.idle_since is None else max(0.0, now - runtime.idle_since),
+                        "heat": self.book.heat(model_id, now),
+                        "total_requests": runtime.total_requests,
+                        "total_tokens": runtime.total_tokens,
+                        "usage_unknown_requests": runtime.usage_unknown_requests,
+                        "admission_blocked": runtime.admission_blocked,
                         "last_error": runtime.last_error,
                     }
                     for model_id, runtime in self.book.runtime.items()

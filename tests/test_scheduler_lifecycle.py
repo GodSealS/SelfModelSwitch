@@ -523,3 +523,25 @@ async def test_status_exposes_admission_faults_with_memory_sample_compatible_res
     await scheduler.storage_lost(asyncio.get_running_loop().time() + 1)
     faulted = await scheduler.status()
     assert faulted["admission"]["storage_unavailable"] is True
+
+
+@pytest.mark.asyncio
+async def test_status_projects_model_contract_fields_and_waiting_count() -> None:
+    registry = book()
+    operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)
+    registry.loaded(operation, 0)
+    lease = registry.acquire_ready("chat", "active", 0)
+    scheduler = ModelScheduler(registry, Resources(), Backend())
+    async with scheduler._condition:
+        scheduler._queue.enqueue("waiting", "chat", 0, asyncio.get_running_loop().time() + 1, asyncio.get_running_loop().time())
+
+    model = (await scheduler.status())["models"]["chat"]
+    assert model["state"] == "active"
+    assert model["waiting_requests"] == 1
+    assert model["capabilities"] == ["chat"]
+    assert model["reserved_bytes"] == 100
+    assert model["effective_reserved_bytes"] == 100
+    assert model["max_concurrency"] == 1
+    assert model["idle_seconds"] is None
+    assert model["total_requests"] == 1
+    await scheduler.release(lease, Outcome.SUCCESS)
