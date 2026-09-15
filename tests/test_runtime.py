@@ -12,7 +12,7 @@ import pytest
 from model_scheduler.config import load_config
 from model_scheduler.control_recovery import ControlRecoveryClient
 from model_scheduler.contracts import MemorySample
-from model_scheduler.llama_swap_client import LlamaSwapControlContract
+from model_scheduler.llama_swap_client import ControlRequest, LlamaSwapControlContract
 from model_scheduler.runtime import RuntimeCompositionError, build_backend, build_scheduler
 from app import create_app
 from run import main
@@ -53,7 +53,7 @@ def test_app_factory_composes_runtime_when_control_backend_is_injected() -> None
 def _control_contract() -> LlamaSwapControlContract:
     return LlamaSwapControlContract(
         running_parser=lambda _: [],
-        load_path="/fixed/load",
+        load_request=lambda model_id: ControlRequest("GET", "/fixed/load", params={"model": model_id}),
         unload_path="/fixed/unload/{model_id}",
         validate_load_response=lambda _: None,
         validate_unload_response=lambda _: None,

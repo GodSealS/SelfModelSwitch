@@ -4,13 +4,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from model_scheduler.llama_swap_client import LlamaSwapClient, LlamaSwapControlContract, LlamaSwapError, LlamaSwapProtocolError
+from model_scheduler.llama_swap_client import ControlRequest, LlamaSwapClient, LlamaSwapControlContract, LlamaSwapError, LlamaSwapProtocolError
 
 
 def contract() -> LlamaSwapControlContract:
     return LlamaSwapControlContract(
         running_parser=lambda _: ["qwen-small"],
-        load_path="/props",
+        load_request=lambda model_id: ControlRequest("GET", "/props", params={"model": model_id}),
         unload_path="/api/models/unload/{model_id}",
         validate_load_response=lambda _: None,
         validate_unload_response=lambda _: None,
@@ -21,7 +21,7 @@ def test_control_contract_rejects_paths_with_unbound_template_fields() -> None:
     with pytest.raises(ValueError, match="unload path"):
         LlamaSwapControlContract(
             running_parser=lambda _: [],
-            load_path="/props",
+            load_request=lambda model_id: ControlRequest("GET", "/props", params={"model": model_id}),
             unload_path="/api/{deployment}/unload/{model_id}",
             validate_load_response=lambda _: None,
             validate_unload_response=lambda _: None,
@@ -138,7 +138,7 @@ async def test_successful_control_status_without_the_pinned_response_shape_is_a_
     monkeypatch.setattr("model_scheduler.llama_swap_client.httpx.AsyncClient", lambda **_kwargs: Client())
     strict_contract = LlamaSwapControlContract(
         running_parser=lambda _: ["qwen-small"],
-        load_path="/props",
+        load_request=lambda model_id: ControlRequest("GET", "/props", params={"model": model_id}),
         unload_path="/api/models/unload/{model_id}",
         validate_load_response=lambda response: response.json()["accepted"],
         validate_unload_response=lambda _: None,
@@ -173,10 +173,51 @@ async def test_contract_can_validate_a_pinned_non_json_unload_success_body(monke
     monkeypatch.setattr("model_scheduler.llama_swap_client.httpx.AsyncClient", lambda **_kwargs: Client())
     text_contract = LlamaSwapControlContract(
         running_parser=lambda _: [],
-        load_path="/props",
+        load_request=lambda model_id: ControlRequest("GET", "/props", params={"model": model_id}),
         unload_path="/api/models/unload/{model_id}",
         validate_load_response=lambda _: None,
         validate_unload_response=validate_ok,
     )
 
     await LlamaSwapClient("http://127.0.0.1:8080", contract=text_contract).unload("qwen-small")
+
+
+@pytest.mark.asyncio
+async def test_contract_can_express_a_fixture_derived_post_load_request(monkeypatch) -> None:
+    seen = {}
+
+    class Response:
+        status_code = 200
+        text = "{}"
+        content = b"{}"
+        headers = {"content-type": "application/json"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, **kwargs):
+            seen["url"] = url
+            seen.update(kwargs)
+            return Response()
+
+    monkeypatch.setattr("model_scheduler.llama_swap_client.httpx.AsyncClient", lambda **_kwargs: Client())
+    post_contract = LlamaSwapControlContract(
+        running_parser=lambda _: ["embedding"],
+        load_request=lambda model_id: ControlRequest("POST", "/v1/embeddings", json_body={"model": model_id, "input": "fixture-warmup"}),
+        unload_path="/api/models/unload/{model_id}",
+        validate_load_response=lambda _: None,
+        validate_unload_response=lambda _: None,
+    )
+    client = LlamaSwapClient("http://127.0.0.1:8080", contract=post_contract)
+    client.running = AsyncMock(return_value=["embedding"])
+
+    await client.load("embedding")
+
+    assert seen == {
+        "url": "http://127.0.0.1:8080/v1/embeddings",
+        "json": {"model": "embedding", "input": "fixture-warmup"},
+    }

@@ -30,17 +30,37 @@ class LlamaSwapResponse:
 
 
 @dataclass(frozen=True)
+class ControlRequest:
+    """A release-fixture-derived, non-shell request used only for model load."""
+
+    method: str
+    path: str
+    params: dict[str, str] | None = None
+    json_body: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.method not in {"GET", "POST"} or not self.path.startswith("/") or "?" in self.path or "#" in self.path:
+            raise ValueError("invalid fixed control request")
+        if self.method == "GET" and self.json_body is not None:
+            raise ValueError("GET control request cannot have a JSON body")
+        if self.params is not None and any(type(key) is not str or type(value) is not str for key, value in self.params.items()):
+            raise ValueError("control request params must be strings")
+        if self.json_body is not None and not isinstance(self.json_body, dict):
+            raise ValueError("control request JSON body must be an object")
+
+
+@dataclass(frozen=True)
 class LlamaSwapControlContract:
     """Pinned request paths and response validators for one llama-swap release."""
 
     running_parser: Callable[[Any], list[str]]
-    load_path: str
+    load_request: Callable[[str], ControlRequest]
     unload_path: str
     validate_load_response: Callable[[LlamaSwapResponse], None]
     validate_unload_response: Callable[[LlamaSwapResponse], None]
 
     def __post_init__(self) -> None:
-        if not self.load_path.startswith("/") or not self.unload_path.startswith("/"):
+        if not self.unload_path.startswith("/"):
             raise ValueError("control paths must be absolute")
         if (self.unload_path.count("{model_id}") != 1
                 or "{" in self.unload_path.replace("{model_id}", "")
@@ -97,10 +117,22 @@ class LlamaSwapClient:
     async def load(self, model_id: str):
         """Activate a model through the fixture-derived control request."""
         contract = self._contract()
-        url = f"{self.base_url}{contract.load_path}"
+        try:
+            request = contract.load_request(model_id)
+        except Exception as exc:
+            raise LlamaSwapProtocolError("invalid fixed llama-swap load request") from exc
+        if not isinstance(request, ControlRequest):
+            raise LlamaSwapProtocolError("invalid fixed llama-swap load request")
+        url = f"{self.base_url}{request.path}"
         async with httpx.AsyncClient(timeout=self.load_timeout) as c:
             try:
-                r = await c.get(url, params={"model": model_id})
+                if request.method == "GET":
+                    r = await c.get(url, params=request.params)
+                else:
+                    kwargs: dict[str, Any] = {"json": request.json_body}
+                    if request.params is not None:
+                        kwargs["params"] = request.params
+                    r = await c.post(url, **kwargs)
             except httpx.HTTPError as e:
                 raise LlamaSwapError(f"load transport error for {model_id}: {e}") from e
 
