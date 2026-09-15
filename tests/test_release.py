@@ -26,4 +26,6 @@ def test_release_archive_is_auditable_and_excludes_workspace_state(tmp_path: Pat
     with tarfile.open(archive) as bundle:
         names = bundle.getnames()
     assert "self-model-switch-test-1/deployment/manifest.json" in names
+    assert "self-model-switch-test-1/requirements.lock" in names
+    assert "self-model-switch-test-1/requirements-dev.lock" in names
     assert not any(".venv" in name or name.endswith("config.yaml") for name in names if "/deployment/" not in name)
