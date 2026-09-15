@@ -83,6 +83,17 @@ class OversizedEventGateway:
         return OversizedEvent()
 
 
+class CombinedEventsGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class CombinedEvents(StreamOpened):
+            def iter_bytes(self):
+                async def iterator():
+                    event = b"data: " + b"x" * 600_000 + b"\n\n"
+                    yield event + event + b"data: [DONE]\n\n"
+                return iterator()
+        return CombinedEvents()
+
+
 def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
     scheduler = Scheduler()
     app = create_app(scheduler=scheduler, gateway=Gateway())
@@ -148,6 +159,15 @@ def test_stream_aborts_an_oversized_unterminated_sse_event_without_forwarding_it
     assert response.status_code == 200
     assert response.content == b""
     assert scheduler.releases == [Outcome.ABORTED]
+
+
+def test_stream_allows_multiple_valid_sse_events_combined_in_one_large_chunk() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=CombinedEventsGateway())) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert response.status_code == 200
+    assert response.content.endswith(b"data: [DONE]\n\n")
+    assert scheduler.releases == [Outcome.SUCCESS]
 
 
 def test_chat_rejects_non_json_and_oversized_bodies_before_admission() -> None:

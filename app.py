@@ -328,18 +328,24 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                 async def stream_body():
                     outcome = Outcome.ABORTED
                     pending = b""
+                    event_bytes = 0
                     try:
                         async for chunk in opened.iter_bytes():
                             pending += chunk
-                            if len(pending) > config.gateway.max_sse_event_bytes:
-                                return
                             lines = pending.splitlines(keepends=True)
                             pending = b""
                             if lines and not lines[-1].endswith((b"\n", b"\r")):
                                 pending = lines.pop()
                             for line in lines:
+                                event_bytes += len(line)
+                                if event_bytes > config.gateway.max_sse_event_bytes:
+                                    return
                                 if line.rstrip(b"\r\n") == b"data: [DONE]":
                                     outcome = Outcome.SUCCESS
+                                if not line.rstrip(b"\r\n"):
+                                    event_bytes = 0
+                            if len(pending) > config.gateway.max_sse_event_bytes:
+                                return
                             yield chunk
                     finally:
                         try:
