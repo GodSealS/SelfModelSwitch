@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -17,14 +18,26 @@ class LlamaSwapProtocolError(LlamaSwapError):
 
 
 @dataclass(frozen=True)
+class LlamaSwapResponse:
+    """Immutable response evidence passed to a fixture-derived validator."""
+
+    status_code: int
+    content_type: str | None
+    body: bytes
+
+    def json(self) -> Any:
+        return json.loads(self.body)
+
+
+@dataclass(frozen=True)
 class LlamaSwapControlContract:
     """Pinned request paths and response validators for one llama-swap release."""
 
     running_parser: Callable[[Any], list[str]]
     load_path: str
     unload_path: str
-    validate_load_response: Callable[[Any], None]
-    validate_unload_response: Callable[[Any], None]
+    validate_load_response: Callable[[LlamaSwapResponse], None]
+    validate_unload_response: Callable[[LlamaSwapResponse], None]
 
     def __post_init__(self) -> None:
         if not self.load_path.startswith("/") or not self.unload_path.startswith("/"):
@@ -125,6 +138,11 @@ class LlamaSwapClient:
     @staticmethod
     def _validate_response(response: Any, validator: Callable[[Any], None], action: str) -> None:
         try:
-            validator(response.json())
+            content_type = response.headers.get("content-type")
+            media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else None
+            body = response.content
+            if not isinstance(body, bytes):
+                raise TypeError("control response body must be bytes")
+            validator(LlamaSwapResponse(response.status_code, media_type, body))
         except Exception as exc:
             raise LlamaSwapProtocolError(f"invalid fixed llama-swap {action} response") from exc

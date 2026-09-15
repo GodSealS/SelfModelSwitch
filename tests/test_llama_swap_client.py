@@ -118,6 +118,8 @@ async def test_successful_control_status_without_the_pinned_response_shape_is_a_
     class Response:
         status_code = 200
         text = "{}"
+        content = b"{}"
+        headers = {"content-type": "application/json"}
 
         @staticmethod
         def json():
@@ -138,9 +140,43 @@ async def test_successful_control_status_without_the_pinned_response_shape_is_a_
         running_parser=lambda _: ["qwen-small"],
         load_path="/props",
         unload_path="/api/models/unload/{model_id}",
-        validate_load_response=lambda payload: payload["accepted"],
+        validate_load_response=lambda response: response.json()["accepted"],
         validate_unload_response=lambda _: None,
     )
 
     with pytest.raises(LlamaSwapProtocolError, match="invalid fixed llama-swap load response"):
         await LlamaSwapClient("http://127.0.0.1:8080", contract=strict_contract).load("qwen-small")
+
+
+@pytest.mark.asyncio
+async def test_contract_can_validate_a_pinned_non_json_unload_success_body(monkeypatch) -> None:
+    class Response:
+        status_code = 200
+        text = "OK"
+        content = b"OK"
+        headers = {"content-type": "text/plain; charset=utf-8"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    def validate_ok(response):
+        if response.content_type != "text/plain" or response.body != b"OK":
+            raise ValueError("unexpected unload response")
+
+    monkeypatch.setattr("model_scheduler.llama_swap_client.httpx.AsyncClient", lambda **_kwargs: Client())
+    text_contract = LlamaSwapControlContract(
+        running_parser=lambda _: [],
+        load_path="/props",
+        unload_path="/api/models/unload/{model_id}",
+        validate_load_response=lambda _: None,
+        validate_unload_response=validate_ok,
+    )
+
+    await LlamaSwapClient("http://127.0.0.1:8080", contract=text_contract).unload("qwen-small")
