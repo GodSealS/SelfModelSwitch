@@ -78,6 +78,15 @@ class Observation:
     detail_code: str | None = None
 
 
+@dataclass(frozen=True)
+class RecoveryResult:
+    """Validated result from the root-owned control-plane recovery helper."""
+    ok: bool
+    phase: str
+    error_code: str | None
+    stopped_models: tuple[str, ...]
+
+
 class GatewayError(RuntimeError):
     def __init__(self, http_status: int, code: str, outcome: Outcome):
         super().__init__(code)
@@ -90,6 +99,11 @@ class BackendControl(Protocol):
     async def observe(self, model_id: str) -> Observation: ...
     async def load(self, operation: Operation, deadline: float) -> Observation: ...
     async def stop(self, operation: Operation, deadline: float) -> Observation: ...
+
+
+class ControlRecoveryPort(Protocol):
+    """The scheduler may request recovery but never executes sudo/systemctl itself."""
+    async def recover(self, deadline: float) -> RecoveryResult: ...
 
 
 class OpenedResponse(Protocol):
