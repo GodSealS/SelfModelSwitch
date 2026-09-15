@@ -367,6 +367,8 @@ class ModelScheduler:
         if self.recovery is None:
             raise ModelUnavailable("control_recovery_unavailable")
         async with self._condition:
+            if self.book.recovering:
+                raise Conflict("recovery_in_progress")
             if any(runtime.leases for runtime in self.book.runtime.values()):
                 raise Conflict("recovery_has_leases")
             epoch = self.book.begin_recovery()

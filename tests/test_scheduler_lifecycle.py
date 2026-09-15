@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult
-from model_scheduler.model_registry import Book
+from model_scheduler.model_registry import Book, Conflict
 from model_scheduler.scheduler import ModelScheduler, ModelUnavailable, QueueFull
 
 
@@ -232,6 +232,28 @@ async def test_scheduler_recovery_uses_injected_control_port() -> None:
     scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=Recovery())
     await scheduler.recover(asyncio.get_running_loop().time() + 1)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_second_recovery_request_is_rejected_while_helper_is_running() -> None:
+    class BlockingRecovery:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.finish = asyncio.Event()
+
+        async def recover(self, deadline):
+            self.started.set()
+            await self.finish.wait()
+            return RecoveryResult(True, "complete", None, ("chat",))
+
+    recovery = BlockingRecovery()
+    scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=recovery)
+    first = asyncio.create_task(scheduler.recover(asyncio.get_running_loop().time() + 1))
+    await recovery.started.wait()
+    with pytest.raises(Conflict, match="recovery_in_progress"):
+        await scheduler.recover(asyncio.get_running_loop().time() + 1)
+    recovery.finish.set()
+    await first
 
 
 @pytest.mark.asyncio
