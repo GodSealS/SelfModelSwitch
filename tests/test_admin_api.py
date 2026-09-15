@@ -27,6 +27,35 @@ def test_health_reflects_actual_injected_dependency_checks() -> None:
     assert unhealthy.status_code == 503 and unhealthy.json()["checks"]["storage"] is False
 
 
+def test_health_uses_conservative_scheduler_runtime_checks_without_an_injected_provider() -> None:
+    class Control:
+        async def health(self):
+            return True
+
+    class Backend:
+        control = Control()
+
+    class HealthyScheduler:
+        backend = Backend()
+
+        async def status(self):
+            return {
+                "resources": {"sample_age_seconds": 0.1},
+                "admission": {"storage_unavailable": False, "recovering": False, "shutting_down": False},
+                "models": {
+                    "embedding": {"state": "ready"},
+                    "reranker": {"state": "ready"},
+                    "qwen-small": {"state": "ready"},
+                    "qwen-large": {"state": "ready"},
+                },
+            }
+
+    with TestClient(create_app(scheduler=HealthyScheduler())) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["checks"] == {"llama_swap": True, "storage": True, "resources": True, "preload": True, "control": True}
+
+
 def test_manual_unload_does_not_return_success_without_stop_evidence() -> None:
     class UnverifiedScheduler:
         async def unload(self, model_id, deadline): raise ModelUnavailable("stop_unverified")

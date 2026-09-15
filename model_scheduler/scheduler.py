@@ -498,4 +498,39 @@ class ModelScheduler:
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()
         async with self._condition:
-            return {"resources": {"total_bytes": snapshot.total_bytes, "available_bytes": snapshot.available_bytes, "used_bytes": snapshot.used_bytes, "utilization": snapshot.utilization, "source": snapshot.source, "sample_age_seconds": snapshot.age_at(monotonic())}, "queue_size": self._queue.size, "models": {model_id: {"state": runtime.state.value, "generation": runtime.generation, "in_flight": len(runtime.leases), "last_error": runtime.last_error} for model_id, runtime in self.book.runtime.items()}}
+            now = monotonic()
+            total, available = snapshot.total_bytes, snapshot.available_bytes
+            sampled_at = snapshot.sampled_at
+            sample_age = snapshot.age_at(now) if callable(getattr(snapshot, "age_at", None)) else max(0.0, now - sampled_at)
+            intent = self._switch_intent
+            return {
+                "resources": {
+                    "total_bytes": total,
+                    "available_bytes": available,
+                    "used_bytes": getattr(snapshot, "used_bytes", total - available),
+                    "utilization": getattr(snapshot, "utilization", 1 - available / total if total else 1),
+                    "source": getattr(snapshot, "source", "unknown"),
+                    "sample_age_seconds": sample_age,
+                },
+                "admission": {
+                    "shutting_down": self._shutting_down,
+                    "storage_unavailable": self._storage_unavailable,
+                    "recovering": self.book.recovering,
+                    "cold_load_not_before": self._cold_load_not_before,
+                    "switch": None if intent is None else {
+                        "target_id": intent.target_id,
+                        "frozen_models": list(intent.frozen_models),
+                        "expires_in_seconds": max(0.0, intent.expires_at - now),
+                    },
+                },
+                "queue_size": self._queue.size,
+                "models": {
+                    model_id: {
+                        "state": runtime.state.value,
+                        "generation": runtime.generation,
+                        "in_flight": len(runtime.leases),
+                        "last_error": runtime.last_error,
+                    }
+                    for model_id, runtime in self.book.runtime.items()
+                },
+            }

@@ -169,6 +169,38 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                 result = await result
             if isinstance(result, dict) and set(result) == required and all(type(value) is bool for value in result.values()):
                 checks = result
+        elif app.state.scheduler is not None and callable(getattr(app.state.scheduler, "status", None)):
+            try:
+                status = await app.state.scheduler.status()
+                resources = status.get("resources", {}) if isinstance(status, dict) else {}
+                admission = status.get("admission", {}) if isinstance(status, dict) else {}
+                models = status.get("models", {}) if isinstance(status, dict) else {}
+                age = resources.get("sample_age_seconds") if isinstance(resources, dict) else None
+                storage_ready = isinstance(admission, dict) and admission.get("storage_unavailable") is False
+                recovering = not isinstance(admission, dict) or admission.get("recovering") is not False
+                shutting_down = not isinstance(admission, dict) or admission.get("shutting_down") is not False
+                preload_models = [model_id for model_id, model in config.models.items() if model.lifecycle.preload]
+                preload_ready = isinstance(models, dict) and all(
+                    isinstance(models.get(model_id), dict) and models[model_id].get("state") == "ready"
+                    for model_id in preload_models
+                )
+                control = getattr(getattr(app.state.scheduler, "backend", None), "control", None)
+                control_health = getattr(control, "health", None)
+                control_ready = False
+                if callable(control_health):
+                    result = control_health()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    control_ready = result is True
+                checks = {
+                    "storage": storage_ready,
+                    "resources": type(age) in (int, float) and 0 <= age <= config.resources.sample_max_age_seconds,
+                    "preload": preload_ready,
+                    "control": control_ready and not recovering and not shutting_down,
+                    "llama_swap": control_ready,
+                }
+            except Exception:
+                checks = {key: False for key in required}
         if app.state.preload_error is not None:
             checks["preload"] = False
         ready = all(checks.values()) and not app.state.shutting_down

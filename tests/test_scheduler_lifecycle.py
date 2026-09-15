@@ -460,3 +460,15 @@ async def test_ready_admission_waits_for_storage_guard() -> None:
     lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
     assert lease.model_id == "chat"
     assert guard.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_status_exposes_admission_faults_with_memory_sample_compatible_resources() -> None:
+    scheduler = ModelScheduler(book(), Resources(), Backend())
+    initial = await scheduler.status()
+    assert initial["resources"]["used_bytes"] == 1_000
+    assert initial["admission"]["storage_unavailable"] is False
+
+    await scheduler.storage_lost(asyncio.get_running_loop().time() + 1)
+    faulted = await scheduler.status()
+    assert faulted["admission"]["storage_unavailable"] is True
