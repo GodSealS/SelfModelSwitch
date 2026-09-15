@@ -36,6 +36,14 @@ class DirectInferenceGateway:
     def _path(capability: Capability) -> str:
         return {Capability.CHAT: "/v1/chat/completions", Capability.EMBEDDINGS: "/v1/embeddings", Capability.RERANK: "/reranking"}[capability]
 
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> int:
+        try:
+            value = int(response.headers.get("retry-after", ""))
+        except ValueError:
+            return 1
+        return value if 1 <= value <= 60 else 1
+
     async def open(self, lease: Lease, capability: Capability, payload: Mapping[str, object], deadline: float) -> OpenedHTTPXResponse:
         base = self._upstreams.get(lease.model_id)
         if base is None:
@@ -51,7 +59,17 @@ class DirectInferenceGateway:
             raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
         if 200 <= response.status_code < 300:
             return OpenedHTTPXResponse(response)
+        status_code = response.status_code
+        retry_after = self._retry_after(response) if status_code == 429 else None
         await response.aclose()
-        if response.status_code in {400, 413, 422, 429}:
-            raise GatewayError(response.status_code, "upstream_invalid_request", Outcome.REJECTED)
+        if status_code in {400, 422}:
+            raise GatewayError(status_code, "upstream_invalid_request", Outcome.REJECTED)
+        if status_code == 413:
+            raise GatewayError(413, "upstream_request_too_large", Outcome.REJECTED)
+        if status_code == 429:
+            raise GatewayError(429, "upstream_rate_limited", Outcome.REJECTED, retry_after=retry_after)
+        if status_code == 503:
+            raise GatewayError(503, "upstream_unavailable", Outcome.ABORTED)
+        if status_code in {401, 403, 404} or 300 <= status_code < 400:
+            raise GatewayError(502, "upstream_configuration_error", Outcome.ABORTED)
         raise GatewayError(502, "upstream_error", Outcome.ABORTED)

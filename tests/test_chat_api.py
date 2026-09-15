@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app import BodyError, _read_json, create_app
-from model_scheduler.contracts import Lease, Outcome
+from model_scheduler.contracts import GatewayError, Lease, Outcome
 from model_scheduler.scheduler import QueueFull
 
 
@@ -177,6 +177,18 @@ def test_chat_maps_queue_full_and_queue_deadline_to_distinct_public_errors() -> 
     assert full.json()["error"]["code"] == "queue_full"
     assert timed_out.status_code == 504
     assert timed_out.json()["error"]["code"] == "queue_timeout"
+
+
+def test_chat_preserves_a_valid_upstream_retry_after_header() -> None:
+    class RateLimitedGateway:
+        async def open(self, *_):
+            raise GatewayError(429, "upstream_rate_limited", Outcome.REJECTED, retry_after=7)
+
+    with TestClient(create_app(scheduler=Scheduler(), gateway=RateLimitedGateway())) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "upstream_rate_limited"
+    assert response.headers["retry-after"] == "7"
 
 
 @pytest.mark.asyncio

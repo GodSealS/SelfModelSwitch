@@ -34,3 +34,33 @@ async def test_gateway_classifies_complete_upstream_400_as_rejected() -> None:
         await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 10)
     assert error.value.outcome is Outcome.REJECTED
     await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected_status", "expected_code", "expected_outcome"),
+    [
+        (404, 502, "upstream_configuration_error", Outcome.ABORTED),
+        (413, 413, "upstream_request_too_large", Outcome.REJECTED),
+        (429, 429, "upstream_rate_limited", Outcome.REJECTED),
+        (503, 503, "upstream_unavailable", Outcome.ABORTED),
+    ],
+)
+async def test_gateway_preserves_the_public_error_class_for_known_upstream_statuses(status_code, expected_status, expected_code, expected_outcome) -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status_code)), follow_redirects=False)
+    gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client)
+    with pytest.raises(GatewayError) as error:
+        await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 10)
+    assert (error.value.http_status, error.value.code, error.value.outcome) == (expected_status, expected_code, expected_outcome)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("header", "expected_retry_after"), [("7", 7), ("0", 1), ("invalid", 1), ("61", 1)])
+async def test_gateway_clamps_or_defaults_upstream_retry_after(header, expected_retry_after) -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(429, headers={"retry-after": header})), follow_redirects=False)
+    gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client)
+    with pytest.raises(GatewayError) as error:
+        await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 10)
+    assert error.value.retry_after == expected_retry_after
+    await client.aclose()

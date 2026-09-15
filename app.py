@@ -346,7 +346,8 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         except GatewayError as exc:
             if lease is not None:
                 await app.state.scheduler.release(lease, exc.outcome)
-            return _error(exc.http_status, exc.code, "Upstream request failed", request_id)
+            headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+            return _error(exc.http_status, exc.code, "Upstream request failed", request_id, extra_headers=headers)
         except QueueFull:
             return _error(429, "queue_full", "Request queue is full", request_id, extra_headers={"Retry-After": "1"})
         except TimeoutError:
@@ -379,7 +380,8 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             raise
         except GatewayError as exc:
             if "lease" in locals(): await app.state.scheduler.release(lease, exc.outcome)
-            return None, _error(exc.http_status, exc.code, "Upstream request failed", request_id)
+            headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+            return None, _error(exc.http_status, exc.code, "Upstream request failed", request_id, extra_headers=headers)
         except QueueFull:
             return None, _error(429, "queue_full", "Request queue is full", request_id, extra_headers={"Retry-After": "1"})
         except TimeoutError:

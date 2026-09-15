@@ -89,11 +89,12 @@ class RecoveryResult:
 
 
 class GatewayError(RuntimeError):
-    def __init__(self, http_status: int, code: str, outcome: Outcome):
+    def __init__(self, http_status: int, code: str, outcome: Outcome, *, retry_after: int | None = None):
         super().__init__(code)
         self.http_status = http_status
         self.code = code
         self.outcome = outcome
+        self.retry_after = retry_after
 
 
 class BackendControl(Protocol):
