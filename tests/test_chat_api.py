@@ -28,11 +28,29 @@ class Opened:
         return None
 
 
+class StreamOpened(Opened):
+    def iter_bytes(self):
+        async def iterator():
+            yield b"data: first\n\n"
+            yield b"data: [DONE]\n\n"
+        return iterator()
+
+
 class Gateway:
     async def open(self, lease, capability, payload, deadline):
         assert capability.value == "chat"
         assert payload["model"] == "qwen-small"
-        return Opened()
+        return StreamOpened() if payload.get("stream") else Opened()
+
+
+class MissingDoneGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class MissingDone(StreamOpened):
+            def iter_bytes(self):
+                async def iterator():
+                    yield b"data: partial\n\n"
+                return iterator()
+        return MissingDone()
 
 
 def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
@@ -56,3 +74,22 @@ def test_chat_rejects_capability_before_acquiring_lease() -> None:
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "unsupported_capability"
     assert scheduler.releases == []
+
+
+def test_stream_response_owns_lease_until_done_event() -> None:
+    scheduler = Scheduler()
+    app = create_app(scheduler=scheduler, gateway=Gateway())
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+
+    assert response.status_code == 200
+    assert b"[DONE]" in response.content
+    assert scheduler.releases == [Outcome.SUCCESS]
+
+
+def test_stream_eof_without_done_aborts_lease() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=MissingDoneGateway())) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert response.status_code == 200
+    assert scheduler.releases == [Outcome.ABORTED]

@@ -13,7 +13,7 @@ from time import monotonic
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
@@ -83,11 +83,19 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
             opened = await app.state.gateway.open(lease, Capability.CHAT, payload, deadline)
             if body.stream:
-                # The following T08 slice replaces this with a response owner that
-                # parses SSE completion and observes client disconnects.
-                await opened.aclose()
-                await app.state.scheduler.release(lease, Outcome.ABORTED)
-                return _error(503, "streaming_not_ready", "Streaming is not ready", request_id)
+                async def stream_body():
+                    outcome = Outcome.ABORTED
+                    tail = b""
+                    try:
+                        async for chunk in opened.iter_bytes():
+                            tail = (tail + chunk)[-1024:]
+                            yield chunk
+                            if b"data: [DONE]" in tail:
+                                outcome = Outcome.SUCCESS
+                    finally:
+                        await opened.aclose()
+                        await app.state.scheduler.release(lease, outcome)
+                return StreamingResponse(stream_body(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
             response = await opened.json()
             await opened.aclose()
             await app.state.scheduler.release(lease, Outcome.SUCCESS)
