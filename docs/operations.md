@@ -5,8 +5,8 @@ unverified image, alter model files, or operate containers outside the manifest.
 
 ## Prepare deployment input
 
-Collect the Thor facts read-only, then produce one JSON deployment input with
-the actual SSD UUID, ext4 filesystem, fixed llama-swap ARM64 release and SHA256,
+Collect target hardware facts read-only, then produce one JSON deployment input with
+the actual device-tree identity, SSD UUID, ext4 filesystem, fixed llama-swap ARM64 release and SHA256,
 image digest, model SHA256 values, and measured memory budgets. Production
 rendering additionally needs the measured validation report. Render it into a
 new, empty directory:
@@ -19,7 +19,8 @@ Review `manifest.json`, `config.yaml`, `llama-swap.yaml`, both service units,
 and `fstab.fragment`. The fragment is a suggestion only; merge it into
 `/etc/fstab` manually after review. Never run a formatter from this project.
 Production render copies its validated prompt-free hardware evidence as
-`thor-report.json` into the deployment directory; retain that file in the
+`hardware-report.json` into the deployment directory; it must exactly match the
+deployment input and the target device-tree identity. Retain that file in the
 release archive with the manifest it validates.
 
 ## Install and start

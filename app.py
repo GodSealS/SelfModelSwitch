@@ -251,7 +251,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
         if app.state.owned_client is not None:
             await app.state.owned_client.aclose()
 
-    app = FastAPI(title="AGX Thor Model Scheduler", version="1.0", lifespan=lifespan)
+    app = FastAPI(title="AGX Model Scheduler", version="1.0", lifespan=lifespan)
     app.state.config = config
     app.state.ready = False
     app.state.scheduler = scheduler

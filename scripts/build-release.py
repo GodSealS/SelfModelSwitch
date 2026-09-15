@@ -17,7 +17,7 @@ class ReleaseError(ValueError):
 
 
 _DEPLOYMENT_FILES = frozenset({"manifest.json", "config.yaml", "llama-swap.yaml", "fstab.fragment", "model-scheduler.service", "llama-swap.service"})
-_OPTIONAL_DEPLOYMENT_FILES = frozenset({"thor-report.json"})
+_OPTIONAL_DEPLOYMENT_FILES = frozenset({"hardware-report.json"})
 
 
 def _tracked_files(root: Path) -> list[Path]:
@@ -26,20 +26,20 @@ def _tracked_files(root: Path) -> list[Path]:
     return [root / item for item in result.stdout.decode().split("\0") if item and item not in excluded]
 
 
-def _verify_thor_report(deployment: Path, deployment_files: set[str]) -> None:
-    report = deployment / "thor-report.json"
+def _verify_hardware_report(deployment: Path, deployment_files: set[str]) -> None:
+    report = deployment / "hardware-report.json"
     try:
         manifest = json.loads((deployment / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ReleaseError("cannot read deployment manifest") from exc
-    if "thor-report.json" not in deployment_files:
-        if isinstance(manifest, dict) and "thor_report_sha256" in manifest:
-            raise ReleaseError("Thor report is missing")
+    if "hardware-report.json" not in deployment_files:
+        if isinstance(manifest, dict) and "hardware_report_sha256" in manifest:
+            raise ReleaseError("Hardware report is missing")
         return
-    expected = manifest.get("thor_report_sha256") if isinstance(manifest, dict) else None
+    expected = manifest.get("hardware_report_sha256") if isinstance(manifest, dict) else None
     actual = hashlib.sha256(report.read_bytes()).hexdigest()
     if not isinstance(expected, str) or expected != actual:
-        raise ReleaseError("Thor report digest mismatch")
+        raise ReleaseError("Hardware report digest mismatch")
 
 
 def build(root: Path, deployment: Path, output: Path, release_id: str) -> Path:
@@ -48,7 +48,7 @@ def build(root: Path, deployment: Path, output: Path, release_id: str) -> Path:
     deployment_files = {path.name for path in deployment.iterdir()} if deployment.is_dir() else set()
     if not _DEPLOYMENT_FILES <= deployment_files or deployment_files - _DEPLOYMENT_FILES - _OPTIONAL_DEPLOYMENT_FILES:
         raise ReleaseError("deployment directory is incomplete")
-    _verify_thor_report(deployment, deployment_files)
+    _verify_hardware_report(deployment, deployment_files)
     if output.exists() and any(output.iterdir()):
         raise ReleaseError("release output directory must be empty")
     output.mkdir(parents=True, exist_ok=True)

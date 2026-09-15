@@ -65,17 +65,28 @@ def _nonnegative_finite_number(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def validate_thor_report(report: Any) -> dict[str, Any]:
-    """Validate the prompt-free hardware evidence needed for production render."""
+def _validate_hardware_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"model", "compatible"}:
+        raise DeployError("invalid hardware identity")
+    model = _require(value["model"], "hardware model")
+    compatible = value["compatible"]
+    if not isinstance(compatible, list) or not compatible or any(type(item) is not str or not item or "REQUIRED" in item for item in compatible):
+        raise DeployError("invalid hardware compatible")
+    return {"model": model, "compatible": list(compatible)}
+
+
+def validate_hardware_report(report: Any) -> dict[str, Any]:
+    """Validate prompt-free, device-bound evidence needed for production render."""
     required = {
         "schema_version", "timestamp_utc", "source_commit", "deployment_id",
         "jetpack_version", "image_digest", "llama_swap_version", "llama_swap_sha256",
-        "ssd_uuid", "models", "scenarios", "soak",
+        "ssd_uuid", "hardware", "models", "scenarios", "soak",
     }
-    if not isinstance(report, dict) or not required <= set(report) or report.get("schema_version") != 1:
-        raise DeployError("invalid Thor report")
-    for key in required - {"schema_version", "models", "scenarios", "soak"}:
-        _require(report[key], f"Thor report {key}")
+    if not isinstance(report, dict) or set(report) != required or report.get("schema_version") != 2:
+        raise DeployError("invalid hardware report")
+    for key in required - {"schema_version", "hardware", "models", "scenarios", "soak"}:
+        _require(report[key], f"hardware report {key}")
+    _validate_hardware_identity(report["hardware"])
     timestamp = report["timestamp_utc"]
     try:
         if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
@@ -84,17 +95,17 @@ def validate_thor_report(report: Any) -> dict[str, Any]:
         if parsed_timestamp.tzinfo is None:
             raise ValueError
     except ValueError as exc:
-        raise DeployError("invalid Thor report provenance") from exc
+        raise DeployError("invalid hardware report provenance") from exc
     if not isinstance(report["source_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", report["source_commit"]):
-        raise DeployError("invalid Thor report provenance")
+        raise DeployError("invalid hardware report provenance")
     if not _HASH.fullmatch(report["llama_swap_sha256"]) or not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", report["image_digest"]):
-        raise DeployError("invalid Thor report identity")
+        raise DeployError("invalid hardware report identity")
     models = report["models"]
     if not isinstance(models, dict) or set(models) != _MODELS:
-        raise DeployError("invalid Thor report models")
+        raise DeployError("invalid hardware report models")
     for model in models.values():
         if not isinstance(model, dict) or not _REPORT_MODEL_FIELDS <= set(model):
-            raise DeployError("invalid Thor report model")
+            raise DeployError("invalid hardware report model")
         if (
             not isinstance(model["sha256"], str)
             or not _HASH.fullmatch(model["sha256"])
@@ -114,13 +125,13 @@ def validate_thor_report(report: Any) -> dict[str, Any]:
             or model["capability_verified"] is not True
             or not _nonnegative_finite_number(model["cold_load_seconds"])
         ):
-            raise DeployError("invalid Thor report model")
+            raise DeployError("invalid hardware report model")
     scenarios = report["scenarios"]
     if not isinstance(scenarios, dict) or set(scenarios) != _SCENARIOS or any(value != "passed" for value in scenarios.values()):
-        raise DeployError("Thor acceptance scenarios are incomplete")
+        raise DeployError("hardware acceptance scenarios are incomplete")
     soak = report["soak"]
     if not isinstance(soak, dict) or not _REPORT_SOAK_FIELDS <= set(soak):
-        raise DeployError("invalid Thor soak report")
+        raise DeployError("invalid hardware soak report")
     zero_fields = {"http_500_count", "oom_count", "lease_leaks", "unsafe_evictions", "queue_final", "leases_final"}
     nonnegative_fields = {"http_429_count", "http_504_count"}
     if (
@@ -130,7 +141,7 @@ def validate_thor_report(report: Any) -> dict[str, Any]:
         or any(type(soak[key]) is not int or soak[key] != 0 for key in zero_fields)
         or any(type(soak[key]) is not int or soak[key] < 0 for key in nonnegative_fields)
     ):
-        raise DeployError("Thor soak report did not pass")
+        raise DeployError("hardware soak report did not pass")
     return report
 
 
@@ -142,11 +153,12 @@ def _validate_report(path_value: Any, data: dict[str, Any]) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         raise DeployError("cannot read validation report") from exc
     try:
-        report = validate_thor_report(report)
+        report = validate_hardware_report(report)
     except DeployError as exc:
         raise DeployError("validation report does not meet hardware acceptance") from exc
     expected_identity = {
         "deployment_id": data["deployment_id"],
+        "hardware": data["hardware"],
         "jetpack_version": data["jetpack_version"],
         "image_digest": data["image"],
         "llama_swap_version": data["llama_swap_version"],
@@ -165,11 +177,12 @@ def _validate_report(path_value: Any, data: dict[str, Any]) -> None:
 def validate(data: Any, mode: str) -> dict[str, Any]:
     if mode not in {"lab", "production"} or not isinstance(data, dict):
         raise DeployError("invalid deployment input")
-    required = {"deployment_id", "ssd_uuid", "ssd_filesystem", "jetpack_version", "llama_swap_version", "llama_swap_sha256", "image", "validation_report", "models"}
+    required = {"deployment_id", "hardware", "ssd_uuid", "ssd_filesystem", "jetpack_version", "llama_swap_version", "llama_swap_sha256", "image", "validation_report", "models"}
     if set(data) != required or data["ssd_filesystem"] != "ext4": raise DeployError("invalid deployment fields")
-    for key in required - {"validation_report", "models", "ssd_filesystem"}: _require(data[key], key)
+    for key in required - {"hardware", "validation_report", "models", "ssd_filesystem"}: _require(data[key], key)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", data["deployment_id"]):
         raise DeployError("invalid deployment_id")
+    _validate_hardware_identity(data["hardware"])
     if not _HASH.fullmatch(data["llama_swap_sha256"]): raise DeployError("invalid llama_swap_sha256")
     if not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", data["image"]): raise DeployError("image must be digest pinned")
     if not isinstance(data["models"], dict) or set(data["models"]) != _MODELS: raise DeployError("invalid model set")
@@ -233,8 +246,8 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     report_bytes = Path(validated["validation_report"]).read_bytes() if mode == "production" else None
     manifest = json.loads(json.dumps(validated))
     if report_bytes is not None:
-        manifest["validation_report"] = "thor-report.json"
-        manifest["thor_report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
+        manifest["validation_report"] = "hardware-report.json"
+        manifest["hardware_report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
     for model_id in _MODELS:
         manifest["models"][model_id]["container_name"] = f"sms-{manifest['deployment_id']}-{model_id}"
     if destination.exists() and any(destination.iterdir()): raise DeployError("output directory must be empty")
@@ -244,7 +257,7 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (destination / "config.yaml").write_text(config_text, encoding="utf-8")
     if report_bytes is not None:
-        (destination / "thor-report.json").write_bytes(report_bytes)
+        (destination / "hardware-report.json").write_bytes(report_bytes)
     (destination / "llama-swap.yaml").write_text(yaml.safe_dump(_llama_swap_config(manifest), sort_keys=False), encoding="utf-8")
     (destination / "fstab.fragment").write_text(f"UUID={manifest['ssd_uuid']} /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n", encoding="utf-8")
     (destination / "model-scheduler.service").write_text(_render_unit("model-scheduler.service"), encoding="utf-8")
@@ -252,7 +265,18 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[str, Any]:
+def _read_hardware_identity(device_tree_root: Path = Path("/proc/device-tree")) -> dict[str, Any]:
+    try:
+        model_parts = [part.decode("utf-8") for part in (device_tree_root / "model").read_bytes().split(b"\0") if part]
+        compatible = [part.decode("utf-8") for part in (device_tree_root / "compatible").read_bytes().split(b"\0") if part]
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DeployError("cannot read hardware identity") from exc
+    if len(model_parts) != 1:
+        raise DeployError("invalid hardware identity")
+    return _validate_hardware_identity({"model": model_parts[0], "compatible": compatible})
+
+
+def preflight(manifest_path: str | Path, *, storage: Any | None = None, hardware: Any | None = None) -> dict[str, Any]:
     """Perform only read-only cross checks on a rendered deployment directory."""
     path = Path(manifest_path)
     try:
@@ -261,6 +285,7 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[
                 or not isinstance(manifest.get("config_sha256"), str) or not _HASH.fullmatch(manifest["config_sha256"])
                 or set(manifest.get("models", {})) != _MODELS):
             raise DeployError("invalid rendered manifest")
+        expected_hardware = _validate_hardware_identity(manifest.get("hardware"))
         config_path = path.parent / "config.yaml"
         config_text = config_path.read_bytes()
         if hashlib.sha256(config_text).hexdigest() != manifest["config_sha256"]:
@@ -268,6 +293,9 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[
         config = load_config(config_path)
     except (OSError, json.JSONDecodeError, ConfigError) as exc:
         raise DeployError("cannot read rendered deployment") from exc
+    actual_hardware = _validate_hardware_identity(hardware) if hardware is not None else _read_hardware_identity()
+    if actual_hardware != expected_hardware:
+        raise DeployError("hardware preflight failed: target identity mismatch")
     for model_id, model in config.models.items():
         rendered = manifest["models"].get(model_id)
         if not isinstance(rendered, dict) or rendered.get("file") != model.file or rendered.get("sha256") != model.sha256:
@@ -279,7 +307,7 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None) -> dict[
     return {"ok": True, "deployment_id": manifest["deployment_id"], "models": sorted(config.models)}
 
 
-def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str, Any]:
+def collect_facts(output: str | Path, *, runner: Any | None = None, device_tree_root: Path = Path("/proc/device-tree")) -> dict[str, Any]:
     """Record only read-only host facts; this command starts no models or services."""
     destination = Path(output)
     if destination.exists():
@@ -297,6 +325,7 @@ def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str,
             "python": platform.python_version(),
             "docker": command(["docker", "version", "--format", "{{.Server.Version}}"]),
             "storage": command(["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"]),
+            "hardware": _read_hardware_identity(device_tree_root),
             "jetpack_release": Path("/etc/nv_tegra_release").read_text(encoding="utf-8").strip() if Path("/etc/nv_tegra_release").is_file() else None,
             "llama_swap_version": optional(["llama-swap", "--version"]),
             "gpu_runtime": optional(["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"]),

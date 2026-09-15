@@ -1,4 +1,4 @@
-# AGX Thor Model Scheduler
+# AGX Model Scheduler
 
 This service is a single-process scheduler for four local llama.cpp model
 servers. It owns residency, memory accounting, leases, and direct inference
@@ -55,6 +55,6 @@ python scripts/build-release.py --deployment build/deploy --output build/release
 
 This repository is **not production-ready** until the fixed ARM64 llama-swap
 release and real HTTP fixtures are recorded, Python 3.12/ARM64 locks install,
-and all Thor acceptance scenarios complete with a real SSD, GPU, model hashes,
-and `thor-report.json`. The repository deliberately does not contain device
+and all hardware acceptance scenarios complete with a real SSD, GPU, model hashes,
+and a device-bound `hardware-report.json`. The repository deliberately does not contain device
 credentials, model files, or a claim that those checks have passed.

@@ -6,7 +6,7 @@ requires-python = ">=3.12,<3.13"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["thor: requires an AGX Thor device and real deployment inputs"]
+markers = ["thor: requires a real AGX device and deployment inputs"]
 
 [tool.ruff]
 target-version = "py312"

@@ -1,11 +1,11 @@
-# Thor installation checklist
+# AGX installation checklist
 
 This checklist is a review aid, not an installer. It does not format storage,
 download models, replace `/etc/fstab`, or operate containers outside the
 rendered manifest.
 
-1. On Thor, run `python -m model_scheduler.deploy collect --output /tmp/thor-facts.json`.
-   Verify JetPack, Docker, SSD UUID/filesystem, and the intended fixed
+1. On the target AGX device, run `python -m model_scheduler.deploy collect --output /tmp/hardware-facts.json`.
+   Verify the device-tree hardware identity, JetPack, Docker, SSD UUID/filesystem, and the intended fixed
    llama-swap ARM64 release before creating deployment input.
 2. Render into a new empty directory. Production mode requires the real model
    measurements report and rejects placeholder hashes.
@@ -27,7 +27,7 @@ rendered manifest.
    `/health` remains 503 during recovery; do not treat that as ready.
    Each model start revalidates the configured SSD and all model hashes before
    Docker is invoked; never bypass this with a manual container command.
-7. Run the hardware acceptance suite and retain its prompt-free report. Only
+7. Run the hardware acceptance suite and retain its prompt-free, device-bound report. Only
    all A01–A20 marked `passed` permits a production-ready declaration.
 
 For recovery and rollback, see `docs/operations.md` in the release archive.

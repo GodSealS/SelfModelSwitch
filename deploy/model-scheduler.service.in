@@ -1,5 +1,5 @@
 [Unit]
-Description=AGX Thor model scheduler
+Description=AGX model scheduler
 Wants=network-online.target llama-swap.service
 After=network-online.target docker.service llama-swap.service @SSD_MOUNT_UNIT@
 RequiresMountsFor=/mnt/model-ssd

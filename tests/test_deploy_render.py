@@ -14,15 +14,16 @@ def input_data(measured: bool = False) -> dict:
     models = {}
     for name, file, pooling in (("embedding", "embedding.gguf", "mean"), ("reranker", "reranker.gguf", "rank"), ("qwen-small", "qwen-small.gguf", None), ("qwen-large", "qwen-large.gguf", None)):
         models[name] = {"file": file, "sha256": "a" * 64, "context_size": 2048, "parallel": 1, "pooling": pooling, "reserved_bytes": 1024, "measured": measured}
-    return {"deployment_id": "thor-local", "ssd_uuid": "uuid", "ssd_filesystem": "ext4", "jetpack_version": "7", "llama_swap_version": "v1", "llama_swap_sha256": "b" * 64, "image": "repo/image@sha256:" + "c" * 64, "validation_report": None, "models": models}
+    return {"deployment_id": "orin-local", "hardware": {"model": "NVIDIA Jetson AGX Orin Developer Kit", "compatible": ["nvidia,p3737-0000+p3701-0005", "nvidia,p3701-0005", "nvidia,tegra234"]}, "ssd_uuid": "uuid", "ssd_filesystem": "ext4", "jetpack_version": "7", "llama_swap_version": "v1", "llama_swap_sha256": "b" * 64, "image": "repo/image@sha256:" + "c" * 64, "validation_report": None, "models": models}
 
 
 def validation_report(payload: dict) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "timestamp_utc": "2026-09-16T00:00:00Z",
         "source_commit": "a" * 40,
         "deployment_id": payload["deployment_id"],
+        "hardware": payload["hardware"],
         "jetpack_version": payload["jetpack_version"],
         "image_digest": payload["image"],
         "llama_swap_version": payload["llama_swap_version"],
@@ -66,12 +67,12 @@ def test_lab_render_writes_consistent_deployment_artifacts(tmp_path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
     output = tmp_path / "out"
     manifest = render(source, "lab", output)
-    assert manifest["deployment_id"] == "thor-local"
+    assert manifest["deployment_id"] == "orin-local"
     assert json.loads((output / "manifest.json").read_text())["models"]["embedding"]["file"] == "embedding.gguf"
     config = load_config(output / "config.yaml")
     assert config.models["qwen-small"].upstream_url == "http://127.0.0.1:10003"
     assert "sms-model-runner start qwen-small" in (output / "llama-swap.yaml").read_text()
-    assert json.loads((output / "manifest.json").read_text())["models"]["qwen-small"]["container_name"] == "sms-thor-local-qwen-small"
+    assert json.loads((output / "manifest.json").read_text())["models"]["qwen-small"]["container_name"] == "sms-orin-local-qwen-small"
     assert manifest["config_sha256"] == hashlib.sha256((output / "config.yaml").read_bytes()).hexdigest()
     assert (output / "fstab.fragment").read_text() == "UUID=uuid /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n"
     scheduler_unit = (output / "model-scheduler.service").read_text()
@@ -99,9 +100,9 @@ def test_production_report_must_match_manifest_model_measurements(tmp_path) -> N
     payload["validation_report"] = str(report)
     source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
     manifest = render(source, "production", tmp_path / "out")
-    assert manifest["validation_report"] == "thor-report.json"
-    assert (tmp_path / "out" / "thor-report.json").read_text() == report.read_text()
-    assert manifest["thor_report_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest()
+    assert manifest["validation_report"] == "hardware-report.json"
+    assert (tmp_path / "out" / "hardware-report.json").read_text() == report.read_text()
+    assert manifest["hardware_report_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest()
     payload["models"]["qwen-small"]["parallel"] = 2
     source.write_text(json.dumps(payload))
     with pytest.raises(DeployError, match="validation report"):
@@ -131,14 +132,56 @@ def test_production_rejects_unparseable_hardware_report_provenance(tmp_path) -> 
         render(source, "production", tmp_path / "out")
 
 
-def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:
+def test_production_rejects_hardware_report_for_a_different_device(tmp_path) -> None:
+    payload = input_data(True)
+    report = validation_report(payload)
+    report["hardware"] = {"model": "NVIDIA Jetson AGX Thor", "compatible": ["nvidia,tegra264"]}
+    report_path = tmp_path / "measurements.json"; report_path.write_text(json.dumps(report))
+    payload["validation_report"] = str(report_path)
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "out")
+
+
+def test_production_rejects_legacy_report_without_hardware_identity(tmp_path) -> None:
+    payload = input_data(True)
+    report = validation_report(payload)
+    report["schema_version"] = 1
+    del report["hardware"]
+    report_path = tmp_path / "measurements.json"; report_path.write_text(json.dumps(report))
+    payload["validation_report"] = str(report_path)
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "out")
+
+
+def test_production_rejects_unknown_or_placeholder_hardware_evidence(tmp_path) -> None:
+    payload = input_data(True)
+    payload["hardware"]["compatible"] = ["REQUIRED_REAL_COMPATIBLE"]
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+    with pytest.raises(DeployError, match="hardware"):
+        render(source, "lab", tmp_path / "placeholder")
+
+    payload = input_data(True)
+    report = validation_report(payload)
+    report["unreviewed"] = "value"
+    report_path = tmp_path / "measurements.json"; report_path.write_text(json.dumps(report))
+    payload["validation_report"] = str(report_path)
+    source.write_text(json.dumps(payload))
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "unknown")
+
+
+def test_preflight_cross_checks_rendered_config_storage_and_hardware(tmp_path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
     output = tmp_path / "out"; render(source, "lab", output)
     class Storage:
         def check(self, models):
             assert models["embedding"].sha256 == "a" * 64
             return StorageSnapshot(True, None, 0, {})
-    result = preflight(output / "manifest.json", storage=Storage())
+    result = preflight(output / "manifest.json", storage=Storage(), hardware=input_data()["hardware"])
     assert result["ok"] is True
 
 
@@ -149,19 +192,32 @@ def test_preflight_rejects_a_config_file_that_no_longer_matches_the_manifest_dig
     config_path.write_text(config_path.read_text() + "\n")
 
     with pytest.raises(DeployError, match="config digest"):
-        preflight(output / "manifest.json")
+        preflight(output / "manifest.json", hardware=input_data()["hardware"])
 
 
 def test_collect_writes_read_only_device_facts_once(tmp_path) -> None:
     output = tmp_path / "facts.json"
+    device_tree = tmp_path / "device-tree"
+    device_tree.mkdir()
+    (device_tree / "model").write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\0")
+    (device_tree / "compatible").write_bytes(b"nvidia,p3737-0000+p3701-0005\0nvidia,p3701-0005\0nvidia,tegra234\0")
     calls: list[list[str]] = []
-    facts = collect_facts(output, runner=lambda argv: calls.append(argv) or "value")
+    facts = collect_facts(output, runner=lambda argv: calls.append(argv) or "value", device_tree_root=device_tree)
     assert facts["uname"] == "value"
     assert facts["llama_swap_version"] == "value"
     assert facts["gpu_runtime"] == "value"
+    assert facts["hardware"] == input_data()["hardware"]
     assert ["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"] in calls
     with pytest.raises(DeployError, match="already exists"):
-        collect_facts(output, runner=lambda _: "value")
+        collect_facts(output, runner=lambda _: "value", device_tree_root=device_tree)
+
+
+def test_preflight_rejects_a_manifest_for_a_different_target_device(tmp_path) -> None:
+    source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
+    output = tmp_path / "out"; render(source, "lab", output)
+
+    with pytest.raises(DeployError, match="hardware"):
+        preflight(output / "manifest.json", hardware={"model": "NVIDIA Jetson AGX Thor", "compatible": ["nvidia,tegra264"]})
 
 
 def test_migrate_legacy_config_writes_explicit_v1_template(tmp_path) -> None:

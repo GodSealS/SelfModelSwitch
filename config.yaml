@@ -1,5 +1,5 @@
 # Lab-only schema-v1 example. Deploy tooling replaces these non-production hashes
-# with the verified manifest values before a Thor deployment is allowed.
+# with the verified manifest values before a hardware-bound deployment is allowed.
 schema_version: 1
 server:
   host: 127.0.0.1
