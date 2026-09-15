@@ -9,6 +9,16 @@ from model_scheduler.contracts import Capability, Lease
 from model_scheduler.gateway import DirectInferenceGateway
 
 
+async def _read_request(reader: asyncio.StreamReader) -> bytes:
+    headers = await reader.readuntil(b"\r\n\r\n")
+    content_length = next(
+        int(line.split(b":", 1)[1].strip())
+        for line in headers.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    )
+    return await reader.readexactly(content_length)
+
+
 @pytest.mark.asyncio
 async def test_gateway_uses_a_real_direct_loopback_socket() -> None:
     requests: list[bytes] = []
@@ -16,6 +26,12 @@ async def test_gateway_uses_a_real_direct_loopback_socket() -> None:
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         headers = await reader.readuntil(b"\r\n\r\n")
         requests.append(headers)
+        content_length = next(
+            int(line.split(b":", 1)[1].strip())
+            for line in headers.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        )
+        await reader.readexactly(content_length)
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
         await writer.drain()
         writer.close()
@@ -41,7 +57,7 @@ async def test_gateway_preserves_sse_utf8_bytes_split_across_real_socket_writes(
     expected = b'data: {"delta":"' + "你好".encode() + b'"}\n\ndata: [DONE]\n\n'
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await reader.readuntil(b"\r\n\r\n")
+        await _read_request(reader)
         writer.write(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
             + f"Content-Length: {len(expected)}\r\nConnection: close\r\n\r\n".encode()
