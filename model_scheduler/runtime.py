@@ -36,6 +36,8 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         priority_aging_seconds=config.scheduler.priority_aging_seconds,
         poll_interval_seconds=config.scheduler.poll_interval_seconds,
         max_evictions=config.scheduler.max_evictions_per_request,
+        switch_drain_timeout_seconds=config.scheduler.switch_drain_timeout_seconds,
+        switch_retry_seconds=config.scheduler.switch_retry_seconds,
         recovery=recovery,
         admission_guard=storage_guard,
     )

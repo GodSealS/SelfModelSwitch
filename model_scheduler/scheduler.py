@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import inspect
 from time import monotonic
 
@@ -19,12 +20,20 @@ class ModelUnavailable(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class SwitchIntent:
+    request_id: str
+    target_id: str
+    frozen_models: tuple[str, ...]
+    expires_at: float
+
+
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None, admission_guard=None):
-        if poll_interval_seconds <= 0:
-            raise ValueError("poll_interval_seconds must be positive")
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, recovery: ControlRecoveryPort | None = None, admission_guard=None):
+        if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds) <= 0:
+            raise ValueError("scheduler intervals must be positive")
         self.book = book
         self.resources = resources
         self.backend = backend
@@ -38,6 +47,10 @@ class ModelScheduler:
         self._loads: dict[str, asyncio.Task[None]] = {}
         self._eviction: asyncio.Task[tuple[str, ...]] | None = None
         self._shutting_down = False
+        self._switch_drain_timeout_seconds = switch_drain_timeout_seconds
+        self._switch_retry_seconds = switch_retry_seconds
+        self._switch_intent: SwitchIntent | None = None
+        self._next_switch_attempt: dict[str, float] = {}
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
         if model_id not in self.book.specs:
@@ -61,12 +74,13 @@ class ModelScheduler:
                 needs_sample = False
                 async with self._condition:
                     now = monotonic()
+                    self._expire_switch_intent(now)
                     if self._shutting_down:
                         raise ModelUnavailable("service_shutting_down")
                     if now >= deadline or not self._queue.contains(request_id):
                         self._queue.remove(request_id, WaitState.EXPIRED)
                         raise TimeoutError("queue deadline elapsed")
-                    if self._queue.is_head(request_id, now):
+                    if self._queue.is_head(request_id, now, eligible=self._cold_request_eligible):
                         try:
                             if not admitted or not self.book.can_admit_ready(model_id, sample, now):
                                 raise Conflict("ready admission blocked")
@@ -76,13 +90,16 @@ class ModelScheduler:
                             if runtime.state.value == "error":
                                 raise ModelUnavailable(runtime.last_error or "model_error")
                             needs_sample = (runtime.state.value == "unloaded" and model_id not in self._loads
-                                            and self._eviction is None)
+                                            and self._eviction is None
+                                            and (self._switch_intent is None or self._switch_intent.request_id == request_id)
+                                            and now >= self._next_switch_attempt.get(model_id, 0))
                         else:
                             self._queue.remove(request_id, WaitState.CLAIMED)
                             return lease
                 if needs_sample:
                     # Sampling is external I/O; take it outside the condition and
                     # re-check state before committing the operation below.
+                    started_operation = False
                     async with self._condition:
                         runtime = self.book.runtime[model_id]
                         if admitted and runtime.state.value == "unloaded" and model_id not in self._loads:
@@ -90,13 +107,12 @@ class ModelScheduler:
                             if self.book.can_load(model_id, sample, now):
                                 operation = self.book.begin_load(model_id, sample, now)
                                 self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                                started_operation = True
                             elif self._eviction is None:
-                                candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
-                                if candidates:
-                                    operations = self.book.begin_eviction([candidate.model_id for candidate in candidates])
-                                    self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
+                                started_operation = self._establish_or_advance_switch(request_id, model_id, sample, deadline, now)
                         self._condition.notify_all()
-                    continue
+                    if started_operation:
+                        continue
                 async with self._condition:
                     remaining = deadline - monotonic()
                     if remaining <= 0:
@@ -109,7 +125,56 @@ class ModelScheduler:
         finally:
             async with self._condition:
                 self._queue.remove(request_id)
+                self._cancel_switch_intent(request_id)
                 self._condition.notify_all()
+
+    def _cold_request_eligible(self, item) -> bool:
+        return monotonic() >= self._next_switch_attempt.get(item.model_id, 0)
+
+    def _establish_or_advance_switch(self, request_id: str, model_id: str, sample: MemorySample, deadline: float, now: float) -> bool:
+        """Freeze one complete eviction set, then stop it only after it drains."""
+        intent = self._switch_intent
+        if intent is None:
+            candidates = self.eviction_policy.choose(
+                self._load_deficit(model_id, sample), now=now, include_busy=True
+            )
+            if not candidates:
+                return False
+            models = tuple(candidate.model_id for candidate in candidates)
+            try:
+                self.book.freeze_for_switch(list(models))
+            except Conflict:
+                return False
+            self._switch_intent = SwitchIntent(
+                request_id, model_id, models,
+                min(deadline, now + self._switch_drain_timeout_seconds),
+            )
+            intent = self._switch_intent
+        if intent.request_id != request_id:
+            return False
+        if any(self.book.runtime[model_id].leases for model_id in intent.frozen_models):
+            return False
+        try:
+            operations = self.book.begin_eviction(list(intent.frozen_models))
+        except Conflict:
+            self._cancel_switch_intent(intent.request_id)
+            return False
+        self._switch_intent = None
+        self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
+        return True
+
+    def _cancel_switch_intent(self, request_id: str) -> None:
+        intent = self._switch_intent
+        if intent is not None and intent.request_id == request_id:
+            self.book.unfreeze_switch(list(intent.frozen_models))
+            self._switch_intent = None
+
+    def _expire_switch_intent(self, now: float) -> None:
+        intent = self._switch_intent
+        if intent is not None and (now >= intent.expires_at or not self._queue.contains(intent.request_id)):
+            self.book.unfreeze_switch(list(intent.frozen_models))
+            self._next_switch_attempt[intent.target_id] = now + self._switch_retry_seconds
+            self._switch_intent = None
 
     async def _finish_load(self, operation, deadline: float) -> None:
         try:

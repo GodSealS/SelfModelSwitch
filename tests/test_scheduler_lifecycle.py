@@ -214,6 +214,62 @@ async def test_cold_load_evicts_a_complete_idle_prefix_before_loading() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cold_target_freezes_busy_evictable_model_until_its_lease_drains() -> None:
+    specs = {
+        "resident": ModelSpec("resident", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=2),
+        "target": ModelSpec("target", "http://127.0.0.1:10002", frozenset({Capability.CHAT}), 100),
+    }
+    registry = Book(specs, model_budget=150, free_floor=20, margin=0)
+    for model_id in specs:
+        registry.bootstrap_stopped(model_id)
+    operation = registry.begin_load("resident", MemorySample(1_000, 1_000, 0), 0)
+    registry.loaded(operation, 0)
+    active = registry.acquire_ready("resident", "active", 0)
+    resources = ReclaimingResources()
+    scheduler = ModelScheduler(registry, resources, ReclaimingBackend(resources), poll_interval_seconds=0.001)
+
+    waiting = asyncio.create_task(scheduler.acquire("target", "cold-target", asyncio.get_running_loop().time() + 1))
+    for _ in range(100):
+        if registry.runtime["resident"].admission_blocked:
+            break
+        await asyncio.sleep(0)
+    assert registry.runtime["resident"].admission_blocked is True
+    assert not waiting.done()
+
+    await scheduler.release(active, Outcome.SUCCESS)
+    target = await waiting
+    assert registry.runtime["resident"].state.value == "unloaded"
+    await scheduler.release(target, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_switch_freeze_expires_and_restores_resident_admission() -> None:
+    specs = {
+        "resident": ModelSpec("resident", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=2),
+        "target": ModelSpec("target", "http://127.0.0.1:10002", frozenset({Capability.CHAT}), 100),
+    }
+    registry = Book(specs, model_budget=150, free_floor=20, margin=0)
+    for model_id in specs:
+        registry.bootstrap_stopped(model_id)
+    operation = registry.begin_load("resident", MemorySample(1_000, 1_000, 0), 0)
+    registry.loaded(operation, 0)
+    registry.acquire_ready("resident", "active", 0)
+    resources = ReclaimingResources()
+    scheduler = ModelScheduler(
+        registry, resources, ReclaimingBackend(resources), poll_interval_seconds=0.001,
+        switch_drain_timeout_seconds=0.01, switch_retry_seconds=1,
+    )
+
+    waiting = asyncio.create_task(scheduler.acquire("target", "cold-target", asyncio.get_running_loop().time() + 1))
+    await asyncio.sleep(0.03)  # Longer than the configured switch drain timeout.
+    assert registry.runtime["resident"].admission_blocked is False
+    assert registry.acquire_ready("resident", "new-resident", asyncio.get_running_loop().time()).model_id == "resident"
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+
+@pytest.mark.asyncio
 async def test_preload_residency_does_not_create_a_user_lease_or_heat() -> None:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, preload=True)
     registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)

@@ -25,11 +25,11 @@ class EvictionPolicy:
         self.book = book
         self.max_evictions = max_evictions
 
-    def candidates(self, now: float) -> list[EvictionCandidate]:
+    def candidates(self, now: float, *, include_busy: bool = False) -> list[EvictionCandidate]:
         result: list[EvictionCandidate] = []
         for model_id, spec in self.book.specs.items():
             runtime = self.book.runtime[model_id]
-            if (runtime.state is not State.READY or runtime.leases or runtime.admission_blocked
+            if (runtime.state is not State.READY or (runtime.leases and not include_busy) or runtime.admission_blocked
                     or spec.pinned or not spec.evictable):
                 continue
             reserved = self.book.required(model_id)
@@ -40,12 +40,12 @@ class EvictionPolicy:
             result.append(EvictionCandidate(model_id, reserved, heat, spec.priority, score))
         return sorted(result, key=lambda candidate: (candidate.score, candidate.model_id))
 
-    def choose(self, bytes_needed: int, *, now: float) -> list[EvictionCandidate]:
+    def choose(self, bytes_needed: int, *, now: float, include_busy: bool = False) -> list[EvictionCandidate]:
         if bytes_needed <= 0:
             return []
         selected: list[EvictionCandidate] = []
         released = 0
-        for candidate in self.candidates(now):
+        for candidate in self.candidates(now, include_busy=include_busy):
             selected.append(candidate)
             released += candidate.reserved_bytes
             if released >= bytes_needed:

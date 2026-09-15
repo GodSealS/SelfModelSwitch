@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 
 class WaitState(str, Enum):
@@ -59,14 +60,15 @@ class RequestQueue:
             item.state = state
         return item
 
-    def head(self, now: float) -> QueuedRequest | None:
+    def head(self, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None) -> QueuedRequest | None:
         self.expire(now)
-        if not self._items:
+        items = tuple(self._items.values()) if eligible is None else tuple(item for item in self._items.values() if eligible(item))
+        if not items:
             return None
-        return min(self._items.values(), key=lambda item: (-self._priority(item, now), item.sequence))
+        return min(items, key=lambda item: (-self._priority(item, now), item.sequence))
 
-    def is_head(self, request_id: str, now: float) -> bool:
-        item = self.head(now)
+    def is_head(self, request_id: str, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None) -> bool:
+        item = self.head(now, eligible=eligible)
         return item is not None and item.request_id == request_id
 
     def contains(self, request_id: str) -> bool:
