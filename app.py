@@ -331,6 +331,8 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                     try:
                         async for chunk in opened.iter_bytes():
                             pending += chunk
+                            if len(pending) > config.gateway.max_sse_event_bytes:
+                                return
                             lines = pending.splitlines(keepends=True)
                             pending = b""
                             if lines and not lines[-1].endswith((b"\n", b"\r")):

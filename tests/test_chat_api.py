@@ -73,6 +73,16 @@ class BrokenCloseGateway:
         return BrokenClose()
 
 
+class OversizedEventGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class OversizedEvent(StreamOpened):
+            def iter_bytes(self):
+                async def iterator():
+                    yield b"x" * (1024 * 1024 + 1)
+                return iterator()
+        return OversizedEvent()
+
+
 def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
     scheduler = Scheduler()
     app = create_app(scheduler=scheduler, gateway=Gateway())
@@ -129,6 +139,15 @@ def test_stream_close_failure_still_releases_lease() -> None:
         with pytest.raises(RuntimeError, match="close failed"):
             client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
     assert scheduler.releases == [Outcome.SUCCESS]
+
+
+def test_stream_aborts_an_oversized_unterminated_sse_event_without_forwarding_it() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=OversizedEventGateway())) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert response.status_code == 200
+    assert response.content == b""
+    assert scheduler.releases == [Outcome.ABORTED]
 
 
 def test_chat_rejects_non_json_and_oversized_bodies_before_admission() -> None:
