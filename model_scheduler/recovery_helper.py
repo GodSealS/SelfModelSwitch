@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import socket
 import subprocess
 from typing import Any, Callable
 
 
 class RecoveryHelper:
-    def __init__(self, manifest: str | Path, *, runner: Callable[[list[str]], str] | None = None, inspector: Callable[[str], dict[str, Any] | None] | None = None):
+    _PORTS = {"embedding": 10001, "reranker": 10002, "qwen-small": 10003, "qwen-large": 10004}
+
+    def __init__(self, manifest: str | Path, *, runner: Callable[[list[str]], str] | None = None, inspector: Callable[[str], dict[str, Any] | None] | None = None, port_open: Callable[[int], bool] | None = None):
         self.manifest = Path(manifest)
         self.runner = runner or self._run
         self.inspector = inspector or self._inspect
+        self.port_open = port_open or self._port_open
 
     @staticmethod
     def _run(argv: list[str]) -> str:
@@ -26,6 +30,12 @@ class RecoveryHelper:
         if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
             raise ValueError("invalid docker inspect response")
         return payload[0]
+
+    @staticmethod
+    def _port_open(port: int) -> bool:
+        with socket.socket() as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
 
     def recover(self) -> dict[str, object]:
         try:
@@ -43,6 +53,8 @@ class RecoveryHelper:
                     if labels.get("io.self-model-switch.deployment") != deployment_id or labels.get("io.self-model-switch.model") != model_id:
                         raise ValueError("container label mismatch")
                     self.runner(["docker", "stop", "--time", "30", name])
+                if self.port_open(self._PORTS[model_id]):
+                    raise ValueError("container port remains open")
                 stopped.append(model_id)
             self.runner(["systemctl", "start", "llama-swap.service"])
             return {"ok": True, "phase": "complete", "error_code": None, "stopped_models": stopped}

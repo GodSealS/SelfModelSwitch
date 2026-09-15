@@ -13,7 +13,7 @@ def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> Non
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
     calls: list[list[str]] = []
     record = {"Config": {"Labels": {"io.self-model-switch.deployment": "thor-local", "io.self-model-switch.model": "embedding"}}}
-    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: record)
+    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: record, port_open=lambda _: False)
     result = helper.recover()
     assert result["ok"] is True
     assert ["docker", "stop", "--time", "30", "sms-thor-local-embedding"] in calls
@@ -23,7 +23,14 @@ def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> Non
 def test_recovery_refuses_same_prefix_container_with_wrong_labels(tmp_path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
-    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: {"Config": {"Labels": {"io.self-model-switch.deployment": "other", "io.self-model-switch.model": "embedding"}}})
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: {"Config": {"Labels": {"io.self-model-switch.deployment": "other", "io.self-model-switch.model": "embedding"}}}, port_open=lambda _: False)
+    assert helper.recover()["ok"] is False
+
+
+def test_recovery_refuses_to_claim_stop_while_manifest_port_is_open(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: None, port_open=lambda port: port == 10001)
     assert helper.recover()["ok"] is False
 
 
