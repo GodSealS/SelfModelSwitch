@@ -5,7 +5,7 @@ import json
 import pytest
 
 from model_scheduler.config import load_config
-from model_scheduler.deploy import DeployError, collect_facts, preflight, render
+from model_scheduler.deploy import DeployError, collect_facts, migrate, preflight, render
 from model_scheduler.storage_monitor import StorageSnapshot
 
 
@@ -77,3 +77,31 @@ def test_collect_writes_read_only_device_facts_once(tmp_path) -> None:
     assert ["lsblk", "--json", "--output", "NAME,UUID,FSTYPE,MOUNTPOINTS"] in calls
     with pytest.raises(DeployError, match="already exists"):
         collect_facts(output, runner=lambda _: "value")
+
+
+def test_migrate_legacy_config_writes_explicit_v1_template(tmp_path) -> None:
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text("""
+server: {host: 127.0.0.1, port: 8090}
+llama_swap: {base_url: http://127.0.0.1:8080, timeout_seconds: 30, load_timeout_seconds: 900}
+scheduler:
+  poll_interval_seconds: 2
+  resource_safety_margin: 0.15
+  min_free_memory_bytes: 1
+  max_evictions_per_request: 8
+  request_queue_timeout_seconds: 1800
+  heat: {half_life_seconds: 1800, request_weight: 1.0, token_weight: 0.0001, active_bonus: 2.0}
+  thrash: {switch_window_seconds: 10, max_switches_in_window: 3, cooldown_seconds: 15}
+resources: {provider: auto, total_memory_bytes: 0}
+models:
+  embedding: {memory: {reserved_bytes: 1}, scheduling: {priority: 100, evictable: false, pinned: true}, lifecycle: {ttl_seconds: 0}}
+  reranker: {memory: {reserved_bytes: 1}, scheduling: {priority: 80, evictable: true, pinned: false}, lifecycle: {ttl_seconds: 1}}
+  qwen-small: {memory: {reserved_bytes: 1}, scheduling: {priority: 50, evictable: true, pinned: false}, lifecycle: {ttl_seconds: 1}}
+  qwen-large: {memory: {reserved_bytes: 1}, scheduling: {priority: 40, evictable: true, pinned: false}, lifecycle: {ttl_seconds: 1}}
+""")
+    output = tmp_path / "v1.yaml"
+    migrated = migrate(legacy, output)
+    assert migrated["resources"]["provider"] == "psutil"
+    assert "active_bonus" not in migrated["scheduler"]["heat"]
+    assert migrated["models"]["embedding"]["lifecycle"]["preload"] is True
+    assert "REQUIRED_REAL_UUID" in output.read_text()

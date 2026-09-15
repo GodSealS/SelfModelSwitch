@@ -29,6 +29,12 @@ _MODEL_SETTINGS = {
     "qwen-large": (10004, ["chat"], 40, True, False, 1800, None),
 }
 _SSD_MOUNT_UNIT = "mnt-model\\x2dssd.mount"
+_LEGACY_MODEL_SETTINGS = {
+    "embedding": (10001, ["embeddings"], "embedding.gguf"),
+    "reranker": (10002, ["rerank"], "reranker.gguf"),
+    "qwen-small": (10003, ["chat"], "qwen-small.gguf"),
+    "qwen-large": (10004, ["chat"], "qwen-large.gguf"),
+}
 
 
 def _require(value: Any, name: str) -> str:
@@ -177,19 +183,60 @@ def collect_facts(output: str | Path, *, runner: Any | None = None) -> dict[str,
     return facts
 
 
+def migrate(source: str | Path, output: str | Path) -> dict[str, Any]:
+    """Convert only the known pre-v1 layout into an explicit unsafe template."""
+    destination = Path(output)
+    if destination.exists():
+        raise DeployError("migration output already exists")
+    try:
+        legacy = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise DeployError("cannot read legacy configuration") from exc
+    if not isinstance(legacy, dict) or set(legacy) != {"server", "llama_swap", "scheduler", "resources", "models"}:
+        raise DeployError("unsupported legacy configuration")
+    try:
+        server, swap, scheduler, resources, models = (legacy[key] for key in ("server", "llama_swap", "scheduler", "resources", "models"))
+        if not all(isinstance(value, dict) for value in (server, swap, scheduler, resources, models)) or set(models) != _MODELS:
+            raise ValueError
+        if resources.get("provider") != "auto" or resources.get("total_memory_bytes") != 0:
+            raise ValueError
+        heat, thrash = scheduler["heat"], scheduler["thrash"]
+        if not isinstance(heat, dict) or not isinstance(thrash, dict):
+            raise ValueError
+        migrated_models = {}
+        for model_id, old_model in models.items():
+            if not isinstance(old_model, dict):
+                raise ValueError
+            port, capabilities, filename = _LEGACY_MODEL_SETTINGS[model_id]
+            old_scheduling, old_lifecycle, old_memory = old_model["scheduling"], old_model["lifecycle"], old_model["memory"]
+            if not all(isinstance(value, dict) for value in (old_scheduling, old_lifecycle, old_memory)):
+                raise ValueError
+            pinned = old_scheduling["pinned"]
+            migrated_models[model_id] = {"upstream_url": f"http://127.0.0.1:{port}", "capabilities": capabilities, "file": filename, "sha256": "REQUIRED_64_HEX", "container_name": f"sms-REQUIRED_DEPLOYMENT-{model_id}", "memory": {"reserved_bytes": old_memory["reserved_bytes"]}, "scheduling": {"priority": old_scheduling["priority"], "max_concurrency": 1, "evictable": old_scheduling["evictable"], "pinned": pinned}, "lifecycle": {"preload": pinned, "ttl_seconds": old_lifecycle["ttl_seconds"]}}
+        migrated = {"schema_version": 1, "server": {"host": server["host"], "port": server["port"], "workers": 1, "max_request_body_bytes": 4194304, "body_timeout_seconds": 10, "shutdown_grace_seconds": 30}, "llama_swap": {"base_url": swap["base_url"], "connect_timeout_seconds": 5, "control_timeout_seconds": swap["timeout_seconds"], "load_timeout_seconds": swap["load_timeout_seconds"], "unload_timeout_seconds": 45}, "scheduler": {"poll_interval_seconds": scheduler["poll_interval_seconds"], "request_queue_timeout_seconds": scheduler["request_queue_timeout_seconds"], "queue_capacity": 128, "priority_aging_seconds": 30, "switch_drain_timeout_seconds": 30, "switch_retry_seconds": 30, "resource_safety_margin": scheduler["resource_safety_margin"], "min_free_memory_bytes": scheduler["min_free_memory_bytes"], "max_evictions_per_request": scheduler["max_evictions_per_request"], "memory_reclaim_timeout_seconds": 10, "heat": {"half_life_seconds": heat["half_life_seconds"], "request_weight": heat["request_weight"], "token_weight": heat["token_weight"]}, "thrash": thrash}, "resources": {"provider": "psutil", "system_reserve_bytes": 8589934592, "sample_interval_seconds": 1, "sample_max_age_seconds": 2}, "storage": {"mount_path": "/mnt/model-ssd", "model_directory": "/mnt/model-ssd/models", "expected_uuid": "REQUIRED_REAL_UUID", "filesystem": "ext4"}, "gateway": {"connect_timeout_seconds": 5, "pool_timeout_seconds": 5, "read_idle_timeout_seconds": 60, "write_idle_timeout_seconds": 60, "inference_timeout_seconds": 900, "close_timeout_seconds": 5, "max_response_body_bytes": 16777216, "max_sse_event_bytes": 1048576}, "models": migrated_models}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DeployError("unsupported legacy configuration") from exc
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(yaml.safe_dump(migrated, sort_keys=False), encoding="utf-8")
+    return migrated
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
     render_parser = sub.add_parser("render"); render_parser.add_argument("--input", required=True); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True)
     preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
     collect_parser = sub.add_parser("collect"); collect_parser.add_argument("--output", required=True)
+    migrate_parser = sub.add_parser("migrate"); migrate_parser.add_argument("--input", required=True); migrate_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
             render(args.input, args.mode, args.output)
         elif args.command == "preflight":
             print(json.dumps(preflight(args.manifest), sort_keys=True))
-        else:
+        elif args.command == "collect":
             print(json.dumps(collect_facts(args.output), sort_keys=True))
+        else:
+            migrate(args.input, args.output)
     except DeployError as exc: print(f"deployment error: {exc}", file=sys.stderr); return 78
     return 0
 
