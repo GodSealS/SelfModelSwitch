@@ -1,7 +1,7 @@
 import pytest
 import signal
 
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
 from model_scheduler.storage_monitor import StorageSnapshot
 
 
@@ -68,3 +68,12 @@ def test_runner_requires_a_verified_storage_snapshot_before_docker_start() -> No
     assert storage.seen is models
     with pytest.raises(RunnerError, match="storage verification"):
         require_storage_ready(Storage(False), models)
+
+
+def test_runner_refuses_to_label_a_container_with_a_config_not_bound_by_manifest() -> None:
+    manifest = {"config_sha256": "a" * 64}
+    require_manifest_config_digest(manifest, "a" * 64)
+    with pytest.raises(RunnerError, match="config digest"):
+        require_manifest_config_digest(manifest, "b" * 64)
+    with pytest.raises(RunnerError, match="config digest"):
+        require_manifest_config_digest({}, "a" * 64)

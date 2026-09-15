@@ -44,6 +44,12 @@ def require_storage_ready(storage: Any, models: Mapping[str, Any]) -> None:
         raise RunnerError("storage verification failed")
 
 
+def require_manifest_config_digest(manifest: Mapping[str, Any], config_digest: str) -> None:
+    """Bind the Docker identity label to the exact rendered scheduler config."""
+    if not _HASH.fullmatch(config_digest) or manifest.get("config_sha256") != config_digest:
+        raise RunnerError("manifest config digest mismatch")
+
+
 def docker_stop_argv(requested_name: str, manifest_name: str) -> list[str] | None:
     if requested_name != manifest_name or not manifest_name.startswith("sms-"):
         return None

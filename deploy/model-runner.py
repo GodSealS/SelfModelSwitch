@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 from model_scheduler.config import ConfigError, load_config
-from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_storage_ready, run_child_with_signal_forwarding
+from model_scheduler.model_runner import RunnerError, docker_run_argv, docker_stop_argv, require_manifest_config_digest, require_storage_ready, run_child_with_signal_forwarding
 from model_scheduler.storage_monitor import StorageMonitor
 
 
@@ -91,7 +91,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError("invalid manifest deployment")
             return _stop(name, deployment_id, args.model_id)
         _verify_storage()
-        return run_child_with_signal_forwarding(docker_run_argv(manifest, args.model_id, _config_digest()))
+        config_digest = _config_digest()
+        require_manifest_config_digest(manifest, config_digest)
+        return run_child_with_signal_forwarding(docker_run_argv(manifest, args.model_id, config_digest))
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         print(f"model runner error: {exc}", file=sys.stderr)
         return 78

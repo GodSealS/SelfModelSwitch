@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 from typing import Any, Callable
@@ -10,6 +11,7 @@ from typing import Any, Callable
 
 class RecoveryHelper:
     _PORTS = {"embedding": 10001, "reranker": 10002, "qwen-small": 10003, "qwen-large": 10004}
+    _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
     def __init__(self, manifest: str | Path, *, runner: Callable[[list[str]], str] | None = None, inspector: Callable[[str], dict[str, Any] | None] | None = None, port_open: Callable[[int], bool] | None = None, control_stopped: Callable[[], bool] | None = None):
         self.manifest = Path(manifest)
@@ -61,8 +63,9 @@ class RecoveryHelper:
     def recover(self) -> dict[str, object]:
         try:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
-            deployment_id, models = data["deployment_id"], data["models"]
-            if not isinstance(deployment_id, str) or not isinstance(models, dict) or set(models) != set(self._PORTS):
+            deployment_id, config_sha256, models = data["deployment_id"], data["config_sha256"], data["models"]
+            if (not isinstance(deployment_id, str) or not isinstance(config_sha256, str) or not self._SHA256.fullmatch(config_sha256)
+                    or not isinstance(models, dict) or set(models) != set(self._PORTS)):
                 raise ValueError("invalid manifest")
             for model_id, model in models.items():
                 if not isinstance(model, dict) or model.get("container_name") != f"sms-{deployment_id}-{model_id}":
@@ -78,7 +81,9 @@ class RecoveryHelper:
                 record = self.inspector(name)
                 if record is not None:
                     labels = record.get("Config", {}).get("Labels", {})
-                    if labels.get("io.self-model-switch.deployment") != deployment_id or labels.get("io.self-model-switch.model") != model_id:
+                    if (labels.get("io.self-model-switch.deployment") != deployment_id
+                            or labels.get("io.self-model-switch.model") != model_id
+                            or labels.get("io.self-model-switch.config-sha256") != config_sha256):
                         raise ValueError("container label mismatch")
                     self.runner(["docker", "stop", "--time", "30", name])
                     after = self.inspector(name)

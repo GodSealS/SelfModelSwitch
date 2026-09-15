@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -71,6 +72,7 @@ def test_lab_render_writes_consistent_deployment_artifacts(tmp_path) -> None:
     assert config.models["qwen-small"].upstream_url == "http://127.0.0.1:10003"
     assert "sms-model-runner start qwen-small" in (output / "llama-swap.yaml").read_text()
     assert json.loads((output / "manifest.json").read_text())["models"]["qwen-small"]["container_name"] == "sms-thor-local-qwen-small"
+    assert manifest["config_sha256"] == hashlib.sha256((output / "config.yaml").read_bytes()).hexdigest()
     assert (output / "fstab.fragment").read_text() == "UUID=uuid /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n"
     scheduler_unit = (output / "model-scheduler.service").read_text()
     assert "BindsTo=mnt-model\\x2dssd.mount" in scheduler_unit
