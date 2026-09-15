@@ -51,6 +51,7 @@ class ModelScheduler:
         self._switch_retry_seconds = switch_retry_seconds
         self._switch_intent: SwitchIntent | None = None
         self._next_switch_attempt: dict[str, float] = {}
+        self._recovery_task: asyncio.Task[None] | None = None
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
         if model_id not in self.book.specs:
@@ -177,6 +178,7 @@ class ModelScheduler:
             self._switch_intent = None
 
     async def _finish_load(self, operation, deadline: float) -> None:
+        recover = False
         try:
             observation: Observation = await self.backend.load(operation, deadline)
             async with self._condition:
@@ -184,11 +186,13 @@ class ModelScheduler:
                     self.book.loaded(operation, monotonic())
                 else:
                     self.book.failed(operation, observation.detail_code or "load_unverified")
+                    recover = self.recovery is not None and not self.book.recovering
                 self._condition.notify_all()
         except (Exception, asyncio.CancelledError) as exc:
             async with self._condition:
                 try:
                     self.book.failed(operation, "load_failed")
+                    recover = self.recovery is not None and not self.book.recovering
                 except StaleOperation:
                     pass
                 self._condition.notify_all()
@@ -197,6 +201,36 @@ class ModelScheduler:
         finally:
             async with self._condition:
                 self._loads.pop(operation.model_id, None)
+                self._condition.notify_all()
+            if recover:
+                self._start_recovery(deadline)
+
+    def _start_recovery(self, deadline: float) -> None:
+        if self._recovery_task is None or self._recovery_task.done():
+            self._recovery_task = asyncio.create_task(self._recover_after_unverified_load(deadline))
+
+    async def _recover_after_unverified_load(self, deadline: float) -> None:
+        """Use the narrow recovery port after a control action has uncertain state."""
+        try:
+            async with self._condition:
+                while any(runtime.leases for runtime in self.book.runtime.values()):
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        for runtime in self.book.runtime.values():
+                            for lease in tuple(runtime.leases.values()):
+                                self.book.release(lease, Outcome.ABORTED, monotonic())
+                        break
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), remaining)
+                    except asyncio.TimeoutError:
+                        continue
+            await self.recover(deadline)
+        except (Conflict, ModelUnavailable):
+            # The failed model remains ERROR and admissions stay conservative.
+            pass
+        finally:
+            async with self._condition:
+                self._recovery_task = None
                 self._condition.notify_all()
 
     async def _admission_allowed(self) -> bool:

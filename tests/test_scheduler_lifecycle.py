@@ -35,6 +35,15 @@ class Recovery:
         return RecoveryResult(True, "complete", None, ("chat",))
 
 
+class SignallingRecovery(Recovery):
+    def __init__(self):
+        self.called = asyncio.Event()
+
+    async def recover(self, deadline):
+        self.called.set()
+        return await super().recover(deadline)
+
+
 class ReclaimingResources:
     def __init__(self): self.available = 110
     async def snapshot(self): return MemorySample(1_000, self.available, asyncio.get_running_loop().time())
@@ -192,6 +201,24 @@ async def test_ttl_sweep_does_not_stop_a_model_with_a_waiter() -> None:
 async def test_scheduler_recovery_uses_injected_control_port() -> None:
     scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=Recovery())
     await scheduler.recover(asyncio.get_running_loop().time() + 1)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_unverified_load_triggers_injected_global_recovery() -> None:
+    class UnverifiedLoadBackend(Backend):
+        async def load(self, operation, deadline):
+            return Observation(Presence.UNKNOWN, None, False, 0, "load_timeout")
+
+    recovery = SignallingRecovery()
+    scheduler = ModelScheduler(book(), Resources(), UnverifiedLoadBackend(), recovery=recovery)
+    with pytest.raises(ModelUnavailable, match="load_timeout"):
+        await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    await asyncio.wait_for(recovery.called.wait(), 1)
+    for _ in range(100):
+        if scheduler.book.runtime["chat"].state.value == "unloaded":
+            break
+        await asyncio.sleep(0)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
 
 
