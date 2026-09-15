@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -10,27 +10,24 @@ class LlamaSwapError(RuntimeError):
     pass
 
 
+class LlamaSwapProtocolError(LlamaSwapError):
+    pass
+
+
 class LlamaSwapClient:
     """
     Minimal client for the current llama-swap HTTP surface.
 
-    Current documented endpoints used here:
-      GET  /health
-      GET  /running
-      GET  /v1/models
-      GET  /props?model=<id>       -> dispatches the model and waits for readiness
-      POST /api/models/unload/<id>
-      POST /api/models/unload      -> unload all
-
-    llama-swap does not need a separate load endpoint for this design: a model
-    is activated by dispatching a request to it. For llama.cpp-backed models,
-    /props?model= is a lightweight warm-up/dispatch route.
+    The release-specific ``running_parser`` is mandatory.  llama-swap does not
+    publish a stable response schema across releases, so a client constructed
+    without a parser refuses to infer model residency from unverified JSON.
     """
 
-    def __init__(self, base_url: str, timeout: float = 30.0, load_timeout: float = 900.0):
+    def __init__(self, base_url: str, timeout: float = 30.0, load_timeout: float = 900.0, *, running_parser: Callable[[Any], list[str]] | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.load_timeout = load_timeout
+        self.running_parser = running_parser
 
     async def health(self) -> bool:
         async with httpx.AsyncClient(timeout=self.timeout) as c:
@@ -38,16 +35,18 @@ class LlamaSwapClient:
             return r.status_code == 200
 
     async def running(self) -> list[str]:
+        if self.running_parser is None:
+            raise LlamaSwapProtocolError("fixed llama-swap running fixture is required")
         async with httpx.AsyncClient(timeout=self.timeout) as c:
             r = await c.get(f"{self.base_url}/running")
             r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                return [x if isinstance(x, str) else x.get("id", x.get("model", "")) for x in data]
-            if isinstance(data, dict):
-                models = data.get("models", data.get("running", []))
-                return [x if isinstance(x, str) else x.get("id", x.get("model", "")) for x in models]
-            return []
+            try:
+                model_ids = self.running_parser(r.json())
+            except (TypeError, ValueError, KeyError) as exc:
+                raise LlamaSwapProtocolError("invalid fixed llama-swap running response") from exc
+            if not isinstance(model_ids, list) or any(type(model_id) is not str or not model_id for model_id in model_ids):
+                raise LlamaSwapProtocolError("invalid fixed llama-swap running response")
+            return model_ids
 
     async def list_models(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as c:
