@@ -64,13 +64,17 @@ class RecoveryHelper:
             deployment_id, models = data["deployment_id"], data["models"]
             if not isinstance(deployment_id, str) or not isinstance(models, dict) or set(models) != set(self._PORTS):
                 raise ValueError("invalid manifest")
+            for model_id, model in models.items():
+                if not isinstance(model, dict) or model.get("container_name") != f"sms-{deployment_id}-{model_id}":
+                    raise ValueError("unsafe container name")
             self.runner(["systemctl", "stop", "llama-swap.service"])
             if not self.control_stopped():
                 raise ValueError("control_plane_still_running")
             stopped = []
             for model_id in sorted(models):
                 name = models[model_id].get("container_name")
-                if not isinstance(name, str) or not name.startswith(f"sms-{deployment_id}-"): raise ValueError("unsafe container name")
+                if not isinstance(name, str):
+                    raise ValueError("unsafe container name")
                 record = self.inspector(name)
                 if record is not None:
                     labels = record.get("Config", {}).get("Labels", {})

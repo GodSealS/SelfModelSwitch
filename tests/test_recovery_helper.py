@@ -22,6 +22,18 @@ def test_recovery_rejects_an_incomplete_manifest_before_stopping_control_plane(t
     assert calls == []
 
 
+def test_recovery_rejects_a_noncanonical_container_name_before_stopping_control_plane(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    models = _models()
+    models["qwen-small"]["container_name"] = "sms-thor-local-qwen-small-stale"
+    manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": models}))
+    calls: list[list[str]] = []
+    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: None, port_open=lambda _: False, control_stopped=lambda: True)
+
+    assert helper.recover()["ok"] is False
+    assert calls == []
+
+
 def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": _models()}))
