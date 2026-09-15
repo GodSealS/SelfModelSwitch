@@ -12,11 +12,19 @@ def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> Non
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
     calls: list[list[str]] = []
-    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "")
+    record = {"Config": {"Labels": {"io.self-model-switch.deployment": "thor-local", "io.self-model-switch.model": "embedding"}}}
+    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: record)
     result = helper.recover()
     assert result["ok"] is True
     assert ["docker", "stop", "--time", "30", "sms-thor-local-embedding"] in calls
     assert all("ps" not in command for command in calls)
+
+
+def test_recovery_refuses_same_prefix_container_with_wrong_labels(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: {"Config": {"Labels": {"io.self-model-switch.deployment": "other", "io.self-model-switch.model": "embedding"}}})
+    assert helper.recover()["ok"] is False
 
 
 def test_control_recovery_helper_rejects_all_arguments() -> None:
