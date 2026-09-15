@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
 from model_scheduler.config import ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
+from model_scheduler.model_registry import Conflict
 
 
 def _config_path(explicit: str | Path | None) -> Path:
@@ -73,6 +74,20 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         if app.state.scheduler is None:
             return {model_id: {"state": "unknown", "in_flight": 0} for model_id in sorted(config.models)}
         return (await app.state.scheduler.status())["models"]
+
+    @app.post("/api/models/{model_id}/unload")
+    async def unload(model_id: str):
+        request_id = str(uuid4())
+        if model_id not in config.models:
+            return _error(404, "model_not_found", "Unknown model", request_id, "model")
+        if app.state.scheduler is None:
+            return _error(503, "service_unavailable", "Service is not ready", request_id)
+        try:
+            await app.state.scheduler.unload(model_id, monotonic() + config.llama_swap.unload_timeout_seconds)
+            return JSONResponse(content={"ok": True, "model": model_id}, headers={"X-Request-ID": request_id})
+        except Conflict as exc:
+            code = str(exc)
+            return _error(409, code if code in {"model_pinned", "model_busy"} else "model_busy", "Model cannot be unloaded", request_id)
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
