@@ -10,6 +10,7 @@ import uvicorn
 
 from app import create_app
 from model_scheduler.config import ConfigError, load_config
+from model_scheduler.instance_lock import InstanceLocked, acquire
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_config:
         print(f"schema_version={config.schema_version} models={','.join(sorted(config.models))}")
         return 0
-    uvicorn.run(create_app(path), host=config.server.host, port=config.server.port, workers=1, reload=False)
+    try:
+        with acquire(Path("/run/model-scheduler/scheduler.lock")):
+            uvicorn.run(create_app(path), host=config.server.host, port=config.server.port, workers=1, reload=False)
+    except InstanceLocked:
+        print("scheduler instance already running", file=sys.stderr)
+        return 73
     return 0
 
 
