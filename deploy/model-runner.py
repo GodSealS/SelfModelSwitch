@@ -37,7 +37,7 @@ def _config_digest() -> str:
         raise RunnerError("scheduler config unavailable") from exc
 
 
-def _stop(name: str) -> int:
+def _stop(name: str, deployment_id: str, model_id: str) -> int:
     inspect = subprocess.run(["docker", "inspect", name], capture_output=True, text=True, timeout=10)
     if inspect.returncode:
         return 0
@@ -46,7 +46,8 @@ def _stop(name: str) -> int:
         labels = record["Config"]["Labels"]
     except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RunnerError("cannot verify container labels") from exc
-    if labels.get("io.self-model-switch.model") not in MODELS:
+    if (labels.get("io.self-model-switch.deployment") != deployment_id
+            or labels.get("io.self-model-switch.model") != model_id):
         raise RunnerError("refusing to stop unmanaged container")
     return subprocess.run(["docker", "stop", "--time", "30", name], timeout=45).returncode
 
@@ -68,7 +69,10 @@ def main(argv: list[str] | None = None) -> int:
             command = docker_stop_argv(name, name)
             if command is None:
                 raise RunnerError("invalid manifest container")
-            return _stop(name)
+            deployment_id = manifest.get("deployment_id")
+            if not isinstance(deployment_id, str):
+                raise RunnerError("invalid manifest deployment")
+            return _stop(name, deployment_id, args.model_id)
         return subprocess.run(docker_run_argv(manifest, args.model_id, _config_digest()), timeout=None).returncode
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         print(f"model runner error: {exc}", file=sys.stderr)
