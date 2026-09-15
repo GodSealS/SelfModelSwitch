@@ -474,6 +474,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         try:
             lease = await app.state.scheduler.acquire(model_id, request_id, deadline)
             opened = await app.state.gateway.open(lease, capability, payload, deadline)
+            if opened.status_code != 200 or _media_type(opened.headers) != "application/json":
+                await close_and_release(opened, lease, Outcome.ABORTED)
+                return None, _error(502, "upstream_protocol_error", "Invalid upstream response", request_id)
             result = await opened.json()
             return (lease, opened, result), None
         except asyncio.CancelledError:

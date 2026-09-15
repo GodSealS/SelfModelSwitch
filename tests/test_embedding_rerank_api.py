@@ -17,7 +17,7 @@ class Scheduler:
 
 class Opened:
     status_code = 200
-    headers = {}
+    headers = {"content-type": "application/json"}
     def __init__(self, data): self.data = data
     async def json(self): return self.data
     async def aclose(self): return None
@@ -62,6 +62,21 @@ def test_embeddings_reject_vectors_with_inconsistent_dimensions() -> None:
     scheduler = Scheduler()
     with TestClient(create_app(scheduler=scheduler, gateway=BadDimensionsGateway())) as client:
         response = client.post("/v1/embeddings", json={"model": "embedding", "input": ["one", "two"]})
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_protocol_error"
+    assert scheduler.outcomes == [Outcome.ABORTED]
+
+
+def test_json_routes_reject_a_non_json_upstream_success_before_parsing_it() -> None:
+    class WrongContentTypeGateway:
+        async def open(self, lease, capability, payload, deadline):
+            class WrongContentType(Opened):
+                headers = {"content-type": "text/plain"}
+            return WrongContentType({"data": [{"index": 0, "embedding": [1.0]}]})
+
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=WrongContentTypeGateway())) as client:
+        response = client.post("/v1/embeddings", json={"model": "embedding", "input": "hello"})
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_protocol_error"
     assert scheduler.outcomes == [Outcome.ABORTED]
