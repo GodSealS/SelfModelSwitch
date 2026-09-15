@@ -128,3 +128,13 @@ def test_stream_close_failure_still_releases_lease() -> None:
         with pytest.raises(RuntimeError, match="close failed"):
             client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
     assert scheduler.releases == [Outcome.SUCCESS]
+
+
+def test_chat_rejects_non_json_and_oversized_bodies_before_admission() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=Gateway())) as client:
+        wrong_type = client.post("/v1/chat/completions", content="not json", headers={"content-type": "text/plain"})
+        oversized = client.post("/v1/chat/completions", content=b"x" * (4 * 1024 * 1024 + 1), headers={"content-type": "application/json"})
+    assert wrong_type.status_code == 415
+    assert oversized.status_code == 413
+    assert scheduler.releases == []

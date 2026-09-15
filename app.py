@@ -6,7 +6,9 @@ that would make imports perform control-plane I/O and hide startup failures.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import inspect
+import json
 import math
 import os
 from pathlib import Path
@@ -24,6 +26,12 @@ from model_scheduler.model_registry import Conflict
 from model_scheduler.scheduler import ModelUnavailable
 
 
+class BodyError(ValueError):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
 def _config_path(explicit: str | Path | None) -> Path:
     if explicit is not None:
         return Path(explicit)
@@ -32,6 +40,36 @@ def _config_path(explicit: str | Path | None) -> Path:
 
 def _error(status: int, code: str, message: str, request_id: str, param: str | None = None) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers={"X-Request-ID": request_id})
+
+
+async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float) -> dict[str, object]:
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        raise BodyError(415, "unsupported_media_type", "Content-Type must be application/json")
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            declared_length = int(length)
+        except ValueError as exc:
+            raise BodyError(400, "invalid_content_length", "Content-Length is invalid") from exc
+        if declared_length < 0:
+            raise BodyError(400, "invalid_content_length", "Content-Length is invalid")
+        if declared_length > max_bytes:
+            raise BodyError(413, "request_too_large", "Request body exceeds the configured limit")
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            raw = await request.body()
+    except asyncio.TimeoutError as exc:
+        raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
+    if len(raw) > max_bytes:
+        raise BodyError(413, "request_too_large", "Request body exceeds the configured limit")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BodyError(400, "invalid_json", "Request body is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise BodyError(400, "invalid_json", "Request body must be a JSON object")
+    return payload
 
 
 def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None) -> FastAPI:
@@ -113,8 +151,10 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def chat(request: Request):
         request_id = str(uuid4())
         try:
-            payload = await request.json()
+            payload = await _read_json(request, max_bytes=config.server.max_request_body_bytes, timeout_seconds=config.server.body_timeout_seconds)
             body = ChatRequest.model_validate(payload)
+        except BodyError as exc:
+            return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid chat request", request_id)
         model = config.models.get(body.model)
@@ -187,7 +227,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def embeddings(request: Request):
         request_id = str(uuid4())
         try:
-            payload = await request.json(); body = EmbeddingRequest.model_validate(payload)
+            payload = await _read_json(request, max_bytes=config.server.max_request_body_bytes, timeout_seconds=config.server.body_timeout_seconds); body = EmbeddingRequest.model_validate(payload)
+        except BodyError as exc:
+            return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid embedding request", request_id)
         inputs = [body.input] if isinstance(body.input, str) else body.input
@@ -212,7 +254,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def rerank(request: Request):
         request_id = str(uuid4())
         try:
-            payload = await request.json(); body = RerankRequest.model_validate(payload)
+            payload = await _read_json(request, max_bytes=config.server.max_request_body_bytes, timeout_seconds=config.server.body_timeout_seconds); body = RerankRequest.model_validate(payload)
+        except BodyError as exc:
+            return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid rerank request", request_id)
         if not body.query.strip() or not 1 <= len(body.documents) <= 256 or any(not item.strip() for item in body.documents):
