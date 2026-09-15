@@ -55,7 +55,9 @@ class DirectInferenceGateway:
         try:
             async with asyncio.timeout(remaining):
                 response = await self._client.send(request, stream=True)
-        except (asyncio.TimeoutError, httpx.HTTPError) as exc:
+        except asyncio.TimeoutError as exc:
+            raise GatewayError(504, "inference_timeout", Outcome.ABORTED) from exc
+        except httpx.HTTPError as exc:
             raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
         if 200 <= response.status_code < 300:
             return OpenedHTTPXResponse(response)

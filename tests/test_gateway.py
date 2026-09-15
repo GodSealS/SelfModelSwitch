@@ -64,3 +64,17 @@ async def test_gateway_clamps_or_defaults_upstream_retry_after(header, expected_
         await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 10)
     assert error.value.retry_after == expected_retry_after
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_an_absolute_inference_deadline_as_a_timeout() -> None:
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.1)
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(slow_handler), follow_redirects=False)
+    gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client)
+    with pytest.raises(GatewayError) as error:
+        await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 0.001)
+    assert (error.value.http_status, error.value.code, error.value.outcome) == (504, "inference_timeout", Outcome.ABORTED)
+    await client.aclose()
