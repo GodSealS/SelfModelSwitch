@@ -127,6 +127,12 @@ class Book:
         self._add_heat(model_id, now, self.request_weight)
         return lease
 
+    def can_admit_ready(self, model_id: str, sample: MemorySample, now: float) -> bool:
+        runtime = self.runtime[model_id]
+        return (not self.recovering and runtime.state is State.READY and not runtime.admission_blocked
+                and len(runtime.leases) < self.specs[model_id].max_concurrency
+                and self.sample_valid(sample, now) and sample.available_bytes >= self.free_floor)
+
     def release(self, lease: Lease, outcome: Outcome, now: float, tokens: int | None = None) -> bool:
         runtime = self.runtime[lease.model_id]
         if runtime.leases.get(lease.lease_id) != lease or runtime.generation != lease.generation:

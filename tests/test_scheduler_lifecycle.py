@@ -48,6 +48,14 @@ class ReclaimingBackend:
         return Observation(Presence.STOPPED, None, False, 0)
 
 
+class RecoveringReadyResources:
+    def __init__(self): self.calls = 0
+    async def snapshot(self):
+        self.calls += 1
+        available = 10 if self.calls == 1 else 9_000
+        return MemorySample(10_000, available, asyncio.get_running_loop().time())
+
+
 def book() -> Book:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
     result = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
@@ -222,3 +230,13 @@ async def test_shutdown_rejects_admission_aborts_remaining_leases_and_stops_mode
     with pytest.raises(ModelUnavailable, match="shutting_down"):
         await scheduler.acquire("chat", "new", asyncio.get_running_loop().time() + 1)
     assert scheduler.book.release(lease, Outcome.SUCCESS, asyncio.get_running_loop().time()) is False
+
+
+@pytest.mark.asyncio
+async def test_ready_admission_waits_for_fresh_free_memory_sample() -> None:
+    registry = book()
+    operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)
+    registry.loaded(operation, 0)
+    scheduler = ModelScheduler(registry, RecoveringReadyResources(), Backend(), poll_interval_seconds=0.001)
+    lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    assert lease.model_id == "chat"

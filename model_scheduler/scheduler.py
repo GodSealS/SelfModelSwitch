@@ -21,12 +21,15 @@ class ModelUnavailable(RuntimeError):
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, recovery: ControlRecoveryPort | None = None):
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be positive")
         self.book = book
         self.resources = resources
         self.backend = backend
         self.recovery = recovery
         self.queue_capacity = queue_capacity
+        self.poll_interval_seconds = poll_interval_seconds
         self.eviction_policy = EvictionPolicy(book, max_evictions=max_evictions)
         self._condition = asyncio.Condition()
         self._queue = RequestQueue(capacity=queue_capacity, aging_seconds=priority_aging_seconds)
@@ -50,6 +53,8 @@ class ModelScheduler:
                 raise QueueFull("queue_full")
         try:
             while True:
+                snapshot = await self.resources.snapshot()
+                sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
                 needs_sample = False
                 async with self._condition:
                     now = monotonic()
@@ -60,6 +65,8 @@ class ModelScheduler:
                         raise TimeoutError("queue deadline elapsed")
                     if self._queue.is_head(request_id, now):
                         try:
+                            if not self.book.can_admit_ready(model_id, sample, now):
+                                raise Conflict("ready admission blocked")
                             lease = self.book.acquire_ready(model_id, request_id, now)
                         except Conflict:
                             runtime = self.book.runtime[model_id]
@@ -73,8 +80,6 @@ class ModelScheduler:
                 if needs_sample:
                     # Sampling is external I/O; take it outside the condition and
                     # re-check state before committing the operation below.
-                    snapshot = await self.resources.snapshot()
-                    sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
                     async with self._condition:
                         runtime = self.book.runtime[model_id]
                         if runtime.state.value == "unloaded" and model_id not in self._loads:
@@ -94,9 +99,10 @@ class ModelScheduler:
                     if remaining <= 0:
                         raise TimeoutError("queue deadline elapsed")
                     try:
-                        await asyncio.wait_for(self._condition.wait(), remaining)
+                        await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
                     except asyncio.TimeoutError as exc:
-                        raise TimeoutError("queue deadline elapsed") from exc
+                        if monotonic() >= deadline:
+                            raise TimeoutError("queue deadline elapsed") from exc
         finally:
             async with self._condition:
                 self._queue.remove(request_id)

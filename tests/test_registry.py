@@ -95,3 +95,11 @@ def test_ttl_begins_only_after_last_lease_releases() -> None:
     book.release(second, Outcome.SUCCESS, 100)
     assert not book.ttl_due("a", 109.9)
     assert book.ttl_due("a", 110)
+
+
+def test_ready_admission_requires_a_fresh_sample_and_free_floor() -> None:
+    book = make_book()
+    load(book, "a", 0)
+    assert book.can_admit_ready("a", MemorySample(1_000, 20, 0), 1)
+    assert not book.can_admit_ready("a", MemorySample(1_000, 19, 0), 1)
+    assert not book.can_admit_ready("a", MemorySample(1_000, 900, -10), 1)
