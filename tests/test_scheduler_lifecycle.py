@@ -254,6 +254,21 @@ async def test_scheduler_recovery_uses_injected_control_port() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_keeps_accounting_conservative_when_recovery_stop_evidence_is_incomplete() -> None:
+    class IncompleteRecovery:
+        async def recover(self, deadline):
+            return RecoveryResult(True, "complete", None, ())
+
+    scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=IncompleteRecovery())
+
+    with pytest.raises(ModelUnavailable, match="control_recovery_incomplete"):
+        await scheduler.recover(asyncio.get_running_loop().time() + 1)
+
+    assert scheduler.book.recovering is True
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
 async def test_second_recovery_request_is_rejected_while_helper_is_running() -> None:
     class BlockingRecovery:
         def __init__(self):

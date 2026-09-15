@@ -14,7 +14,11 @@ rendered manifest.
 4. Install root-owned manifest/configuration and the two generated unit files;
    install `control-recover.py` as root-owned
    `/usr/local/libexec/sms-control-recover` with a sudoers rule that permits
-   only its no-argument invocation.
+   only its no-argument invocation. Install the tracked
+   `deploy/sudoers.model-scheduler` template as
+   `/etc/sudoers.d/model-scheduler` with mode `0440`, then validate it with
+   `visudo -cf /etc/sudoers.d/model-scheduler`; do not replace its explicit
+   empty-argument matcher with a wildcard.
 5. Create a release-specific Python 3.12 virtual environment from the verified
    hash lock, place it under `/opt/self-model-switch/releases/<id>`, and update
    `current` only after preflight succeeds.

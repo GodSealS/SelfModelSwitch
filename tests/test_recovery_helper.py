@@ -94,6 +94,11 @@ def test_control_recovery_helper_rejects_all_arguments() -> None:
     assert result.returncode == 64
 
 
+def test_sudoers_rule_allows_only_the_no_argument_recovery_helper() -> None:
+    rule = (Path(__file__).resolve().parent.parent / "deploy" / "sudoers.model-scheduler").read_text(encoding="utf-8")
+    assert rule == 'model-scheduler ALL=(root) NOPASSWD: /usr/local/libexec/sms-control-recover ""\n'
+
+
 def test_recovery_refuses_to_clean_containers_until_control_cgroup_is_empty(tmp_path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(_manifest(_models())))

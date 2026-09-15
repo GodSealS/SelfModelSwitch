@@ -393,7 +393,11 @@ class ModelScheduler:
             if not result.ok:
                 self._condition.notify_all()
                 raise ModelUnavailable(result.error_code or "control_recovery_failed")
-            self.book.finish_recovery(epoch, frozenset(result.stopped_models))
+            try:
+                self.book.finish_recovery(epoch, frozenset(result.stopped_models))
+            except Conflict as exc:
+                self._condition.notify_all()
+                raise ModelUnavailable("control_recovery_incomplete") from exc
             self._condition.notify_all()
 
     async def shutdown(self, deadline: float) -> tuple[str, ...]:

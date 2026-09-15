@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import AppConfig, model_specs
+from .control_recovery import ControlRecoveryClient
 from .model_registry import Book
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
@@ -52,6 +53,6 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         switch_window_seconds=config.scheduler.thrash.switch_window_seconds,
         max_switches_in_window=config.scheduler.thrash.max_switches_in_window,
         cooldown_seconds=config.scheduler.thrash.cooldown_seconds,
-        recovery=recovery,
+        recovery=recovery if recovery is not None else ControlRecoveryClient(),
         admission_guard=guard,
     )

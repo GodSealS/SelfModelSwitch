@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from model_scheduler.config import load_config
+from model_scheduler.control_recovery import ControlRecoveryClient
 from model_scheduler.contracts import MemorySample
 from model_scheduler.runtime import build_scheduler
 from app import create_app
@@ -31,6 +32,7 @@ def test_runtime_builder_defaults_to_a_fail_closed_storage_guard() -> None:
     config = load_config(Path(__file__).resolve().parent.parent / "config.yaml")
     scheduler = build_scheduler(config, Backend(), resources=Resources())
     assert scheduler.admission_guard is not None
+    assert isinstance(scheduler.recovery, ControlRecoveryClient)
 
 
 def test_app_factory_composes_runtime_when_control_backend_is_injected() -> None:
