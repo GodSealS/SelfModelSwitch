@@ -11,8 +11,9 @@ from .contracts import Capability, GatewayError, Lease, OpenedResponse, Outcome
 
 
 class OpenedHTTPXResponse:
-    def __init__(self, response: httpx.Response):
+    def __init__(self, response: httpx.Response, max_response_body_bytes: int):
         self._response = response
+        self._max_response_body_bytes = max_response_body_bytes
         self.status_code = response.status_code
         self.headers = response.headers
 
@@ -23,14 +24,30 @@ class OpenedHTTPXResponse:
         await self._response.aclose()
 
     async def json(self) -> object:
-        data = await self._response.aread()
-        return json.loads(data)
+        data = bytearray()
+        try:
+            async for chunk in self._response.aiter_bytes():
+                if len(data) + len(chunk) > self._max_response_body_bytes:
+                    try:
+                        await self.aclose()
+                    finally:
+                        raise GatewayError(502, "upstream_response_too_large", Outcome.ABORTED)
+                data.extend(chunk)
+        except httpx.HTTPError as exc:
+            raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
+        try:
+            return json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GatewayError(502, "upstream_protocol_error", Outcome.ABORTED) from exc
 
 
 class DirectInferenceGateway:
-    def __init__(self, upstreams: Mapping[str, str], client: httpx.AsyncClient):
+    def __init__(self, upstreams: Mapping[str, str], client: httpx.AsyncClient, *, max_response_body_bytes: int = 16 * 1024 * 1024):
+        if max_response_body_bytes <= 0:
+            raise ValueError("max_response_body_bytes must be positive")
         self._upstreams = dict(upstreams)
         self._client = client
+        self._max_response_body_bytes = max_response_body_bytes
 
     @staticmethod
     def _path(capability: Capability) -> str:
@@ -60,7 +77,7 @@ class DirectInferenceGateway:
         except httpx.HTTPError as exc:
             raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
         if 200 <= response.status_code < 300:
-            return OpenedHTTPXResponse(response)
+            return OpenedHTTPXResponse(response, self._max_response_body_bytes)
         status_code = response.status_code
         retry_after = self._retry_after(response) if status_code == 429 else None
         await response.aclose()

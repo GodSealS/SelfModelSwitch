@@ -120,7 +120,11 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     if gateway is None and scheduler is not None:
         timeout = httpx.Timeout(config.gateway.inference_timeout_seconds, connect=config.gateway.connect_timeout_seconds, read=config.gateway.read_idle_timeout_seconds, write=config.gateway.write_idle_timeout_seconds, pool=config.gateway.pool_timeout_seconds)
         owned_client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
-        gateway = DirectInferenceGateway({model_id: model.upstream_url for model_id, model in config.models.items()}, owned_client)
+        gateway = DirectInferenceGateway(
+            {model_id: model.upstream_url for model_id, model in config.models.items()},
+            owned_client,
+            max_response_body_bytes=config.gateway.max_response_body_bytes,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

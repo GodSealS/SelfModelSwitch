@@ -78,3 +78,18 @@ async def test_gateway_reports_an_absolute_inference_deadline_as_a_timeout() -> 
         await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 0.001)
     assert (error.value.http_status, error.value.code, error.value.outcome) == (504, "inference_timeout", Outcome.ABORTED)
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gateway_bounds_non_streaming_response_bytes_and_normalizes_invalid_json() -> None:
+    async def assert_json_error(content: bytes, expected_code: str) -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=content)), follow_redirects=False)
+        gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client, max_response_body_bytes=4)
+        opened = await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 10)
+        with pytest.raises(GatewayError) as error:
+            await opened.json()
+        assert (error.value.code, error.value.outcome) == (expected_code, Outcome.ABORTED)
+        await client.aclose()
+
+    await assert_json_error(b"12345", "upstream_response_too_large")
+    await assert_json_error(b"nope", "upstream_protocol_error")
