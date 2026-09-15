@@ -309,6 +309,7 @@ class ModelScheduler:
             if needs_sample:
                 snapshot = await self.resources.snapshot()
                 sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
+                started_operation = False
                 async with self._condition:
                     runtime = self.book.runtime[model_id]
                     now = monotonic()
@@ -316,21 +317,25 @@ class ModelScheduler:
                         if self.book.can_load(model_id, sample, now):
                             operation = self.book.begin_load(model_id, sample, now)
                             self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                            started_operation = True
                         else:
                             candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
                             if candidates:
                                 operations = self.book.begin_eviction([candidate.model_id for candidate in candidates])
                                 self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
+                                started_operation = True
                     self._condition.notify_all()
-                continue
+                if started_operation:
+                    continue
             async with self._condition:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise TimeoutError("preload deadline elapsed")
                 try:
-                    await asyncio.wait_for(self._condition.wait(), remaining)
+                    await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
                 except asyncio.TimeoutError as exc:
-                    raise TimeoutError("preload deadline elapsed") from exc
+                    if monotonic() >= deadline:
+                        raise TimeoutError("preload deadline elapsed") from exc
 
     async def recover(self, deadline: float) -> None:
         """Reconcile all model accounting through the injected root-owned helper."""

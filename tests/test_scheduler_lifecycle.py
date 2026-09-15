@@ -72,6 +72,15 @@ class RecoveringAdmissionGuard:
         return self.calls > 1
 
 
+class UnderProvisionedResources:
+    def __init__(self):
+        self.calls = 0
+
+    async def snapshot(self):
+        self.calls += 1
+        return MemorySample(1_000, 0, asyncio.get_running_loop().time())
+
+
 def book() -> Book:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
     result = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
@@ -307,6 +316,19 @@ async def test_preload_residency_does_not_create_a_user_lease_or_heat() -> None:
     runtime = registry.runtime["chat"]
     assert runtime.state.value == "ready"
     assert runtime.total_requests == 0 and not runtime.leases and registry.heat("chat", 1) == 0
+
+
+@pytest.mark.asyncio
+async def test_preload_waits_for_a_new_resource_sample_instead_of_spinning() -> None:
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, preload=True)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    resources = UnderProvisionedResources()
+    scheduler = ModelScheduler(registry, resources, Backend(), poll_interval_seconds=0.001)
+
+    with pytest.raises(TimeoutError, match="preload deadline elapsed"):
+        await scheduler.preload(asyncio.get_running_loop().time() + 0.01)
+    assert resources.calls < 20
 
 
 @pytest.mark.asyncio
