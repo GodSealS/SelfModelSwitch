@@ -4,6 +4,8 @@ Wants=network-online.target llama-swap.service
 After=network-online.target docker.service llama-swap.service @SSD_MOUNT_UNIT@
 RequiresMountsFor=/mnt/model-ssd
 BindsTo=@SSD_MOUNT_UNIT@
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple

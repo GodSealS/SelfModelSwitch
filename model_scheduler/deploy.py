@@ -23,6 +23,7 @@ _MODEL_SETTINGS = {
     "qwen-small": (10003, ["chat"], 50, True, False, 900, None),
     "qwen-large": (10004, ["chat"], 40, True, False, 1800, None),
 }
+_SSD_MOUNT_UNIT = "mnt-model\\x2dssd.mount"
 
 
 def _require(value: Any, name: str) -> str:
@@ -85,6 +86,14 @@ def _llama_swap_config(manifest: dict[str, Any]) -> dict[str, Any]:
     return {"healthCheckTimeout": 900, "globalTTL": 0, "unloadTimeout": 45, "models": models, "routing": {"router": {"use": "group", "settings": {"groups": {"all-managed": {"swap": False, "exclusive": False, "members": sorted(_MODELS)}}}}}}
 
 
+def _render_unit(name: str) -> str:
+    template = Path(__file__).resolve().parent.parent / "deploy" / f"{name}.in"
+    try:
+        return template.read_text(encoding="utf-8").replace("@SSD_MOUNT_UNIT@", _SSD_MOUNT_UNIT)
+    except OSError as exc:
+        raise DeployError(f"cannot read {name} template") from exc
+
+
 def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     path, destination = Path(source), Path(output)
     try: data = json.loads(path.read_text(encoding="utf-8"))
@@ -99,6 +108,8 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     (destination / "config.yaml").write_text(yaml.safe_dump(_scheduler_config(manifest), sort_keys=False), encoding="utf-8")
     (destination / "llama-swap.yaml").write_text(yaml.safe_dump(_llama_swap_config(manifest), sort_keys=False), encoding="utf-8")
     (destination / "fstab.fragment").write_text(f"UUID={manifest['ssd_uuid']} /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n", encoding="utf-8")
+    (destination / "model-scheduler.service").write_text(_render_unit("model-scheduler.service"), encoding="utf-8")
+    (destination / "llama-swap.service").write_text(_render_unit("llama-swap.service"), encoding="utf-8")
     return manifest
 
 

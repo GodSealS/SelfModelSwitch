@@ -26,6 +26,9 @@ def test_lab_render_writes_consistent_deployment_artifacts(tmp_path) -> None:
     assert "sms-model-runner start qwen-small" in (output / "llama-swap.yaml").read_text()
     assert json.loads((output / "manifest.json").read_text())["models"]["qwen-small"]["container_name"] == "sms-thor-local-qwen-small"
     assert (output / "fstab.fragment").read_text() == "UUID=uuid /mnt/model-ssd ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n"
+    scheduler_unit = (output / "model-scheduler.service").read_text()
+    assert "BindsTo=mnt-model\\x2dssd.mount" in scheduler_unit
+    assert "BindsTo=llama-swap.service" not in scheduler_unit
 
 
 def test_production_rejects_unmeasured_or_placeholder_input(tmp_path) -> None:
