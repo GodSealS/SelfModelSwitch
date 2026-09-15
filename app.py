@@ -440,7 +440,18 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         if error: return error
         lease, opened, result = context
         items = result.get("results") if isinstance(result, dict) else None
-        if not isinstance(items, list) or {item.get("index") for item in items if isinstance(item, dict)} != set(range(len(body.documents))) or any(type(item.get("relevance_score")) not in (int, float) or not math.isfinite(item["relevance_score"]) for item in items):
+        if (
+            not isinstance(items, list)
+            or len(items) != len(body.documents)
+            or not all(isinstance(item, dict) for item in items)
+            or any(type(item.get("index")) is not int for item in items)
+            or {item["index"] for item in items} != set(range(len(body.documents)))
+            or any(
+                type(item.get("relevance_score")) not in (int, float)
+                or not math.isfinite(item["relevance_score"])
+                for item in items
+            )
+        ):
             await close_and_release(opened, lease, Outcome.ABORTED)
             return _error(502, "upstream_protocol_error", "Invalid rerank response", request_id)
         ordered = sorted(items, key=lambda item: (-item["relevance_score"], item["index"]))[:count]

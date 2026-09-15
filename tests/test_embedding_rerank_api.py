@@ -76,3 +76,16 @@ def test_rerank_stably_sorts_scores_and_optionally_returns_documents() -> None:
         {"index": 0, "relevance_score": 0.5, "document": {"text": "one"}},
         {"index": 1, "relevance_score": 0.5, "document": {"text": "two"}},
     ]
+
+
+def test_rerank_rejects_duplicate_or_non_integer_upstream_indexes() -> None:
+    class InvalidIndexGateway:
+        async def open(self, lease, capability, payload, deadline):
+            return Opened({"results": [{"index": 0, "relevance_score": 0.5}, {"index": True, "relevance_score": 0.4}]})
+
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=InvalidIndexGateway())) as client:
+        response = client.post("/v1/rerank", json={"model": "reranker", "query": "q", "documents": ["one", "two"]})
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_protocol_error"
+    assert scheduler.outcomes == [Outcome.ABORTED]
