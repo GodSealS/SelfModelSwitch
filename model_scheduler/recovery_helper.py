@@ -53,6 +53,9 @@ class RecoveryHelper:
                     if labels.get("io.self-model-switch.deployment") != deployment_id or labels.get("io.self-model-switch.model") != model_id:
                         raise ValueError("container label mismatch")
                     self.runner(["docker", "stop", "--time", "30", name])
+                    after = self.inspector(name)
+                    if after is not None and after.get("State", {}).get("Running") is True:
+                        raise ValueError("container remains running")
                 if self.port_open(self._PORTS[model_id]):
                     raise ValueError("container port remains open")
                 stopped.append(model_id)
