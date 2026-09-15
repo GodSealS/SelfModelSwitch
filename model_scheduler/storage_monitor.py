@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 from time import monotonic
 from typing import Any, Callable, Mapping
@@ -54,18 +55,21 @@ class StorageMonitor:
             entry = entries[0]
             if entry.get("target") != str(self.mount_path) or entry.get("uuid") != self.expected_uuid or entry.get("fstype") != self.filesystem:
                 raise StorageError("mount_identity_mismatch")
+            directory_stat = os.lstat(self.model_directory)
+            if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+                raise StorageError("model_directory_unsafe")
             files: dict[str, ModelFile] = {}
             for model_id, value in models.items():
                 filename, expected_hash = self._model_file(value)
                 candidate = self.model_directory / filename
-                stat = os.lstat(candidate)
+                file_stat = os.lstat(candidate)
                 if not candidate.is_file() or candidate.is_symlink() or not os.access(candidate, os.R_OK):
                     raise StorageError("model_file_unsafe")
                 digest = self._sha256(candidate)
                 after = os.lstat(candidate)
-                if (after.st_ino, after.st_size, after.st_mtime_ns) != (stat.st_ino, stat.st_size, stat.st_mtime_ns):
+                if (after.st_ino, after.st_size, after.st_mtime_ns) != (file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns):
                     raise StorageError("model_file_changed")
-                observed = ModelFile(stat.st_ino, stat.st_size, stat.st_mtime_ns, digest)
+                observed = ModelFile(file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns, digest)
                 if self._baseline is not None and self._baseline.get(model_id) != observed:
                     raise StorageError("model_file_changed")
                 if expected_hash is not None and digest != expected_hash:

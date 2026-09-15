@@ -54,3 +54,12 @@ def test_storage_rejects_expected_hash_mismatch(tmp_path: Path) -> None:
     (models / "embedding.gguf").write_bytes(b"model")
     monitor = StorageMonitor(mount, models, "expected", "ext4", runner=lambda _: findmnt("expected", str(mount)))
     assert monitor.check({"embedding": ("embedding.gguf", "0" * 64)}).ready is False
+
+
+def test_storage_rejects_a_symlinked_model_directory(tmp_path: Path) -> None:
+    mount = tmp_path / "ssd"; mount.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "embedding.gguf").write_bytes(b"model")
+    model_directory = mount / "models"; model_directory.symlink_to(outside, target_is_directory=True)
+    monitor = StorageMonitor(mount, model_directory, "expected", "ext4", runner=lambda _: findmnt("expected", str(mount)))
+    assert monitor.check({"embedding": "embedding.gguf"}).ready is False
