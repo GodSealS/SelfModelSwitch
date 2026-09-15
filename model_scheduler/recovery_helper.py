@@ -11,11 +11,12 @@ from typing import Any, Callable
 class RecoveryHelper:
     _PORTS = {"embedding": 10001, "reranker": 10002, "qwen-small": 10003, "qwen-large": 10004}
 
-    def __init__(self, manifest: str | Path, *, runner: Callable[[list[str]], str] | None = None, inspector: Callable[[str], dict[str, Any] | None] | None = None, port_open: Callable[[int], bool] | None = None):
+    def __init__(self, manifest: str | Path, *, runner: Callable[[list[str]], str] | None = None, inspector: Callable[[str], dict[str, Any] | None] | None = None, port_open: Callable[[int], bool] | None = None, control_stopped: Callable[[], bool] | None = None):
         self.manifest = Path(manifest)
         self.runner = runner or self._run
         self.inspector = inspector or self._inspect
         self.port_open = port_open or self._port_open
+        self.control_stopped = control_stopped or self._control_stopped
 
     @staticmethod
     def _run(argv: list[str]) -> str:
@@ -37,12 +38,34 @@ class RecoveryHelper:
             sock.settimeout(0.5)
             return sock.connect_ex(("127.0.0.1", port)) == 0
 
+    @staticmethod
+    def _control_stopped() -> bool:
+        """Require both unit inactivity and an empty service cgroup."""
+        try:
+            active = subprocess.check_output(
+                ["systemctl", "show", "--property=ActiveState", "--value", "llama-swap.service"],
+                text=True,
+                timeout=10,
+            ).strip()
+            group = subprocess.check_output(
+                ["systemctl", "show", "--property=ControlGroup", "--value", "llama-swap.service"],
+                text=True,
+                timeout=10,
+            ).strip()
+            if active != "inactive" or not group.startswith("/"):
+                return False
+            return not (Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs").read_text(encoding="utf-8").strip()
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     def recover(self) -> dict[str, object]:
         try:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
             deployment_id, models = data["deployment_id"], data["models"]
             if not isinstance(deployment_id, str) or not isinstance(models, dict): raise ValueError("invalid manifest")
             self.runner(["systemctl", "stop", "llama-swap.service"])
+            if not self.control_stopped():
+                raise ValueError("control_plane_still_running")
             stopped = []
             for model_id in sorted(models):
                 name = models[model_id].get("container_name")

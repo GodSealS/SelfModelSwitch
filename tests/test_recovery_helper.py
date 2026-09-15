@@ -15,7 +15,7 @@ def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> Non
     record = {"Config": {"Labels": {"io.self-model-switch.deployment": "thor-local", "io.self-model-switch.model": "embedding"}}, "State": {"Running": True}}
     stopped = {**record, "State": {"Running": False}}
     inspections = iter((record, stopped))
-    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: next(inspections), port_open=lambda _: False)
+    helper = RecoveryHelper(manifest, runner=lambda argv: calls.append(argv) or "", inspector=lambda _: next(inspections), port_open=lambda _: False, control_stopped=lambda: True)
     result = helper.recover()
     assert result["ok"] is True
     assert ["docker", "stop", "--time", "30", "sms-thor-local-embedding"] in calls
@@ -25,14 +25,14 @@ def test_recovery_only_stops_manifest_named_matching_containers(tmp_path) -> Non
 def test_recovery_refuses_same_prefix_container_with_wrong_labels(tmp_path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
-    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: {"Config": {"Labels": {"io.self-model-switch.deployment": "other", "io.self-model-switch.model": "embedding"}}}, port_open=lambda _: False)
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: {"Config": {"Labels": {"io.self-model-switch.deployment": "other", "io.self-model-switch.model": "embedding"}}}, port_open=lambda _: False, control_stopped=lambda: True)
     assert helper.recover()["ok"] is False
 
 
 def test_recovery_refuses_to_claim_stop_while_manifest_port_is_open(tmp_path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
-    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: None, port_open=lambda port: port == 10001)
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: None, port_open=lambda port: port == 10001, control_stopped=lambda: True)
     assert helper.recover()["ok"] is False
 
 
@@ -40,7 +40,7 @@ def test_recovery_rejects_docker_stop_success_when_container_stays_running(tmp_p
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
     record = {"Config": {"Labels": {"io.self-model-switch.deployment": "thor-local", "io.self-model-switch.model": "embedding"}}, "State": {"Running": True}}
-    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: record, port_open=lambda _: False)
+    helper = RecoveryHelper(manifest, runner=lambda _: "", inspector=lambda _: record, port_open=lambda _: False, control_stopped=lambda: True)
     assert helper.recover()["ok"] is False
 
 
@@ -48,3 +48,19 @@ def test_control_recovery_helper_rejects_all_arguments() -> None:
     script = Path(__file__).resolve().parent.parent / "deploy" / "control-recover.py"
     result = subprocess.run([sys.executable, str(script), "unexpected"], capture_output=True, text=True)
     assert result.returncode == 64
+
+
+def test_recovery_refuses_to_clean_containers_until_control_cgroup_is_empty(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"deployment_id": "thor-local", "models": {"embedding": {"container_name": "sms-thor-local-embedding"}}}))
+    calls: list[list[str]] = []
+    helper = RecoveryHelper(
+        manifest,
+        runner=lambda argv: calls.append(argv) or "",
+        inspector=lambda _: None,
+        port_open=lambda _: False,
+        control_stopped=lambda: False,
+    )
+
+    assert helper.recover()["ok"] is False
+    assert calls == [["systemctl", "stop", "llama-swap.service"]]
