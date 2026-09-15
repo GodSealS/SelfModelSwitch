@@ -1,0 +1,20 @@
+[Unit]
+Description=Model lifecycle controller
+Requires=docker.service
+After=docker.service @SSD_MOUNT_UNIT@
+RequiresMountsFor=/mnt/model-ssd
+BindsTo=@SSD_MOUNT_UNIT@
+
+[Service]
+Type=simple
+User=model-scheduler
+Group=model-scheduler
+SupplementaryGroups=docker
+ExecStart=/opt/self-model-switch/current/bin/llama-swap --config /etc/self-model-switch/llama-swap.yaml --listen 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

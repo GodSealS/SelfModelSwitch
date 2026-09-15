@@ -1,0 +1,23 @@
+[Unit]
+Description=AGX Thor model scheduler
+Wants=network-online.target llama-swap.service
+After=network-online.target docker.service llama-swap.service @SSD_MOUNT_UNIT@
+RequiresMountsFor=/mnt/model-ssd
+BindsTo=@SSD_MOUNT_UNIT@
+
+[Service]
+Type=simple
+User=model-scheduler
+Group=model-scheduler
+SupplementaryGroups=docker
+WorkingDirectory=/opt/self-model-switch/current
+Environment=MODEL_SCHEDULER_CONFIG=/etc/self-model-switch/config.yaml
+RuntimeDirectory=model-scheduler
+ExecStart=/opt/self-model-switch/current/.venv/bin/python run.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
