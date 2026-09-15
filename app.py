@@ -38,6 +38,39 @@ class BodyError(ValueError):
         self.status, self.code = status, code
 
 
+class _StreamingLease:
+    def __init__(self, opened, scheduler, lease) -> None:
+        self.opened = opened
+        self.scheduler = scheduler
+        self.lease = lease
+        self.completed = False
+        self._cleaned = False
+
+    async def cleanup(self, outcome: Outcome) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        try:
+            await self.opened.aclose()
+        finally:
+            await self.scheduler.release(self.lease, outcome)
+
+
+class _LeasedStreamingResponse(StreamingResponse):
+    """Keep upstream-response ownership until ASGI has finished sending it."""
+    def __init__(self, content, owner: _StreamingLease, **kwargs) -> None:
+        super().__init__(content, **kwargs)
+        self._owner = owner
+
+    async def __call__(self, scope, receive, send) -> None:
+        outcome = Outcome.ABORTED
+        try:
+            await super().__call__(scope, receive, send)
+            outcome = Outcome.SUCCESS if self._owner.completed else Outcome.ABORTED
+        finally:
+            await asyncio.shield(self._owner.cleanup(outcome))
+
+
 def _config_path(explicit: str | Path | None) -> Path:
     if explicit is not None:
         return Path(explicit)
@@ -357,34 +390,33 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
             opened = await app.state.gateway.open(lease, Capability.CHAT, payload, deadline)
             if body.stream:
+                owner = _StreamingLease(opened, app.state.scheduler, lease)
+
                 async def stream_body():
-                    outcome = Outcome.ABORTED
                     pending = b""
                     event_bytes = 0
-                    try:
-                        async for chunk in opened.iter_bytes():
-                            pending += chunk
-                            lines = pending.splitlines(keepends=True)
-                            pending = b""
-                            if lines and not lines[-1].endswith((b"\n", b"\r")):
-                                pending = lines.pop()
-                            for line in lines:
-                                event_bytes += len(line)
-                                if event_bytes > config.gateway.max_sse_event_bytes:
-                                    return
-                                if line.rstrip(b"\r\n") == b"data: [DONE]":
-                                    outcome = Outcome.SUCCESS
-                                if not line.rstrip(b"\r\n"):
-                                    event_bytes = 0
-                            if len(pending) > config.gateway.max_sse_event_bytes:
+                    async for chunk in opened.iter_bytes():
+                        pending += chunk
+                        lines = pending.splitlines(keepends=True)
+                        pending = b""
+                        if lines and not lines[-1].endswith((b"\n", b"\r")):
+                            pending = lines.pop()
+                        done_in_chunk = False
+                        for line in lines:
+                            event_bytes += len(line)
+                            if event_bytes > config.gateway.max_sse_event_bytes:
                                 return
-                            yield chunk
-                    finally:
-                        try:
-                            await opened.aclose()
-                        finally:
-                            await app.state.scheduler.release(lease, outcome)
-                return StreamingResponse(stream_body(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
+                            if line.rstrip(b"\r\n") == b"data: [DONE]":
+                                done_in_chunk = True
+                            if not line.rstrip(b"\r\n"):
+                                event_bytes = 0
+                        if len(pending) > config.gateway.max_sse_event_bytes:
+                            return
+                        yield chunk
+                        if done_in_chunk:
+                            owner.completed = True
+                            return
+                return _LeasedStreamingResponse(stream_body(), owner, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
             response = await opened.json()
             await close_and_release(opened, lease, Outcome.SUCCESS)
             return JSONResponse(content=response, headers={"X-Request-ID": request_id})
