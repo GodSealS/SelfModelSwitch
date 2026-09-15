@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "acceptance_status": "incomplete_no_llama_cpp_load_fixture",
+  "provenance": {
+    "captured_on": "2026-09-16",
+    "platform": "linux/arm64 Docker",
+    "isolation": "temporary --rm container; no model, SSD, GPU, workspace mount, or existing container",
+    "note": "This is real llama-swap v217 control-plane evidence only. It cannot authorize a production contract because no real llama.cpp successful load was exercised."
+  },
+  "release": {
+    "version": "v217",
+    "asset": "llama-swap_217_linux_arm64.tar.gz",
+    "sha256": "36c58cf69f1422e999acba0b7bff0d47d5b955cb95e8d3875c461d814a74cc29"
+  },
+  "running": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": {
+      "running": []
+    }
+  },
+  "unload": {
+    "status": 200,
+    "content_type": "text/plain",
+    "body_utf8": "OK"
+  },
+  "load_probe": {
+    "path": "/props?model=fixture",
+    "status": 404
+  }
+}
