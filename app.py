@@ -136,8 +136,10 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                                     outcome = Outcome.SUCCESS
                             yield chunk
                     finally:
-                        await opened.aclose()
-                        await app.state.scheduler.release(lease, outcome)
+                        try:
+                            await opened.aclose()
+                        finally:
+                            await app.state.scheduler.release(lease, outcome)
                 return StreamingResponse(stream_body(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
             response = await opened.json()
             await opened.aclose()

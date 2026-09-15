@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app import create_app
 from model_scheduler.contracts import Lease, Outcome
@@ -63,6 +64,14 @@ class TextContainingDoneGateway:
         return TextContainingDone()
 
 
+class BrokenCloseGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class BrokenClose(StreamOpened):
+            async def aclose(self):
+                raise RuntimeError("close failed")
+        return BrokenClose()
+
+
 def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
     scheduler = Scheduler()
     app = create_app(scheduler=scheduler, gateway=Gateway())
@@ -111,3 +120,11 @@ def test_done_text_inside_an_sse_payload_does_not_complete_lease() -> None:
         response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
     assert response.status_code == 200
     assert scheduler.releases == [Outcome.ABORTED]
+
+
+def test_stream_close_failure_still_releases_lease() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=BrokenCloseGateway())) as client:
+        with pytest.raises(RuntimeError, match="close failed"):
+            client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert scheduler.releases == [Outcome.SUCCESS]
