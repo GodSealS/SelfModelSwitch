@@ -68,10 +68,11 @@ class LlamaSwapClient:
             except httpx.HTTPError as e:
                 raise LlamaSwapError(f"load transport error for {model_id}: {e}") from e
 
-            # A llama.cpp upstream may return 200. A non-llama.cpp upstream can
-            # return 404 after llama-swap has already performed the model swap.
-            # We therefore confirm with /running before treating 404 as fatal.
-            if r.status_code >= 500:
+            # Control responses are part of the pinned llama-swap contract.
+            # A failed or redirected request cannot prove that the requested
+            # operation was accepted, even if a stale /running response happens
+            # to list the model.
+            if not 200 <= r.status_code < 300:
                 raise LlamaSwapError(f"load failed for {model_id}: {r.status_code} {r.text[:500]}")
 
         running = await self.running()
@@ -81,13 +82,13 @@ class LlamaSwapClient:
     async def unload(self, model_id: str):
         async with httpx.AsyncClient(timeout=self.load_timeout) as c:
             r = await c.post(f"{self.base_url}/api/models/unload/{model_id}")
-            if r.status_code >= 400:
+            if not 200 <= r.status_code < 300:
                 raise LlamaSwapError(f"unload failed for {model_id}: {r.status_code} {r.text[:500]}")
 
     async def unload_all(self):
         async with httpx.AsyncClient(timeout=self.load_timeout) as c:
             r = await c.post(f"{self.base_url}/api/models/unload")
-            if r.status_code >= 400:
+            if not 200 <= r.status_code < 300:
                 raise LlamaSwapError(f"unload-all failed: {r.status_code} {r.text[:500]}")
 
     async def proxy_json(self, path: str, payload: dict[str, Any], timeout: float | None = None):
