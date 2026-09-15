@@ -26,6 +26,7 @@ class ModelScheduler:
         self.queue_capacity = queue_capacity
         self._condition = asyncio.Condition()
         self._waiters: set[str] = set()
+        self._waiter_models: dict[str, str] = {}
         self._loads: dict[str, asyncio.Task[None]] = {}
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
@@ -39,6 +40,7 @@ class ModelScheduler:
             if len(self._waiters) >= self.queue_capacity:
                 raise QueueFull("queue_full")
             self._waiters.add(request_id)
+            self._waiter_models[request_id] = model_id
         try:
             while True:
                 needs_sample = False
@@ -75,6 +77,7 @@ class ModelScheduler:
         finally:
             async with self._condition:
                 self._waiters.discard(request_id)
+                self._waiter_models.pop(request_id, None)
                 self._condition.notify_all()
 
     async def _finish_load(self, operation, deadline: float) -> None:
@@ -113,13 +116,75 @@ class ModelScheduler:
             if runtime.state.value == "unloaded": return
             if runtime.leases or runtime.operation_id or runtime.state.value != "ready": raise Conflict("model_busy")
             operation = self.book.begin_eviction([model_id], automatic=False)[0]
-        observation = await self.backend.stop(operation, deadline)
+        try:
+            observation = await self.backend.stop(operation, deadline)
+        except asyncio.CancelledError:
+            async with self._condition:
+                try:
+                    self.book.failed(operation, "stop_unverified")
+                except StaleOperation:
+                    pass
+                self._condition.notify_all()
+            raise
+        except Exception:
+            async with self._condition:
+                try:
+                    self.book.failed(operation, "stop_unverified")
+                except StaleOperation:
+                    pass
+                self._condition.notify_all()
+            raise
         async with self._condition:
             if observation.presence is Presence.STOPPED:
                 self.book.stopped(operation)
             else:
                 self.book.failed(operation, observation.detail_code or "stop_unverified")
             self._condition.notify_all()
+
+    async def sweep_ttl(self, deadline: float) -> tuple[str, ...]:
+        """Stop due idle models, without allowing TTL to outrun queued demand."""
+        now = monotonic()
+        async with self._condition:
+            waiting_models = set(self._waiter_models.values())
+            model_ids = [
+                model_id for model_id in self.book.specs
+                if model_id not in waiting_models and self.book.ttl_due(model_id, now)
+            ]
+            if not model_ids:
+                return ()
+            operations = self.book.begin_eviction(model_ids)
+            self._condition.notify_all()
+
+        stopped: list[str] = []
+        for index, operation in enumerate(operations):
+            try:
+                observation = await self.backend.stop(operation, deadline)
+            except asyncio.CancelledError:
+                async with self._condition:
+                    self.book.failed(operation, "stop_unverified")
+                    self._rollback_pending(operations[index + 1:])
+                    self._condition.notify_all()
+                raise
+            except Exception:
+                observation = None
+            async with self._condition:
+                if observation is not None and observation.presence is Presence.STOPPED:
+                    self.book.stopped(operation)
+                    stopped.append(operation.model_id)
+                else:
+                    self.book.failed(operation, observation.detail_code if observation else "stop_unverified")
+                    self._rollback_pending(operations[index + 1:])
+                    self._condition.notify_all()
+                    return tuple(stopped)
+                self._condition.notify_all()
+        return tuple(stopped)
+
+    def _rollback_pending(self, operations) -> None:
+        for operation in operations:
+            try:
+                self.book.rollback_unsent(operation)
+            except StaleOperation:
+                pass
 
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()

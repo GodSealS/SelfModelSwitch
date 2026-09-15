@@ -83,3 +83,15 @@ def test_stale_load_operation_cannot_overwrite_new_generation() -> None:
     with pytest.raises(StaleOperation):
         book.loaded(old, 901)
     assert book.committed == 100
+
+
+def test_ttl_begins_only_after_last_lease_releases() -> None:
+    specs = {"a": ModelSpec("a", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=2, ttl_seconds=10)}
+    book = Book(specs, model_budget=300, free_floor=20, margin=0); book.bootstrap_stopped("a")
+    load(book, "a", 0)
+    first, second = book.acquire_ready("a", "first", 1), book.acquire_ready("a", "second", 2)
+    book.release(first, Outcome.SUCCESS, 5)
+    assert not book.ttl_due("a", 100)
+    book.release(second, Outcome.SUCCESS, 100)
+    assert not book.ttl_due("a", 109.9)
+    assert book.ttl_due("a", 110)

@@ -173,6 +173,12 @@ class Book:
         runtime.state, runtime.operation_id, runtime.reservation = State.UNLOADED, None, 0
         runtime.admission_blocked, runtime.idle_since, runtime.last_error = False, None, None
 
+    def ttl_due(self, model_id: str, now: float) -> bool:
+        runtime, spec = self.runtime[model_id], self.specs[model_id]
+        return (runtime.state is State.READY and not runtime.leases and not runtime.admission_blocked
+                and not spec.pinned and spec.evictable and spec.ttl_seconds > 0
+                and runtime.idle_since is not None and now - runtime.idle_since >= spec.ttl_seconds)
+
     def begin_recovery(self) -> int:
         if self.recovering:
             return self.epoch

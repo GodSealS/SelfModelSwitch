@@ -74,3 +74,34 @@ async def test_unload_requires_backend_stop_evidence() -> None:
     await scheduler.release(lease, Outcome.SUCCESS)
     await scheduler.unload("chat", asyncio.get_running_loop().time() + 1)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_ttl_sweep_stops_only_idle_models_without_waiters() -> None:
+    backend = Backend(); backend.finish.set()
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, ttl_seconds=0.001)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    await asyncio.sleep(0.002)
+    assert await scheduler.sweep_ttl(asyncio.get_running_loop().time() + 1) == ("chat",)
+    assert registry.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_ttl_sweep_does_not_stop_a_model_with_a_waiter() -> None:
+    backend = Backend(); backend.finish.set()
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, ttl_seconds=0.001)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    lease = await scheduler.acquire("chat", "initial", asyncio.get_running_loop().time() + 1)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    await asyncio.sleep(0.002)
+    async with scheduler._condition:
+        scheduler._waiters.add("waiting")
+        scheduler._waiter_models["waiting"] = "chat"
+    assert await scheduler.sweep_ttl(asyncio.get_running_loop().time() + 1) == ()
+    assert registry.runtime["chat"].state.value == "ready"
