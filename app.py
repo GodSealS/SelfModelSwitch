@@ -99,6 +99,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "shutdown", None)):
+            with suppress(Exception):
+                await app.state.scheduler.shutdown(monotonic() + config.server.shutdown_grace_seconds)
 
     app = FastAPI(title="AGX Thor Model Scheduler", version="1.0", lifespan=lifespan)
     app.state.config = config

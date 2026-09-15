@@ -160,6 +160,21 @@ class Book:
             result.append(Operation(runtime.operation_id, model_id, runtime.generation, self.epoch))
         return result
 
+    def begin_cleanup(self, model_ids: list[str]) -> list[Operation]:
+        """Stop idle READY or ERROR models during recovery or process shutdown."""
+        if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):
+            raise Conflict("invalid cleanup batch")
+        for model_id in model_ids:
+            runtime = self.runtime[model_id]
+            if runtime.state not in {State.READY, State.ERROR} or runtime.leases or runtime.operation_id:
+                raise Conflict("cleanup candidate changed")
+        operations: list[Operation] = []
+        for model_id in model_ids:
+            runtime = self.runtime[model_id]
+            runtime.state, runtime.admission_blocked, runtime.operation_id = State.EVICTING, True, uuid4().hex
+            operations.append(Operation(runtime.operation_id, model_id, runtime.generation, self.epoch))
+        return operations
+
     def rollback_unsent(self, operation: Operation) -> None:
         runtime = self._operation(operation)
         if runtime.state is not State.EVICTING or runtime.leases:

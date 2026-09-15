@@ -62,3 +62,13 @@ def test_framework_not_found_errors_use_the_standard_request_id_shape() -> None:
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
     assert response.json()["request_id"] == response.headers["x-request-id"]
+
+
+def test_lifespan_invokes_injected_scheduler_shutdown() -> None:
+    class ShutdownScheduler:
+        called = False
+        async def shutdown(self, deadline): self.called = True; return ()
+    scheduler = ShutdownScheduler()
+    with TestClient(create_app(scheduler=scheduler)):
+        pass
+    assert scheduler.called is True

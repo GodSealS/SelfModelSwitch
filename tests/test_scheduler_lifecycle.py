@@ -209,3 +209,16 @@ async def test_preload_residency_does_not_create_a_user_lease_or_heat() -> None:
     runtime = registry.runtime["chat"]
     assert runtime.state.value == "ready"
     assert runtime.total_requests == 0 and not runtime.leases and registry.heat("chat", 1) == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_admission_aborts_remaining_leases_and_stops_models() -> None:
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    lease = await scheduler.acquire("chat", "active", asyncio.get_running_loop().time() + 1)
+    stopped = await scheduler.shutdown(asyncio.get_running_loop().time())
+    assert stopped == ("chat",)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
+    with pytest.raises(ModelUnavailable, match="shutting_down"):
+        await scheduler.acquire("chat", "new", asyncio.get_running_loop().time() + 1)
+    assert scheduler.book.release(lease, Outcome.SUCCESS, asyncio.get_running_loop().time()) is False

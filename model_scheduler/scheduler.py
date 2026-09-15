@@ -32,6 +32,7 @@ class ModelScheduler:
         self._queue = RequestQueue(capacity=queue_capacity, aging_seconds=priority_aging_seconds)
         self._loads: dict[str, asyncio.Task[None]] = {}
         self._eviction: asyncio.Task[tuple[str, ...]] | None = None
+        self._shutting_down = False
 
     async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
         if model_id not in self.book.specs:
@@ -39,6 +40,8 @@ class ModelScheduler:
         if deadline <= monotonic():
             raise TimeoutError("queue deadline elapsed")
         async with self._condition:
+            if self._shutting_down:
+                raise ModelUnavailable("service_shutting_down")
             try:
                 self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, monotonic())
             except ValueError as exc:
@@ -50,6 +53,8 @@ class ModelScheduler:
                 needs_sample = False
                 async with self._condition:
                     now = monotonic()
+                    if self._shutting_down:
+                        raise ModelUnavailable("service_shutting_down")
                     if now >= deadline or not self._queue.contains(request_id):
                         self._queue.remove(request_id, WaitState.EXPIRED)
                         raise TimeoutError("queue deadline elapsed")
@@ -224,6 +229,32 @@ class ModelScheduler:
                 raise ModelUnavailable(result.error_code or "control_recovery_failed")
             self.book.finish_recovery(epoch, frozenset(result.stopped_models))
             self._condition.notify_all()
+
+    async def shutdown(self, deadline: float) -> tuple[str, ...]:
+        """Close admission, drain leases to deadline, then stop managed models."""
+        async with self._condition:
+            self._shutting_down = True
+            self._queue.clear()
+            self._condition.notify_all()
+            while any(runtime.leases for runtime in self.book.runtime.values()) and monotonic() < deadline:
+                try:
+                    await asyncio.wait_for(self._condition.wait(), deadline - monotonic())
+                except asyncio.TimeoutError:
+                    break
+            for runtime in self.book.runtime.values():
+                for lease in tuple(runtime.leases.values()):
+                    self.book.release(lease, Outcome.ABORTED, monotonic())
+            if self._eviction is not None:
+                task = self._eviction
+            else:
+                targets = [model_id for model_id, runtime in self.book.runtime.items() if runtime.state.value in {"ready", "error"} and not runtime.leases]
+                if not targets:
+                    return ()
+                operations = self.book.begin_cleanup(targets)
+                task = asyncio.create_task(self._run_eviction(operations, deadline))
+                self._eviction = task
+            self._condition.notify_all()
+        return await task
 
     async def unload(self, model_id: str, deadline: float) -> None:
         async with self._condition:
