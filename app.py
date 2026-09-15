@@ -52,6 +52,12 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     app.state.gateway = gateway
     app.state.health_checks = health_checks
 
+    async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
+        try:
+            await opened.aclose()
+        finally:
+            await app.state.scheduler.release(lease, outcome, tokens)
+
     @app.get("/live")
     async def live() -> dict[str, bool]:
         return {"ok": True}
@@ -142,8 +148,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                             await app.state.scheduler.release(lease, outcome)
                 return StreamingResponse(stream_body(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
             response = await opened.json()
-            await opened.aclose()
-            await app.state.scheduler.release(lease, Outcome.SUCCESS)
+            await close_and_release(opened, lease, Outcome.SUCCESS)
             return JSONResponse(content=response, headers={"X-Request-ID": request_id})
         except GatewayError as exc:
             if lease is not None:
@@ -190,14 +195,14 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         lease, opened, result = context
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list) or len(data) != len(inputs) or {item.get("index") for item in data if isinstance(item, dict)} != set(range(len(inputs))):
-            await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+            await close_and_release(opened, lease, Outcome.ABORTED)
             return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
         for item in data:
             vector = item.get("embedding")
             if not isinstance(vector, list) or not vector or any(type(x) not in (int, float) or not math.isfinite(x) for x in vector):
-                await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+                await close_and_release(opened, lease, Outcome.ABORTED)
                 return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
-        await opened.aclose(); await app.state.scheduler.release(lease, Outcome.SUCCESS)
+        await close_and_release(opened, lease, Outcome.SUCCESS)
         return JSONResponse(content={"object": "list", "data": sorted(data, key=lambda item: item["index"]), "model": body.model}, headers={"X-Request-ID": request_id})
 
     @app.post("/v1/rerank")
@@ -216,11 +221,11 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         lease, opened, result = context
         items = result.get("results") if isinstance(result, dict) else None
         if not isinstance(items, list) or {item.get("index") for item in items if isinstance(item, dict)} != set(range(len(body.documents))) or any(type(item.get("relevance_score")) not in (int, float) or not math.isfinite(item["relevance_score"]) for item in items):
-            await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+            await close_and_release(opened, lease, Outcome.ABORTED)
             return _error(502, "upstream_protocol_error", "Invalid rerank response", request_id)
         ordered = sorted(items, key=lambda item: (-item["relevance_score"], item["index"]))[:count]
         public = [{"index": item["index"], "relevance_score": item["relevance_score"], **({"document": {"text": body.documents[item["index"]]}} if body.return_documents else {})} for item in ordered]
-        await opened.aclose(); await app.state.scheduler.release(lease, Outcome.SUCCESS)
+        await close_and_release(opened, lease, Outcome.SUCCESS)
         return JSONResponse(content={"model": body.model, "results": public}, headers={"X-Request-ID": request_id})
 
     return app
