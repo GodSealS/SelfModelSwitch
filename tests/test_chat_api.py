@@ -31,6 +31,8 @@ class Opened:
 
 
 class StreamOpened(Opened):
+    headers = {"content-type": "text/event-stream"}
+
     def iter_bytes(self):
         async def iterator():
             yield b"data: first\n\n"
@@ -71,6 +73,21 @@ class BrokenCloseGateway:
             async def aclose(self):
                 raise RuntimeError("close failed")
         return BrokenClose()
+
+
+class InvalidChatSuccessGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class Invalid(Opened):
+            async def json(self):
+                return {"model": "qwen-small", "choices": "not-a-list"}
+        return Invalid()
+
+
+class InvalidSSEGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class Invalid(StreamOpened):
+            headers = {"content-type": "application/json"}
+        return Invalid()
 
 
 class OversizedEventGateway:
@@ -115,6 +132,20 @@ def test_chat_rejects_capability_before_acquiring_lease() -> None:
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "unsupported_capability"
     assert scheduler.releases == []
+
+
+def test_chat_rejects_invalid_upstream_success_shapes_before_returning_them() -> None:
+    non_stream_scheduler = Scheduler()
+    stream_scheduler = Scheduler()
+    with TestClient(create_app(scheduler=non_stream_scheduler, gateway=InvalidChatSuccessGateway())) as client:
+        non_stream = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+    with TestClient(create_app(scheduler=stream_scheduler, gateway=InvalidSSEGateway())) as client:
+        stream = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert non_stream.status_code == 502
+    assert stream.status_code == 502
+    assert non_stream.json()["error"]["code"] == stream.json()["error"]["code"] == "upstream_protocol_error"
+    assert non_stream_scheduler.releases == [Outcome.ABORTED]
+    assert stream_scheduler.releases == [Outcome.ABORTED]
 
 
 def test_stream_response_owns_lease_until_done_event() -> None:

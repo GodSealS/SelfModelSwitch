@@ -106,6 +106,21 @@ def _openapi_json_body(model: type[BaseModel]) -> dict[str, object]:
     }
 
 
+def _media_type(headers) -> str:
+    value = headers.get("content-type", "") if hasattr(headers, "get") else ""
+    return value.split(";", 1)[0].strip().lower() if isinstance(value, str) else ""
+
+
+def _valid_chat_response(response: object) -> bool:
+    if not isinstance(response, dict) or not isinstance(response.get("model"), str) or not isinstance(response.get("choices"), list):
+        return False
+    usage = response.get("usage")
+    return usage is None or (
+        isinstance(usage, dict)
+        and all(type(usage[key]) is int and usage[key] >= 0 for key in ("prompt_tokens", "completion_tokens", "total_tokens") if key in usage)
+    )
+
+
 async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float) -> dict[str, object]:
     content_type = request.headers.get("content-type", "")
     if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -390,6 +405,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
             opened = await app.state.gateway.open(lease, Capability.CHAT, payload, deadline)
             if body.stream:
+                if opened.status_code != 200 or _media_type(opened.headers) != "text/event-stream":
+                    await close_and_release(opened, lease, Outcome.ABORTED)
+                    return _error(502, "upstream_protocol_error", "Invalid chat streaming response", request_id)
                 owner = _StreamingLease(opened, app.state.scheduler, lease)
 
                 async def stream_body():
@@ -418,6 +436,9 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                             return
                 return _LeasedStreamingResponse(stream_body(), owner, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": request_id})
             response = await opened.json()
+            if _media_type(opened.headers) != "application/json" or not _valid_chat_response(response):
+                await close_and_release(opened, lease, Outcome.ABORTED)
+                return _error(502, "upstream_protocol_error", "Invalid chat response", request_id)
             await close_and_release(opened, lease, Outcome.SUCCESS)
             return JSONResponse(content=response, headers={"X-Request-ID": request_id})
         except asyncio.CancelledError:
