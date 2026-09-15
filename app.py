@@ -127,6 +127,8 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
                 result = await result
             if isinstance(result, dict) and set(result) == required and all(type(value) is bool for value in result.values()):
                 checks = result
+        if app.state.preload_error is not None:
+            checks["preload"] = False
         ready = all(checks.values()) and not app.state.shutting_down
         return JSONResponse(status_code=200 if ready else 503, content={"ok": ready, "checks": checks, "reason": None if ready else "dependencies_unready"})
 

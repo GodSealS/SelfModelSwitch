@@ -44,3 +44,13 @@ def test_lifespan_starts_injected_preload_without_blocking_live_endpoint() -> No
     with TestClient(create_app(scheduler=scheduler)) as client:
         assert client.get("/live").status_code == 200
         assert scheduler.called is True
+
+
+def test_preload_failure_keeps_health_unready() -> None:
+    class BrokenPreloadScheduler:
+        async def preload(self, deadline): raise RuntimeError("pinned preload failed")
+    checks = lambda: {"llama_swap": True, "storage": True, "resources": True, "preload": True, "control": True}
+    with TestClient(create_app(scheduler=BrokenPreloadScheduler(), health_checks=checks)) as client:
+        response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["checks"]["preload"] is False
