@@ -21,6 +21,8 @@ rendered manifest.
 6. Run `systemd-analyze verify` on generated unit files, then daemon-reload and
    start llama-swap followed by model-scheduler. `/live` may be 200 while
    `/health` remains 503 during recovery; do not treat that as ready.
+   Each model start revalidates the configured SSD and all model hashes before
+   Docker is invoked; never bypass this with a manual container command.
 7. Run the hardware acceptance suite and retain its prompt-free report. Only
    all A01–A20 marked `passed` permits a production-ready declaration.
 

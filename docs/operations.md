@@ -39,6 +39,11 @@ The second request is expected to fail until storage, control-plane recovery,
 and pinned preload have completed. Inspect `journalctl -u model-scheduler -u
 llama-swap` rather than declaring readiness from process existence.
 
+Every llama-swap model start invokes the manifest-only runner, which rechecks
+the configured SSD mount identity and all declared model file hashes before it
+executes Docker. A failed check must remain a failed start; do not bypass it by
+running `docker run` manually.
+
 ## SSD loss and recovery
 
 When the SSD mount disappears, scheduler admission must fail before models are
