@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app import create_app
+from model_scheduler.scheduler import ModelUnavailable
 
 
 class Scheduler:
@@ -24,3 +25,12 @@ def test_health_reflects_actual_injected_dependency_checks() -> None:
         unhealthy = client.get("/health")
     assert healthy.status_code == 200 and healthy.json()["ok"] is True
     assert unhealthy.status_code == 503 and unhealthy.json()["checks"]["storage"] is False
+
+
+def test_manual_unload_does_not_return_success_without_stop_evidence() -> None:
+    class UnverifiedScheduler:
+        async def unload(self, model_id, deadline): raise ModelUnavailable("stop_unverified")
+    with TestClient(create_app(scheduler=UnverifiedScheduler())) as client:
+        response = client.post("/api/models/qwen-small/unload")
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "stop_unverified"

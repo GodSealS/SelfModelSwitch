@@ -21,6 +21,7 @@ from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequ
 from model_scheduler.config import ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.model_registry import Conflict
+from model_scheduler.scheduler import ModelUnavailable
 
 
 def _config_path(explicit: str | Path | None) -> Path:
@@ -105,6 +106,8 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         except Conflict as exc:
             code = str(exc)
             return _error(409, code if code in {"model_pinned", "model_busy"} else "model_busy", "Model cannot be unloaded", request_id)
+        except ModelUnavailable:
+            return _error(502, "stop_unverified", "Model stop could not be verified", request_id)
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request):

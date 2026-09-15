@@ -186,31 +186,14 @@ class ModelScheduler:
             spec, runtime = self.book.specs[model_id], self.book.runtime[model_id]
             if spec.pinned: raise Conflict("model_pinned")
             if runtime.state.value == "unloaded": return
-            if runtime.leases or runtime.operation_id or runtime.state.value != "ready": raise Conflict("model_busy")
+            if self._eviction is not None or runtime.leases or runtime.operation_id or runtime.state.value != "ready": raise Conflict("model_busy")
             operation = self.book.begin_eviction([model_id], automatic=False)[0]
-        try:
-            observation = await self.backend.stop(operation, deadline)
-        except asyncio.CancelledError:
-            async with self._condition:
-                try:
-                    self.book.failed(operation, "stop_unverified")
-                except StaleOperation:
-                    pass
-                self._condition.notify_all()
-            raise
-        except Exception:
-            async with self._condition:
-                try:
-                    self.book.failed(operation, "stop_unverified")
-                except StaleOperation:
-                    pass
-                self._condition.notify_all()
-            raise
-        async with self._condition:
-            if observation.presence is Presence.STOPPED:
-                self.book.stopped(operation)
-            else:
-                self.book.failed(operation, observation.detail_code or "stop_unverified")
+            task = asyncio.create_task(self._run_eviction([operation], deadline))
+            self._eviction = task
+            self._condition.notify_all()
+        stopped = await task
+        if model_id not in stopped:
+            raise ModelUnavailable("stop_unverified")
             self._condition.notify_all()
 
     async def sweep_ttl(self, deadline: float) -> tuple[str, ...]:

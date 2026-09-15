@@ -6,7 +6,7 @@ import pytest
 
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult
 from model_scheduler.model_registry import Book
-from model_scheduler.scheduler import ModelScheduler, QueueFull
+from model_scheduler.scheduler import ModelScheduler, ModelUnavailable, QueueFull
 
 
 class Resources:
@@ -128,6 +128,19 @@ async def test_unload_requires_backend_stop_evidence() -> None:
     await scheduler.release(lease, Outcome.SUCCESS)
     await scheduler.unload("chat", asyncio.get_running_loop().time() + 1)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_manual_unload_fails_when_stop_is_not_confirmed() -> None:
+    class UnverifiedBackend(Backend):
+        async def stop(self, operation, deadline): return Observation(Presence.UNKNOWN, None, False, 0, "still_running")
+    backend = UnverifiedBackend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    lease = await scheduler.acquire("chat", "request", asyncio.get_running_loop().time() + 1)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    with pytest.raises(ModelUnavailable, match="stop_unverified"):
+        await scheduler.unload("chat", asyncio.get_running_loop().time() + 1)
+    assert scheduler.book.runtime["chat"].state.value == "error"
 
 
 @pytest.mark.asyncio
