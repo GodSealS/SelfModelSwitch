@@ -82,12 +82,7 @@ class LlamaSwapClient:
             return r.json()
 
     async def load(self, model_id: str):
-        """
-        Activate a model without generating tokens.
-
-        /props is a llama.cpp endpoint. If you later add a non-llama.cpp backend,
-        add a backend-specific warmup method here.
-        """
+        """Activate a model through the fixture-derived control request."""
         contract = self._contract()
         url = f"{self.base_url}{contract.load_path}"
         async with httpx.AsyncClient(timeout=self.load_timeout) as c:
