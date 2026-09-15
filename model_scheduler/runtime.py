@@ -7,6 +7,7 @@ from .config import AppConfig, model_specs
 from .model_registry import Book
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
+from .storage_monitor import StorageAdmissionGuard, StorageMonitor
 
 
 def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = None, storage_guard: Any | None = None, recovery: Any | None = None) -> ModelScheduler:
@@ -28,6 +29,15 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
     )
     for model_id in book.specs:
         book.bootstrap_stopped(model_id)
+    guard = storage_guard or StorageAdmissionGuard(
+        StorageMonitor(
+            config.storage.mount_path,
+            config.storage.model_directory,
+            config.storage.expected_uuid,
+            config.storage.filesystem,
+        ),
+        config.models,
+    )
     return ModelScheduler(
         book,
         resource_port,
@@ -42,5 +52,5 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         max_switches_in_window=config.scheduler.thrash.max_switches_in_window,
         cooldown_seconds=config.scheduler.thrash.cooldown_seconds,
         recovery=recovery,
-        admission_guard=storage_guard,
+        admission_guard=guard,
     )

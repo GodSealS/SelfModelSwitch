@@ -92,6 +92,20 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         app.state.shutting_down = False
         app.state.preload_error = None
         app.state.preload_task = None
+        app.state.storage_watch_task = None
+        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "monitor_storage_once", None)):
+            async def watch_storage() -> None:
+                while not app.state.shutting_down:
+                    try:
+                        await app.state.scheduler.monitor_storage_once(monotonic() + config.llama_swap.unload_timeout_seconds)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # The scheduler is fail-closed; a monitor fault must not
+                        # take down /live or spin a retry loop.
+                        pass
+                    await asyncio.sleep(config.resources.sample_interval_seconds)
+            app.state.storage_watch_task = asyncio.create_task(watch_storage())
         if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "preload", None)):
             task = asyncio.create_task(app.state.scheduler.preload(monotonic() + config.llama_swap.load_timeout_seconds))
             app.state.preload_task = task
@@ -104,6 +118,11 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             task.add_done_callback(record_preload)
         yield
         app.state.shutting_down = True
+        storage_task = app.state.storage_watch_task
+        if storage_task is not None:
+            storage_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await storage_task
         task = app.state.preload_task
         if task is not None and not task.done():
             task.cancel()

@@ -388,6 +388,59 @@ async def test_shutdown_rejects_admission_aborts_remaining_leases_and_stops_mode
 
 
 @pytest.mark.asyncio
+async def test_storage_loss_rejects_requests_aborts_leases_and_stops_models() -> None:
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    lease = await scheduler.acquire("chat", "active", asyncio.get_running_loop().time() + 1)
+
+    assert await scheduler.storage_lost(asyncio.get_running_loop().time() + 1) == ("chat",)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
+    assert scheduler.book.release(lease, Outcome.SUCCESS, asyncio.get_running_loop().time()) is False
+    with pytest.raises(ModelUnavailable, match="storage_unavailable"):
+        await scheduler.acquire("chat", "new", asyncio.get_running_loop().time() + 1)
+
+
+@pytest.mark.asyncio
+async def test_storage_loss_keeps_error_and_budget_when_stop_is_unverified() -> None:
+    class UnverifiedStopBackend(Backend):
+        async def stop(self, operation, deadline):
+            return Observation(Presence.UNKNOWN, None, False, 0, "still_running")
+
+    backend = UnverifiedStopBackend(); backend.finish.set()
+    scheduler = ModelScheduler(book(), Resources(), backend)
+    lease = await scheduler.acquire("chat", "active", asyncio.get_running_loop().time() + 1)
+
+    assert await scheduler.storage_lost(asyncio.get_running_loop().time() + 1) == ()
+    assert scheduler.book.runtime["chat"].state.value == "error"
+    assert scheduler.book.committed == scheduler.book.required("chat")
+    assert scheduler.book.release(lease, Outcome.SUCCESS, asyncio.get_running_loop().time()) is False
+
+
+@pytest.mark.asyncio
+async def test_storage_monitor_transition_runs_the_storage_loss_sequence() -> None:
+    registry = book()
+    operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)
+    registry.loaded(operation, 0)
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, admission_guard=lambda: False)
+
+    assert await scheduler.monitor_storage_once(asyncio.get_running_loop().time() + 1) is False
+    assert registry.runtime["chat"].state.value == "unloaded"
+
+
+@pytest.mark.asyncio
+async def test_preload_fails_immediately_after_storage_loss() -> None:
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, preload=True)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = ModelScheduler(registry, Resources(), Backend())
+    await scheduler.storage_lost(asyncio.get_running_loop().time() + 1)
+
+    with pytest.raises(ModelUnavailable, match="storage_unavailable"):
+        await scheduler.preload(asyncio.get_running_loop().time() + 1)
+
+
+@pytest.mark.asyncio
 async def test_ready_admission_waits_for_fresh_free_memory_sample() -> None:
     registry = book()
     operation = registry.begin_load("chat", MemorySample(10_000, 9_000, 0), 0)

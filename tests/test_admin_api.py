@@ -72,3 +72,23 @@ def test_lifespan_invokes_injected_scheduler_shutdown() -> None:
     with TestClient(create_app(scheduler=scheduler)):
         pass
     assert scheduler.called is True
+
+
+def test_lifespan_starts_and_cancels_storage_monitoring() -> None:
+    class StorageScheduler:
+        calls = 0
+        stopped = False
+
+        async def monitor_storage_once(self, deadline):
+            self.calls += 1
+            return True
+
+        async def shutdown(self, deadline):
+            self.stopped = True
+            return ()
+
+    scheduler = StorageScheduler()
+    with TestClient(create_app(scheduler=scheduler)) as client:
+        assert client.get("/live").status_code == 200
+    assert scheduler.calls >= 1
+    assert scheduler.stopped is True

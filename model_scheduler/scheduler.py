@@ -48,6 +48,7 @@ class ModelScheduler:
         self._loads: dict[str, asyncio.Task[None]] = {}
         self._eviction: asyncio.Task[tuple[str, ...]] | None = None
         self._shutting_down = False
+        self._storage_unavailable = False
         self._switch_drain_timeout_seconds = switch_drain_timeout_seconds
         self._switch_retry_seconds = switch_retry_seconds
         self._switch_intent: SwitchIntent | None = None
@@ -67,6 +68,8 @@ class ModelScheduler:
         async with self._condition:
             if self._shutting_down:
                 raise ModelUnavailable("service_shutting_down")
+            if self._storage_unavailable:
+                raise ModelUnavailable("storage_unavailable")
             try:
                 self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, monotonic())
             except ValueError as exc:
@@ -84,6 +87,8 @@ class ModelScheduler:
                     self._expire_switch_intent(now)
                     if self._shutting_down:
                         raise ModelUnavailable("service_shutting_down")
+                    if self._storage_unavailable:
+                        raise ModelUnavailable("storage_unavailable")
                     if now >= deadline or not self._queue.contains(request_id):
                         self._queue.remove(request_id, WaitState.EXPIRED)
                         raise TimeoutError("queue deadline elapsed")
@@ -269,6 +274,13 @@ class ModelScheduler:
         except Exception:
             return False
 
+    async def monitor_storage_once(self, deadline: float) -> bool:
+        """Poll the injected storage guard and execute one fail-closed transition."""
+        if await self._admission_allowed():
+            return not self._storage_unavailable
+        await self.storage_lost(deadline)
+        return False
+
     def _load_deficit(self, model_id: str, sample: MemorySample) -> int:
         required = self.book.required(model_id)
         return max(0, self.book.free_floor + required - sample.available_bytes,
@@ -325,6 +337,8 @@ class ModelScheduler:
         while True:
             needs_sample = False
             async with self._condition:
+                if self._storage_unavailable:
+                    raise ModelUnavailable("storage_unavailable")
                 runtime = self.book.runtime[model_id]
                 if runtime.state.value == "ready":
                     return
@@ -334,11 +348,12 @@ class ModelScheduler:
             if needs_sample:
                 snapshot = await self.resources.snapshot()
                 sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
+                admitted = await self._admission_allowed()
                 started_operation = False
                 async with self._condition:
                     runtime = self.book.runtime[model_id]
                     now = monotonic()
-                    if runtime.state.value == "unloaded" and not self._loads and self._eviction is None:
+                    if admitted and runtime.state.value == "unloaded" and not self._loads and self._eviction is None:
                         if self.book.can_load(model_id, sample, now):
                             operation = self.book.begin_load(model_id, sample, now)
                             self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
@@ -400,6 +415,37 @@ class ModelScheduler:
             else:
                 targets = [model_id for model_id, runtime in self.book.runtime.items() if runtime.state.value in {"ready", "error"} and not runtime.leases]
                 if not targets:
+                    return ()
+                operations = self.book.begin_cleanup(targets)
+                task = asyncio.create_task(self._run_eviction(operations, deadline))
+                self._eviction = task
+            self._condition.notify_all()
+        return await task
+
+    async def storage_lost(self, deadline: float) -> tuple[str, ...]:
+        """Fail closed on a verified SSD fault, then stop every managed model.
+
+        This is intentionally distinct from normal shutdown: the scheduler
+        remains live for diagnostics but rejects all inference until an
+        explicit recovery/restart validates storage again.
+        """
+        async with self._condition:
+            if self._storage_unavailable:
+                return ()
+            self._storage_unavailable = True
+            self._queue.clear()
+            for runtime in self.book.runtime.values():
+                for lease in tuple(runtime.leases.values()):
+                    self.book.release(lease, Outcome.ABORTED, monotonic())
+            if self._eviction is not None:
+                task = self._eviction
+            else:
+                targets = [
+                    model_id for model_id, runtime in self.book.runtime.items()
+                    if runtime.state.value in {"ready", "error"} and not runtime.leases
+                ]
+                if not targets:
+                    self._condition.notify_all()
                     return ()
                 operations = self.book.begin_cleanup(targets)
                 task = asyncio.create_task(self._run_eviction(operations, deadline))
