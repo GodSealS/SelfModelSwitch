@@ -62,6 +62,18 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     async def list_models() -> dict[str, object]:
         return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "self-model-switch"} for model_id in sorted(config.models)]}
 
+    @app.get("/api/status")
+    async def status():
+        if app.state.scheduler is None:
+            return {"ready": False, "resources": None, "queue_size": 0, "models": {}}
+        return await app.state.scheduler.status()
+
+    @app.get("/api/models")
+    async def models():
+        if app.state.scheduler is None:
+            return {model_id: {"state": "unknown", "in_flight": 0} for model_id in sorted(config.models)}
+        return (await app.state.scheduler.status())["models"]
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         request_id = str(uuid4())
