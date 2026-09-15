@@ -62,7 +62,8 @@ class RecoveryHelper:
         try:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
             deployment_id, models = data["deployment_id"], data["models"]
-            if not isinstance(deployment_id, str) or not isinstance(models, dict): raise ValueError("invalid manifest")
+            if not isinstance(deployment_id, str) or not isinstance(models, dict) or set(models) != set(self._PORTS):
+                raise ValueError("invalid manifest")
             self.runner(["systemctl", "stop", "llama-swap.service"])
             if not self.control_stopped():
                 raise ValueError("control_plane_still_running")
