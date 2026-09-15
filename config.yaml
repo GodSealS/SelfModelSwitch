@@ -1,71 +1,85 @@
+# Lab-only schema-v1 example. Deploy tooling replaces these non-production hashes
+# with the verified manifest values before a Thor deployment is allowed.
+schema_version: 1
 server:
   host: 127.0.0.1
   port: 8090
-
+  workers: 1
+  max_request_body_bytes: 4194304
+  body_timeout_seconds: 10
+  shutdown_grace_seconds: 30
 llama_swap:
   base_url: http://127.0.0.1:8080
-  timeout_seconds: 30
+  connect_timeout_seconds: 5
+  control_timeout_seconds: 30
   load_timeout_seconds: 900
-
+  unload_timeout_seconds: 45
 scheduler:
   poll_interval_seconds: 2
-  resource_safety_margin: 0.15
-  min_free_memory_bytes: 2147483648   # 2 GiB hard floor
-  max_evictions_per_request: 8
   request_queue_timeout_seconds: 1800
-  heat:
-    half_life_seconds: 1800
-    request_weight: 1.0
-    token_weight: 0.0001
-    active_bonus: 2.0
-  thrash:
-    switch_window_seconds: 10
-    max_switches_in_window: 3
-    cooldown_seconds: 15
-
+  queue_capacity: 128
+  priority_aging_seconds: 30
+  switch_drain_timeout_seconds: 30
+  switch_retry_seconds: 30
+  resource_safety_margin: 0.15
+  min_free_memory_bytes: 2147483648
+  max_evictions_per_request: 8
+  memory_reclaim_timeout_seconds: 10
+  heat: {half_life_seconds: 1800, request_weight: 1.0, token_weight: 0.0001}
+  thrash: {switch_window_seconds: 10, max_switches_in_window: 3, cooldown_seconds: 15}
 resources:
-  # For AGX Thor, unified memory is the primary scheduling resource.
-  # "auto" tries tegrastats first, then psutil. nvidia-smi is used when available.
-  provider: auto
-  total_memory_bytes: 0   # 0 = detect automatically
-
+  provider: psutil
+  system_reserve_bytes: 8589934592
+  sample_interval_seconds: 1
+  sample_max_age_seconds: 2
+storage:
+  mount_path: /mnt/model-ssd
+  model_directory: /mnt/model-ssd/models
+  expected_uuid: REQUIRED_REAL_UUID
+  filesystem: ext4
+gateway:
+  connect_timeout_seconds: 5
+  pool_timeout_seconds: 5
+  read_idle_timeout_seconds: 60
+  write_idle_timeout_seconds: 60
+  inference_timeout_seconds: 900
+  close_timeout_seconds: 5
+  max_response_body_bytes: 16777216
+  max_sse_event_bytes: 1048576
 models:
   embedding:
-    memory:
-      reserved_bytes: 4294967296       # 4 GiB
-    scheduling:
-      priority: 100
-      evictable: false
-      pinned: true
-    lifecycle:
-      ttl_seconds: 0
-
+    upstream_url: http://127.0.0.1:10001
+    capabilities: [embeddings]
+    file: embedding.gguf
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    container_name: sms-lab-embedding
+    memory: {reserved_bytes: 4294967296}
+    scheduling: {priority: 100, max_concurrency: 1, evictable: false, pinned: true}
+    lifecycle: {preload: true, ttl_seconds: 0}
   reranker:
-    memory:
-      reserved_bytes: 6442450944       # 6 GiB
-    scheduling:
-      priority: 80
-      evictable: true
-      pinned: false
-    lifecycle:
-      ttl_seconds: 900
-
+    upstream_url: http://127.0.0.1:10002
+    capabilities: [rerank]
+    file: reranker.gguf
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    container_name: sms-lab-reranker
+    memory: {reserved_bytes: 6442450944}
+    scheduling: {priority: 80, max_concurrency: 1, evictable: true, pinned: false}
+    lifecycle: {preload: false, ttl_seconds: 900}
   qwen-small:
-    memory:
-      reserved_bytes: 10737418240      # 10 GiB
-    scheduling:
-      priority: 50
-      evictable: true
-      pinned: false
-    lifecycle:
-      ttl_seconds: 900
-
+    upstream_url: http://127.0.0.1:10003
+    capabilities: [chat]
+    file: qwen-small.gguf
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    container_name: sms-lab-qwen-small
+    memory: {reserved_bytes: 10737418240}
+    scheduling: {priority: 50, max_concurrency: 1, evictable: true, pinned: false}
+    lifecycle: {preload: false, ttl_seconds: 900}
   qwen-large:
-    memory:
-      reserved_bytes: 32212254720      # 30 GiB
-    scheduling:
-      priority: 40
-      evictable: true
-      pinned: false
-    lifecycle:
-      ttl_seconds: 1800
+    upstream_url: http://127.0.0.1:10004
+    capabilities: [chat]
+    file: qwen-large.gguf
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    container_name: sms-lab-qwen-large
+    memory: {reserved_bytes: 32212254720}
+    scheduling: {priority: 40, max_concurrency: 1, evictable: true, pinned: false}
+    lifecycle: {preload: false, ttl_seconds: 1800}
