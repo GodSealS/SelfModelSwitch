@@ -318,6 +318,11 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             response = await opened.json()
             await close_and_release(opened, lease, Outcome.SUCCESS)
             return JSONResponse(content=response, headers={"X-Request-ID": request_id})
+        except asyncio.CancelledError:
+            if lease is not None:
+                with suppress(Exception):
+                    await asyncio.shield(app.state.scheduler.release(lease, Outcome.ABORTED))
+            raise
         except GatewayError as exc:
             if lease is not None:
                 await app.state.scheduler.release(lease, exc.outcome)
@@ -347,6 +352,11 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             opened = await app.state.gateway.open(lease, capability, payload, deadline)
             result = await opened.json()
             return (lease, opened, result), None
+        except asyncio.CancelledError:
+            if "lease" in locals():
+                with suppress(Exception):
+                    await asyncio.shield(app.state.scheduler.release(lease, Outcome.ABORTED))
+            raise
         except GatewayError as exc:
             if "lease" in locals(): await app.state.scheduler.release(lease, exc.outcome)
             return None, _error(exc.http_status, exc.code, "Upstream request failed", request_id)
