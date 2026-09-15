@@ -29,7 +29,7 @@ from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.model_registry import Conflict
 from model_scheduler.gateway import DirectInferenceGateway
 from model_scheduler.runtime import build_scheduler
-from model_scheduler.scheduler import ModelUnavailable
+from model_scheduler.scheduler import ModelUnavailable, QueueFull
 
 
 class BodyError(ValueError):
@@ -44,8 +44,9 @@ def _config_path(explicit: str | Path | None) -> Path:
     return Path(os.environ.get("MODEL_SCHEDULER_CONFIG", "config.yaml"))
 
 
-def _error(status: int, code: str, message: str, request_id: str, param: str | None = None) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers={"X-Request-ID": request_id})
+def _error(status: int, code: str, message: str, request_id: str, param: str | None = None, extra_headers: dict[str, str] | None = None) -> JSONResponse:
+    headers = {"X-Request-ID": request_id, **(extra_headers or {})}
+    return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers=headers)
 
 
 async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float) -> dict[str, object]:
@@ -308,7 +309,13 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             if lease is not None:
                 await app.state.scheduler.release(lease, exc.outcome)
             return _error(exc.http_status, exc.code, "Upstream request failed", request_id)
-        except (TimeoutError, RuntimeError):
+        except QueueFull:
+            return _error(429, "queue_full", "Request queue is full", request_id, extra_headers={"Retry-After": "1"})
+        except TimeoutError:
+            if lease is not None:
+                await app.state.scheduler.release(lease, Outcome.ABORTED)
+            return _error(504, "queue_timeout", "Request queue deadline elapsed", request_id)
+        except (ModelUnavailable, RuntimeError):
             if lease is not None:
                 await app.state.scheduler.release(lease, Outcome.ABORTED)
             return _error(503, "service_unavailable", "Service is not ready", request_id)
@@ -330,7 +337,12 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         except GatewayError as exc:
             if "lease" in locals(): await app.state.scheduler.release(lease, exc.outcome)
             return None, _error(exc.http_status, exc.code, "Upstream request failed", request_id)
-        except (TimeoutError, RuntimeError):
+        except QueueFull:
+            return None, _error(429, "queue_full", "Request queue is full", request_id, extra_headers={"Retry-After": "1"})
+        except TimeoutError:
+            if "lease" in locals(): await app.state.scheduler.release(lease, Outcome.ABORTED)
+            return None, _error(504, "queue_timeout", "Request queue deadline elapsed", request_id)
+        except (ModelUnavailable, RuntimeError):
             if "lease" in locals(): await app.state.scheduler.release(lease, Outcome.ABORTED)
             return None, _error(503, "service_unavailable", "Service is not ready", request_id)
 

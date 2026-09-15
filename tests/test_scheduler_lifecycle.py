@@ -112,6 +112,25 @@ async def test_shared_load_grants_one_lease_without_holding_condition_for_io() -
 
 
 @pytest.mark.asyncio
+async def test_one_hundred_waiters_for_one_model_share_a_single_cold_load() -> None:
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, max_concurrency=100)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    backend = Backend()
+    scheduler = ModelScheduler(registry, Resources(), backend, queue_capacity=128)
+    deadline = asyncio.get_running_loop().time() + 2
+    waiters = [asyncio.create_task(scheduler.acquire("chat", f"request-{index}", deadline)) for index in range(100)]
+
+    await backend.started.wait()
+    backend.finish.set()
+    leases = await asyncio.gather(*waiters)
+    assert backend.loads == 1
+    assert len({lease.lease_id for lease in leases}) == 100
+    for lease in leases:
+        await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
 async def test_waiter_capacity_is_bounded() -> None:
     backend = Backend()
     scheduler = ModelScheduler(book(), Resources(), backend, queue_capacity=1)

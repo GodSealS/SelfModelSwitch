@@ -5,6 +5,7 @@ import pytest
 
 from app import create_app
 from model_scheduler.contracts import Lease, Outcome
+from model_scheduler.scheduler import QueueFull
 
 
 class Scheduler:
@@ -138,3 +139,23 @@ def test_chat_rejects_non_json_and_oversized_bodies_before_admission() -> None:
     assert wrong_type.status_code == 415
     assert oversized.status_code == 413
     assert scheduler.releases == []
+
+
+def test_chat_maps_queue_full_and_queue_deadline_to_distinct_public_errors() -> None:
+    class FullScheduler(Scheduler):
+        async def acquire(self, model_id, request_id, deadline):
+            raise QueueFull("queue_full")
+
+    class TimedOutScheduler(Scheduler):
+        async def acquire(self, model_id, request_id, deadline):
+            raise TimeoutError("queue deadline elapsed")
+
+    with TestClient(create_app(scheduler=FullScheduler(), gateway=Gateway())) as client:
+        full = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+    with TestClient(create_app(scheduler=TimedOutScheduler(), gateway=Gateway())) as client:
+        timed_out = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+    assert full.status_code == 429
+    assert full.headers["retry-after"] == "1"
+    assert full.json()["error"]["code"] == "queue_full"
+    assert timed_out.status_code == 504
+    assert timed_out.json()["error"]["code"] == "queue_timeout"
