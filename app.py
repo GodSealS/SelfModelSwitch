@@ -78,7 +78,14 @@ async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float
             raise BodyError(413, "request_too_large", "Request body exceeds the configured limit")
     try:
         async with asyncio.timeout(timeout_seconds):
-            raw = await request.body()
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > max_bytes:
+                    raise BodyError(413, "request_too_large", "Request body exceeds the configured limit")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
     except asyncio.TimeoutError as exc:
         raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
     if len(raw) > max_bytes:

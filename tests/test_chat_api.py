@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 import pytest
 
-from app import create_app
+from app import BodyError, _read_json, create_app
 from model_scheduler.contracts import Lease, Outcome
 from model_scheduler.scheduler import QueueFull
 
@@ -177,3 +177,25 @@ def test_chat_maps_queue_full_and_queue_deadline_to_distinct_public_errors() -> 
     assert full.json()["error"]["code"] == "queue_full"
     assert timed_out.status_code == 504
     assert timed_out.json()["error"]["code"] == "queue_timeout"
+
+
+@pytest.mark.asyncio
+async def test_json_body_limit_stops_reading_after_an_oversized_chunk_without_content_length() -> None:
+    messages = [
+        {"type": "http.request", "body": b'{"payload":"too-large"', "more_body": True},
+        {"type": "http.request", "body": b"}", "more_body": False},
+    ]
+    calls = 0
+
+    async def receive():
+        nonlocal calls
+        calls += 1
+        return messages.pop(0)
+
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": [(b"content-type", b"application/json")]}
+    from starlette.requests import Request
+
+    with pytest.raises(BodyError) as error:
+        await _read_json(Request(scope, receive), max_bytes=8, timeout_seconds=1)
+    assert error.value.code == "request_too_large"
+    assert calls == 1
