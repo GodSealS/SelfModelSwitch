@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from time import monotonic
 
-from .contracts import Lease, MemorySample, Observation, Outcome, Presence
+from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
 from .model_registry import Book, Conflict, StaleOperation
 
 
@@ -19,10 +19,11 @@ class ModelUnavailable(RuntimeError):
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, recovery: ControlRecoveryPort | None = None):
         self.book = book
         self.resources = resources
         self.backend = backend
+        self.recovery = recovery
         self.queue_capacity = queue_capacity
         self._condition = asyncio.Condition()
         self._waiters: set[str] = set()
@@ -106,6 +107,23 @@ class ModelScheduler:
     async def release(self, lease: Lease, outcome: Outcome, tokens: int | None = None) -> None:
         async with self._condition:
             self.book.release(lease, outcome, monotonic(), tokens)
+            self._condition.notify_all()
+
+    async def recover(self, deadline: float) -> None:
+        """Reconcile all model accounting through the injected root-owned helper."""
+        if self.recovery is None:
+            raise ModelUnavailable("control_recovery_unavailable")
+        async with self._condition:
+            if any(runtime.leases for runtime in self.book.runtime.values()):
+                raise Conflict("recovery_has_leases")
+            epoch = self.book.begin_recovery()
+            self._condition.notify_all()
+        result = await self.recovery.recover(deadline)
+        async with self._condition:
+            if not result.ok:
+                self._condition.notify_all()
+                raise ModelUnavailable(result.error_code or "control_recovery_failed")
+            self.book.finish_recovery(epoch, frozenset(result.stopped_models))
             self._condition.notify_all()
 
     async def unload(self, model_id: str, deadline: float) -> None:

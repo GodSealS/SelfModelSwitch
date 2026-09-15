@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence
+from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult
 from model_scheduler.model_registry import Book
 from model_scheduler.scheduler import ModelScheduler, QueueFull
 
@@ -28,6 +28,11 @@ class Backend:
 
     async def stop(self, operation, deadline):
         return Observation(Presence.STOPPED, None, False, 0)
+
+
+class Recovery:
+    async def recover(self, deadline):
+        return RecoveryResult(True, "complete", None, ("chat",))
 
 
 def book() -> Book:
@@ -105,3 +110,10 @@ async def test_ttl_sweep_does_not_stop_a_model_with_a_waiter() -> None:
         scheduler._waiter_models["waiting"] = "chat"
     assert await scheduler.sweep_ttl(asyncio.get_running_loop().time() + 1) == ()
     assert registry.runtime["chat"].state.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_recovery_uses_injected_control_port() -> None:
+    scheduler = ModelScheduler(book(), Resources(), Backend(), recovery=Recovery())
+    await scheduler.recover(asyncio.get_running_loop().time() + 1)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"
