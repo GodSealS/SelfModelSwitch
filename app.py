@@ -6,6 +6,7 @@ that would make imports perform control-plane I/O and hide startup failures.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import math
 import os
 from pathlib import Path
 from time import monotonic
@@ -15,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from model_scheduler.api_models import ChatRequest
+from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
 from model_scheduler.config import ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 
@@ -99,6 +100,75 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             if lease is not None:
                 await app.state.scheduler.release(lease, Outcome.ABORTED)
             return _error(503, "service_unavailable", "Service is not ready", request_id)
+
+    async def acquire_json(model_id: str, capability: Capability, payload: dict, request_id: str):
+        model = config.models.get(model_id)
+        if model is None:
+            return None, _error(404, "model_not_found", "Unknown model", request_id, "model")
+        if capability.value not in model.capabilities:
+            return None, _error(400, "unsupported_capability", "Model does not support this operation", request_id, "model")
+        if app.state.scheduler is None or app.state.gateway is None:
+            return None, _error(503, "service_unavailable", "Service is not ready", request_id)
+        deadline = monotonic() + config.gateway.inference_timeout_seconds
+        try:
+            lease = await app.state.scheduler.acquire(model_id, request_id, deadline)
+            opened = await app.state.gateway.open(lease, capability, payload, deadline)
+            result = await opened.json()
+            return (lease, opened, result), None
+        except GatewayError as exc:
+            if "lease" in locals(): await app.state.scheduler.release(lease, exc.outcome)
+            return None, _error(exc.http_status, exc.code, "Upstream request failed", request_id)
+        except (TimeoutError, RuntimeError):
+            if "lease" in locals(): await app.state.scheduler.release(lease, Outcome.ABORTED)
+            return None, _error(503, "service_unavailable", "Service is not ready", request_id)
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: Request):
+        request_id = str(uuid4())
+        try:
+            payload = await request.json(); body = EmbeddingRequest.model_validate(payload)
+        except (ValidationError, ValueError):
+            return _error(400, "invalid_request", "Invalid embedding request", request_id)
+        inputs = [body.input] if isinstance(body.input, str) else body.input
+        if not inputs or len(inputs) > 256 or any(not value.strip() for value in inputs):
+            return _error(400, "invalid_request", "Embedding input is invalid", request_id, "input")
+        context, error = await acquire_json(body.model, Capability.EMBEDDINGS, payload, request_id)
+        if error: return error
+        lease, opened, result = context
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, list) or len(data) != len(inputs) or {item.get("index") for item in data if isinstance(item, dict)} != set(range(len(inputs))):
+            await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+            return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+        for item in data:
+            vector = item.get("embedding")
+            if not isinstance(vector, list) or not vector or any(type(x) not in (int, float) or not math.isfinite(x) for x in vector):
+                await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+                return _error(502, "upstream_protocol_error", "Invalid embedding response", request_id)
+        await opened.aclose(); await app.state.scheduler.release(lease, Outcome.SUCCESS)
+        return JSONResponse(content={"object": "list", "data": sorted(data, key=lambda item: item["index"]), "model": body.model}, headers={"X-Request-ID": request_id})
+
+    @app.post("/v1/rerank")
+    async def rerank(request: Request):
+        request_id = str(uuid4())
+        try:
+            payload = await request.json(); body = RerankRequest.model_validate(payload)
+        except (ValidationError, ValueError):
+            return _error(400, "invalid_request", "Invalid rerank request", request_id)
+        if not body.query.strip() or not 1 <= len(body.documents) <= 256 or any(not item.strip() for item in body.documents):
+            return _error(400, "invalid_request", "Rerank input is invalid", request_id)
+        count = len(body.documents) if body.top_n is None else body.top_n
+        if not 1 <= count <= len(body.documents): return _error(400, "invalid_request", "top_n is out of range", request_id, "top_n")
+        context, error = await acquire_json(body.model, Capability.RERANK, {"model": body.model, "query": body.query, "documents": body.documents, "top_n": len(body.documents)}, request_id)
+        if error: return error
+        lease, opened, result = context
+        items = result.get("results") if isinstance(result, dict) else None
+        if not isinstance(items, list) or {item.get("index") for item in items if isinstance(item, dict)} != set(range(len(body.documents))) or any(type(item.get("relevance_score")) not in (int, float) or not math.isfinite(item["relevance_score"]) for item in items):
+            await opened.aclose(); await app.state.scheduler.release(lease, Outcome.ABORTED)
+            return _error(502, "upstream_protocol_error", "Invalid rerank response", request_id)
+        ordered = sorted(items, key=lambda item: (-item["relevance_score"], item["index"]))[:count]
+        public = [{"index": item["index"], "relevance_score": item["relevance_score"], **({"document": {"text": body.documents[item["index"]]}} if body.return_documents else {})} for item in ordered]
+        await opened.aclose(); await app.state.scheduler.release(lease, Outcome.SUCCESS)
+        return JSONResponse(content={"model": body.model, "results": public}, headers={"X-Request-ID": request_id})
 
     return app
 
