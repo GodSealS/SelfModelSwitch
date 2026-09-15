@@ -1,162 +1,111 @@
+"""Single-owner async scheduler built around the atomic :class:`Book`."""
 from __future__ import annotations
 
 import asyncio
 from time import monotonic
-from collections import deque
-from typing import Any, Callable
 
-from .config import SchedulerConfig
-from .eviction_policy import EvictionPolicy
-from .heat_tracker import HeatTracker
-from .llama_swap_client import LlamaSwapClient, LlamaSwapError
-from .model_registry import Book
-from .models import ModelState
-from .resource_monitor import ResourceMonitor
+from .contracts import Lease, MemorySample, Observation, Outcome, Presence
+from .model_registry import Book, Conflict, StaleOperation
 
 
-class ResourceError(RuntimeError):
+class QueueFull(RuntimeError):
+    pass
+
+
+class ModelUnavailable(RuntimeError):
     pass
 
 
 class ModelScheduler:
-    def __init__(
-        self,
-        registry: Book,
-        resources: ResourceMonitor,
-        heat: HeatTracker,
-        eviction: EvictionPolicy,
-        llama: LlamaSwapClient,
-        cfg: SchedulerConfig,
-    ):
-        self.registry = registry
+    """Coordinates shared loads and leases without ever awaiting under its lock."""
+
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128):
+        self.book = book
         self.resources = resources
-        self.heat = heat
-        self.eviction = eviction
-        self.llama = llama
-        self.cfg = cfg
-        self._model_locks = {mid: asyncio.Lock() for mid in registry.configs}
-        self._global_lock = asyncio.Lock()
-        self._switch_times = deque()
-        self._cooldown_until = 0.0
+        self.backend = backend
+        self.queue_capacity = queue_capacity
+        self._condition = asyncio.Condition()
+        self._waiters: set[str] = set()
+        self._loads: dict[str, asyncio.Task[None]] = {}
 
-    async def sync_running(self):
-        running = set(await self.llama.running())
-        for mid in self.registry.configs:
-            r = self.registry.get_runtime(mid)
-            if mid in running:
-                if r.state in {ModelState.UNKNOWN, ModelState.UNLOADED, ModelState.ERROR}:
-                    r.mark_loaded()
-                    r.state = ModelState.READY
-            else:
-                if r.in_flight == 0:
-                    r.state = ModelState.UNLOADED
+    async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
+        if model_id not in self.book.specs:
+            raise KeyError(model_id)
+        if deadline <= monotonic():
+            raise TimeoutError("queue deadline elapsed")
+        async with self._condition:
+            if request_id in self._waiters:
+                raise Conflict("duplicate waiter")
+            if len(self._waiters) >= self.queue_capacity:
+                raise QueueFull("queue_full")
+            self._waiters.add(request_id)
+        try:
+            while True:
+                needs_sample = False
+                async with self._condition:
+                    try:
+                        lease = self.book.acquire_ready(model_id, request_id, monotonic())
+                    except Conflict:
+                        runtime = self.book.runtime[model_id]
+                        if runtime.state.value == "error":
+                            raise ModelUnavailable(runtime.last_error or "model_error")
+                        needs_sample = runtime.state.value == "unloaded" and model_id not in self._loads
+                    else:
+                        return lease
+                if needs_sample:
+                    # Sampling is external I/O; take it outside the condition and
+                    # re-check state before committing the operation below.
+                    snapshot = await self.resources.snapshot()
+                    sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
+                    async with self._condition:
+                        runtime = self.book.runtime[model_id]
+                        if runtime.state.value == "unloaded" and model_id not in self._loads:
+                            operation = self.book.begin_load(model_id, sample, monotonic())
+                            self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
+                        self._condition.notify_all()
+                    continue
+                async with self._condition:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("queue deadline elapsed")
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), remaining)
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError("queue deadline elapsed") from exc
+        finally:
+            async with self._condition:
+                self._waiters.discard(request_id)
+                self._condition.notify_all()
 
-    async def ensure_model(self, model_id: str):
-        self.registry.require(model_id)
-        runtime = self.registry.get_runtime(model_id)
-
-        if runtime.state in {ModelState.READY, ModelState.ACTIVE}:
-            return
-
-        async with self._global_lock:
-            await self.sync_running()
-            runtime = self.registry.get_runtime(model_id)
-            if runtime.state in {ModelState.READY, ModelState.ACTIVE}:
-                return
-
-            await self._respect_switch_rate()
-            await self._ensure_resources(model_id)
-
-            runtime.state = ModelState.LOADING
-            try:
-                await self.llama.load(model_id)
-                runtime.mark_loaded()
-            except Exception as e:
-                runtime.mark_error(str(e))
+    async def _finish_load(self, operation, deadline: float) -> None:
+        try:
+            observation: Observation = await self.backend.load(operation, deadline)
+            async with self._condition:
+                if observation.presence is Presence.RUNNING and observation.healthy:
+                    self.book.loaded(operation, monotonic())
+                else:
+                    self.book.failed(operation, observation.detail_code or "load_unverified")
+                self._condition.notify_all()
+        except (Exception, asyncio.CancelledError) as exc:
+            async with self._condition:
+                try:
+                    self.book.failed(operation, "load_failed")
+                except StaleOperation:
+                    pass
+                self._condition.notify_all()
+            if isinstance(exc, asyncio.CancelledError):
                 raise
+        finally:
+            async with self._condition:
+                self._loads.pop(operation.model_id, None)
+                self._condition.notify_all()
 
-            self._switch_times.append(monotonic())
+    async def release(self, lease: Lease, outcome: Outcome, tokens: int | None = None) -> None:
+        async with self._condition:
+            self.book.release(lease, outcome, monotonic(), tokens)
+            self._condition.notify_all()
 
-    async def _ensure_resources(self, target_id: str):
-        target = self.registry.configs[target_id]
-        snap = await self.resources.snapshot()
-
-        required = int(target.memory.reserved_bytes * (1.0 + self.cfg.resource_safety_margin))
-        # Preserve a hard floor after the target is loaded.
-        usable = max(0, snap.available_bytes - self.cfg.min_free_memory_bytes)
-
-        if usable >= required:
-            return
-
-        deficit = required - usable
-        selected = self.eviction.choose(deficit)
-
-        if not selected:
-            raise ResourceError(
-                f"insufficient memory for {target_id}: required={required}, "
-                f"available_usable={usable}, deficit={deficit}, "
-                f"running={self.registry.snapshot()}"
-            )
-
-        for candidate in selected:
-            r = self.registry.get_runtime(candidate.model_id)
-            r.state = ModelState.EVICTING
-            try:
-                await self.llama.unload(candidate.model_id)
-            except Exception as e:
-                r.mark_error(str(e))
-                raise
-            finally:
-                r.state = ModelState.UNLOADED
-
-        # Give the OS/CUDA a moment to return memory, then verify.
-        await asyncio.sleep(0.5)
-        snap2 = await self.resources.snapshot()
-        usable2 = max(0, snap2.available_bytes - self.cfg.min_free_memory_bytes)
-        if usable2 < required:
-            raise ResourceError(
-                f"eviction completed but memory is still insufficient: "
-                f"required={required}, usable={usable2}, source={snap2.source}"
-            )
-
-    async def acquire(self, model_id: str):
-        await self.ensure_model(model_id)
-        r = self.registry.get_runtime(model_id)
-        r.in_flight += 1
-        r.state = ModelState.ACTIVE
-        r.touch()
-        self.heat.record_request(r)
-
-    async def release(self, model_id: str, tokens: int = 0):
-        r = self.registry.get_runtime(model_id)
-        r.in_flight = max(0, r.in_flight - 1)
-        r.total_tokens += tokens
-        self.heat.record_request(r, tokens=tokens)
-        if r.in_flight == 0:
-            r.state = ModelState.READY
-
-    async def _respect_switch_rate(self):
-        now = monotonic()
-        while self._switch_times and now - self._switch_times[0] > self.cfg.thrash.switch_window_seconds:
-            self._switch_times.popleft()
-
-        if len(self._switch_times) >= self.cfg.thrash.max_switches_in_window:
-            sleep_for = max(
-                self.cfg.thrash.cooldown_seconds,
-                self.cfg.thrash.switch_window_seconds - (now - self._switch_times[0]),
-            )
-            await asyncio.sleep(sleep_for)
-
-    async def status(self):
-        snap = await self.resources.snapshot()
-        return {
-            "resources": {
-                "total_bytes": snap.total_bytes,
-                "available_bytes": snap.available_bytes,
-                "used_bytes": snap.used_bytes,
-                "utilization": snap.utilization,
-                "source": snap.source,
-            },
-            "models": self.registry.snapshot(),
-            "queue_size": 0,
-        }
+    async def status(self) -> dict[str, object]:
+        snapshot = await self.resources.snapshot()
+        async with self._condition:
+            return {"resources": {"total_bytes": snapshot.total_bytes, "available_bytes": snapshot.available_bytes, "used_bytes": snapshot.used_bytes, "utilization": snapshot.utilization, "source": snapshot.source, "sample_age_seconds": snapshot.age_at(monotonic())}, "queue_size": len(self._waiters), "models": {model_id: {"state": runtime.state.value, "generation": runtime.generation, "in_flight": len(runtime.leases), "last_error": runtime.last_error} for model_id, runtime in self.book.runtime.items()}}
