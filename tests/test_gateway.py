@@ -93,3 +93,27 @@ async def test_gateway_bounds_non_streaming_response_bytes_and_normalizes_invali
 
     await assert_json_error(b"12345", "upstream_response_too_large")
     await assert_json_error(b"nope", "upstream_protocol_error")
+
+
+@pytest.mark.asyncio
+async def test_gateway_enforces_the_absolute_deadline_while_reading_a_success_body() -> None:
+    class SlowBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(0.1)
+            yield b'{"ok":true}'
+
+        async def aclose(self):
+            return None
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=SlowBody())), follow_redirects=False)
+    gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client)
+    opened = await gateway.open(Lease("lease", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 0.001)
+    with pytest.raises(GatewayError) as error:
+        await opened.json()
+    assert (error.value.http_status, error.value.code, error.value.outcome) == (504, "inference_timeout", Outcome.ABORTED)
+
+    opened = await gateway.open(Lease("lease-2", "request", "chat", 1), Capability.CHAT, {}, asyncio.get_running_loop().time() + 0.001)
+    with pytest.raises(GatewayError) as error:
+        _ = [chunk async for chunk in opened.iter_bytes()]
+    assert (error.value.http_status, error.value.code, error.value.outcome) == (504, "inference_timeout", Outcome.ABORTED)
+    await client.aclose()

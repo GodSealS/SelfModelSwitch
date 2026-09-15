@@ -11,14 +11,23 @@ from .contracts import Capability, GatewayError, Lease, OpenedResponse, Outcome
 
 
 class OpenedHTTPXResponse:
-    def __init__(self, response: httpx.Response, max_response_body_bytes: int):
+    def __init__(self, response: httpx.Response, max_response_body_bytes: int, deadline: float):
         self._response = response
         self._max_response_body_bytes = max_response_body_bytes
+        self._deadline = deadline
         self.status_code = response.status_code
         self.headers = response.headers
 
     def iter_bytes(self) -> AsyncIterator[bytes]:
-        return self._response.aiter_bytes()
+        async def bounded() -> AsyncIterator[bytes]:
+            try:
+                async with asyncio.timeout_at(self._deadline):
+                    async for chunk in self._response.aiter_bytes():
+                        yield chunk
+            except asyncio.TimeoutError as exc:
+                raise GatewayError(504, "inference_timeout", Outcome.ABORTED) from exc
+
+        return bounded()
 
     async def aclose(self) -> None:
         await self._response.aclose()
@@ -26,13 +35,19 @@ class OpenedHTTPXResponse:
     async def json(self) -> object:
         data = bytearray()
         try:
-            async for chunk in self._response.aiter_bytes():
-                if len(data) + len(chunk) > self._max_response_body_bytes:
-                    try:
-                        await self.aclose()
-                    finally:
-                        raise GatewayError(502, "upstream_response_too_large", Outcome.ABORTED)
-                data.extend(chunk)
+            async with asyncio.timeout_at(self._deadline):
+                async for chunk in self._response.aiter_bytes():
+                    if len(data) + len(chunk) > self._max_response_body_bytes:
+                        try:
+                            await self.aclose()
+                        finally:
+                            raise GatewayError(502, "upstream_response_too_large", Outcome.ABORTED)
+                    data.extend(chunk)
+        except asyncio.TimeoutError as exc:
+            try:
+                await self.aclose()
+            finally:
+                raise GatewayError(504, "inference_timeout", Outcome.ABORTED) from exc
         except httpx.HTTPError as exc:
             raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
         try:
@@ -77,7 +92,7 @@ class DirectInferenceGateway:
         except httpx.HTTPError as exc:
             raise GatewayError(502, "upstream_unavailable", Outcome.ABORTED) from exc
         if 200 <= response.status_code < 300:
-            return OpenedHTTPXResponse(response, self._max_response_body_bytes)
+            return OpenedHTTPXResponse(response, self._max_response_body_bytes, deadline)
         status_code = response.status_code
         retry_after = self._retry_after(response) if status_code == 429 else None
         await response.aclose()
