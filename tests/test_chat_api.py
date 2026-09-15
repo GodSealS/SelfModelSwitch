@@ -53,6 +53,16 @@ class MissingDoneGateway:
         return MissingDone()
 
 
+class TextContainingDoneGateway:
+    async def open(self, lease, capability, payload, deadline):
+        class TextContainingDone(StreamOpened):
+            def iter_bytes(self):
+                async def iterator():
+                    yield b'data: {"content":"data: [DONE]"}\n\n'
+                return iterator()
+        return TextContainingDone()
+
+
 def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
     scheduler = Scheduler()
     app = create_app(scheduler=scheduler, gateway=Gateway())
@@ -90,6 +100,14 @@ def test_stream_response_owns_lease_until_done_event() -> None:
 def test_stream_eof_without_done_aborts_lease() -> None:
     scheduler = Scheduler()
     with TestClient(create_app(scheduler=scheduler, gateway=MissingDoneGateway())) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
+    assert response.status_code == 200
+    assert scheduler.releases == [Outcome.ABORTED]
+
+
+def test_done_text_inside_an_sse_payload_does_not_complete_lease() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=TextContainingDoneGateway())) as client:
         response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [], "stream": True})
     assert response.status_code == 200
     assert scheduler.releases == [Outcome.ABORTED]

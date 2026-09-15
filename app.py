@@ -123,13 +123,18 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             if body.stream:
                 async def stream_body():
                     outcome = Outcome.ABORTED
-                    tail = b""
+                    pending = b""
                     try:
                         async for chunk in opened.iter_bytes():
-                            tail = (tail + chunk)[-1024:]
+                            pending += chunk
+                            lines = pending.splitlines(keepends=True)
+                            pending = b""
+                            if lines and not lines[-1].endswith((b"\n", b"\r")):
+                                pending = lines.pop()
+                            for line in lines:
+                                if line.rstrip(b"\r\n") == b"data: [DONE]":
+                                    outcome = Outcome.SUCCESS
                             yield chunk
-                            if b"data: [DONE]" in tail:
-                                outcome = Outcome.SUCCESS
                     finally:
                         await opened.aclose()
                         await app.state.scheduler.release(lease, outcome)
