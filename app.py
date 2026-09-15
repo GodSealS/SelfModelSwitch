@@ -6,6 +6,7 @@ that would make imports perform control-plane I/O and hide startup failures.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import inspect
 import math
 import os
 from pathlib import Path
@@ -32,7 +33,7 @@ def _error(status: int, code: str, message: str, request_id: str, param: str | N
     return JSONResponse(status_code=status, content={"error": {"message": message, "type": "invalid_request_error" if status < 500 else "upstream_error", "code": code, "param": param}, "request_id": request_id}, headers={"X-Request-ID": request_id})
 
 
-def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway=None, health_checks=None) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover."""
     config = load_config(_config_path(config_path))
 
@@ -49,6 +50,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
     app.state.ready = False
     app.state.scheduler = scheduler
     app.state.gateway = gateway
+    app.state.health_checks = health_checks
 
     @app.get("/live")
     async def live() -> dict[str, bool]:
@@ -56,8 +58,17 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        checks = {"llama_swap": False, "storage": False, "resources": False, "preload": False, "control": False}
-        return JSONResponse(status_code=503, content={"ok": False, "checks": checks, "reason": "starting"})
+        required = {"llama_swap", "storage", "resources", "preload", "control"}
+        checks = {key: False for key in required}
+        provider = app.state.health_checks
+        if provider is not None:
+            result = provider()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, dict) and set(result) == required and all(type(value) is bool for value in result.values()):
+                checks = result
+        ready = all(checks.values()) and not app.state.shutting_down
+        return JSONResponse(status_code=200 if ready else 503, content={"ok": ready, "checks": checks, "reason": None if ready else "dependencies_unready"})
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, object]:
