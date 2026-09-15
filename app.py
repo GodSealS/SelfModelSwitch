@@ -20,7 +20,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 import httpx
 
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
@@ -60,6 +60,16 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _reject_non_finite_json_constant(_: str) -> object:
     raise ValueError("non-finite JSON number")
+
+
+def _openapi_json_body(model: type[BaseModel]) -> dict[str, object]:
+    """Document the same strict DTO used after the raw-body safety checks."""
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": model.model_json_schema()}},
+        }
+    }
 
 
 async def _read_json(request: Request, *, max_bytes: int, timeout_seconds: float) -> dict[str, object]:
@@ -292,7 +302,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         except ModelUnavailable as exc:
             return _error(503, str(exc), "Storage recovery did not complete", request_id)
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", openapi_extra=_openapi_json_body(ChatRequest))
     async def chat(request: Request):
         request_id = str(uuid4())
         try:
@@ -391,7 +401,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
             if "lease" in locals(): await app.state.scheduler.release(lease, Outcome.ABORTED)
             return None, _error(503, "service_unavailable", "Service is not ready", request_id)
 
-    @app.post("/v1/embeddings")
+    @app.post("/v1/embeddings", openapi_extra=_openapi_json_body(EmbeddingRequest))
     async def embeddings(request: Request):
         request_id = str(uuid4())
         try:
@@ -445,7 +455,7 @@ def create_app(config_path: str | Path | None = None, *, scheduler=None, gateway
         ]
         return JSONResponse(content={"object": "list", "data": encoded, "model": body.model}, headers={"X-Request-ID": request_id})
 
-    @app.post("/v1/rerank")
+    @app.post("/v1/rerank", openapi_extra=_openapi_json_body(RerankRequest))
     async def rerank(request: Request):
         request_id = str(uuid4())
         try:
