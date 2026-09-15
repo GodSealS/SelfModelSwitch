@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -74,6 +75,17 @@ def validate_thor_report(report: Any) -> dict[str, Any]:
         raise DeployError("invalid Thor report")
     for key in required - {"schema_version", "models", "scenarios", "soak"}:
         _require(report[key], f"Thor report {key}")
+    timestamp = report["timestamp_utc"]
+    try:
+        if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+            raise ValueError
+        parsed_timestamp = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+        if parsed_timestamp.tzinfo is None:
+            raise ValueError
+    except ValueError as exc:
+        raise DeployError("invalid Thor report provenance") from exc
+    if not isinstance(report["source_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", report["source_commit"]):
+        raise DeployError("invalid Thor report provenance")
     if not _HASH.fullmatch(report["llama_swap_sha256"]) or not re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", report["image_digest"]):
         raise DeployError("invalid Thor report identity")
     models = report["models"]

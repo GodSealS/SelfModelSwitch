@@ -114,6 +114,18 @@ def test_production_rejects_a_report_without_all_hardware_acceptance_evidence(tm
         render(source, "production", tmp_path / "out")
 
 
+def test_production_rejects_unparseable_hardware_report_provenance(tmp_path) -> None:
+    payload = input_data(True)
+    report = validation_report(payload)
+    report["timestamp_utc"] = "not-a-timestamp"
+    report["source_commit"] = "not-a-commit"
+    report_path = tmp_path / "measurements.json"; report_path.write_text(json.dumps(report))
+    payload["validation_report"] = str(report_path)
+    source = tmp_path / "input.json"; source.write_text(json.dumps(payload))
+    with pytest.raises(DeployError, match="validation report"):
+        render(source, "production", tmp_path / "out")
+
+
 def test_preflight_cross_checks_rendered_config_and_storage(tmp_path) -> None:
     source = tmp_path / "input.json"; source.write_text(json.dumps(input_data()))
     output = tmp_path / "out"; render(source, "lab", output)
