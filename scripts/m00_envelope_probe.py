@@ -122,7 +122,7 @@ def verify_sha256(path: Path, expected: str) -> str:
     return actual
 
 
-def build_server_command(envelope: Envelope, paths: Paths, no_mmap: bool = False) -> list[str]:
+def build_server_command(envelope: Envelope, paths: Paths, load_mode: str | None = None) -> list[str]:
     command = [
         paths.llama_server,
         "--model", paths.model,
@@ -137,8 +137,8 @@ def build_server_command(envelope: Envelope, paths: Paths, no_mmap: bool = False
         "--host", paths.host,
         "--port", str(paths.port),
     ]
-    if no_mmap:
-        command.append("--no-mmap")
+    if load_mode is not None:
+        command += ["--load-mode", load_mode]
     return command
 
 
@@ -470,7 +470,7 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def capture_env(paths: Paths, envelope: Envelope, no_mmap: bool = False) -> dict:
+def capture_env(paths: Paths, envelope: Envelope, load_mode: str | None = None) -> dict:
     def run(command: list[str]) -> str:
         result = subprocess.run(command, capture_output=True, text=True)
         return result.stdout.strip() or result.stderr.strip()
@@ -483,7 +483,7 @@ def capture_env(paths: Paths, envelope: Envelope, no_mmap: bool = False) -> dict
         "disk": run(["df", "-h"]),
         "mounts": run(["mount"]),
         "meminfo": read_meminfo(),
-        "server_command": build_server_command(envelope, paths, no_mmap=no_mmap),
+        "server_command": build_server_command(envelope, paths, load_mode=load_mode),
         "port_busy": port_in_use(paths.host, paths.port),
     }
 
@@ -711,8 +711,8 @@ def check_probe(args: argparse.Namespace) -> int:
         "runs": args.runs,
         "envelope": asdict(envelope),
         "cold_cache": bool(args.cold_cache),
-        "no_mmap": bool(args.no_mmap),
-        "server": build_server_command(envelope, paths, no_mmap=args.no_mmap),
+        "load_mode": args.load_mode,
+        "server": build_server_command(envelope, paths, load_mode=args.load_mode),
     }
     print("plan: " + json.dumps(plan))
     return 0
@@ -727,7 +727,7 @@ class ProbeRun:
         evidence_dir: Path,
         case_timeout: float,
         cold_cache: bool = False,
-        no_mmap: bool = False,
+        load_mode: str | None = None,
     ):
         self.index = index
         self.envelope = envelope
@@ -736,7 +736,7 @@ class ProbeRun:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.case_timeout = case_timeout
         self.cold_cache = cold_cache
-        self.no_mmap = no_mmap
+        self.load_mode = load_mode
         self.result: dict = {"run": index, "status": "failed", "failure_stage": "setup", "error": None, "cases": {}}
         self.sampler = Sampler(self.run_dir)
         self.proc: subprocess.Popen | None = None
@@ -773,7 +773,7 @@ class ProbeRun:
             )
         time.sleep(10.0)
         self.pre_launch_available = read_meminfo()["available_bytes"]
-        env = capture_env(self.paths, self.envelope, no_mmap=self.no_mmap)
+        env = capture_env(self.paths, self.envelope, load_mode=self.load_mode)
         env["tegrastats_start"] = self.sampler.tegrastats_sample()
         write_json(self.run_dir / "env.json", env)
         try:
@@ -795,7 +795,7 @@ class ProbeRun:
     def _start_server(self) -> None:
         if port_in_use(self.paths.host, self.paths.port):
             raise ProbeError(f"port {self.paths.port} is busy before launch")
-        command = build_server_command(self.envelope, self.paths, no_mmap=self.no_mmap)
+        command = build_server_command(self.envelope, self.paths, load_mode=self.load_mode)
         (self.run_dir / "server.cmd").write_text(" ".join(command) + "\n", encoding="utf-8")
         log = (self.run_dir / "server.log").open("w", encoding="utf-8")
         self.proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -1186,7 +1186,7 @@ def run_probe(args: argparse.Namespace) -> int:
             evidence_dir,
             args.case_timeout,
             cold_cache=bool(args.cold_cache),
-            no_mmap=bool(args.no_mmap),
+            load_mode=args.load_mode,
         )
         result = run.execute()
         runs.append(result)
@@ -1213,7 +1213,7 @@ def run_probe(args: argparse.Namespace) -> int:
             "envelope": asdict(envelope),
             "paths": asdict(paths),
             "cold_cache": bool(args.cold_cache),
-            "no_mmap": bool(args.no_mmap),
+            "load_mode": args.load_mode,
         },
         "preflight": facts,
         "runs": runs,
@@ -1264,7 +1264,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         dest="cold_cache",
         help="drop model/mmproj page cache before each run (true cold start)",
     )
-    parser.add_argument("--no-mmap", action="store_true", dest="no_mmap", help="launch llama-server with --no-mmap")
+    parser.add_argument(
+        "--load-mode",
+        dest="load_mode",
+        choices=["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"],
+        default=None,
+        help="override llama-server --load-mode (default: leave it at auto)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

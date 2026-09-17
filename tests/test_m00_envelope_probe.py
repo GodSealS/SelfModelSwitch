@@ -261,10 +261,11 @@ def test_evidence_directory_name_is_unique_and_utc():
     assert name == "m00-qwen25vl-envelope-20260917T040506Z"
 
 
-def test_build_server_command_can_disable_mmap():
+def test_build_server_command_can_override_load_mode():
     module = _module()
-    assert "--no-mmap" in module.build_server_command(_envelope(), _paths(), no_mmap=True)
-    assert "--no-mmap" not in module.build_server_command(_envelope(), _paths())
+    command = module.build_server_command(_envelope(), _paths(), load_mode="none")
+    assert ("--load-mode", "none") in list(zip(command, command[1:]))
+    assert "--load-mode" not in module.build_server_command(_envelope(), _paths())
 
 
 def test_parse_version_output_extracts_built_commit():
