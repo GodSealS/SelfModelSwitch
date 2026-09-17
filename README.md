@@ -10,6 +10,12 @@ The HTTP listener is loopback-only. Public interfaces are `/live`, `/health`,
 `/api/status`, `/api/models`, `POST /api/models/{model_id}/unload`, and
 `POST /api/recover`.
 
+The [model-service design](plan/README.md) focuses future work on model asset
+mounting, loading, unloading, switching, and the supporting resource and inference
+interfaces. Video analysis is a separate project; its [design documents](plan/video-analysis/README.md)
+are temporarily kept here for review. Its pipeline, annotations, and product
+acceptance are owned by that project. These plans do not describe implemented features.
+
 `POST /api/recover` is a loopback-only administrative operation. It does not
 blindly reopen inference after an SSD fault: it revalidates storage, invokes
 the constrained control-plane recovery port, and then retries configured

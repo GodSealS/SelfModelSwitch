@@ -1,0 +1,54 @@
+# 03 模型服务接口
+
+## 1. 现有兼容接口
+
+保留 `/live`、`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、
+`/api/status`、`/api/models`、`POST /api/models/{id}/unload`、`POST /api/recover`。
+现有参数、响应、SSE 和取消行为由既有测试保护；模型列表来自配置，查询不加载模型。
+未知模型404、能力不符422、有效租约/会话阻止卸载409；队列忙不等于 health 不健康。
+status 展示实际 boot_id、模型状态、execution 数、预留字节和 readiness_reason，不暴露完整控制 token。
+
+## 2. 拟议通用控制接口
+
+以下均待 M01 定型及 M04 实施；不宣称现有代码已经支持。
+本机 Unix socket `/run/self-model-switch/control.sock`，0660，服务账号所有，客户端组控制访问并检查 peer UID。
+接口语义与视频领域无关，其他本机客户端使用同一协议。
+
+| 操作 | 输入 | 行为 |
+|---|---|---|
+| POST /internal/sessions | model_id、idempotency_key、可选 opaque correlation_id | 202 session handle，服务推导预算/期限并排队加载 |
+| GET /internal/sessions/{id} | 身份验证 | 状态、owner 专属 token、到期剩余毫秒、错误 |
+| POST /internal/sessions/{id}/heartbeat | session token | 200续租，过期/旧boot409 |
+| POST /internal/sessions/{id}/close | session token | 202清理中或200closed |
+| POST /internal/executions | session token、operation、input、parameters、idempotency_key | 202 execution_id；仅登记能力和 envelope 内请求 |
+| GET /internal/executions/{id} | 身份验证 | 状态、结果引用、错误、compute_quiescent |
+| POST /internal/executions/{id}/cancel | session token | 202 cancelling或200已终结 |
+
+session token 绑定 boot/session/model/owner；execution 再绑定 generation 和 attempt。
+相同 owner+幂等键+规范 payload hash 返回原对象，不同 payload 返回409；服务重启后旧 token 失效，客户端不能盲重发。
+所有查询和变更检查归属；operation、参数、输出格式由 model adapter 白名单定义，调用方不能自选 argv、URL、端口和字节预算。
+M01 必须锁定 DTO、限制、幂等保留期、协议版本、结果引用生命周期和错误映射，再开始跨项目接入。
+该通用协议替代旧 v2 的 job/stage/phase permit 契约。
+
+## 3. 模型数据访问
+
+兼容 JSON API 保持原传输方式。通用 worker 输入采用有界内联数据或预登记 BlobRef，禁止任意宿主路径/远程 URL。
+拟议本机 Blob API：POST /internal/blobs 有界流式暂存，GET /internal/blobs/{id} 校验 owner/hash 后读取，DELETE 显式释放。
+BlobRef 绑定 owner、sha256、size、媒体类型和 opaque ID；模型服务验证根目录、无 symlink、regular file、配额与剩余空间。
+执行持有 blob 读取租约，期间禁止删除；结果写入服务受限暂存区，经校验后发布引用。
+默认结果终结后保留24小时，过期410；未终结执行的引用不清理，空间不足拒绝新写入。
+客户端应及时复制到自己的持久产物库并校验 hash；服务重启保留已完成 blob 的元数据和归属，重新校验后开放读取。
+这是通用传输暂存，不能保存电影 job 或充当视频检查点。临时目录/配额纳入模型服务部署和故障验收。
+
+vision adapter 可扩展既有 chat data URL 输入；audio/embedding 等能力按实际登记 adapter 提供有界执行。
+不在此定义切片、字幕、人物、声纹聚类或镜头结果结构；这些是客户端契约。
+新 HTTP 专用路由是否提供由 M01 能力矩阵决定，不把旧混合方案的 audio API 当作已交付接口。
+
+## 4. 通用错误和响应
+
+新增 DTO 严格拒绝未知字段、重复 key、bool 冒充整数和非有限数；旧 chat 透传兼容行为保留。
+错误体 `{ "error": { "code": "...", "message": "...", "retryable": false }, "request_id": "..." }`。
+400语法错误、404对象不存在、409冲突/旧token/忙、410引用过期、413负载过大、415格式不支持、422契约或envelope错误、
+429队列满、502后端失败、503资源/存储/实例未知、504排队或执行超时；错误响应不能伪造成功或 SSE DONE。
+上游不自动重试不确定执行；terminal 必须携带完整实例身份且 quiescent=true。
+日志记请求 ID、模型、hash、耗时和状态，不记原始媒体、完整台词或凭据。
