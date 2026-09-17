@@ -261,6 +261,44 @@ def test_evidence_directory_name_is_unique_and_utc():
     assert name == "m00-qwen25vl-envelope-20260917T040506Z"
 
 
+def test_build_server_command_can_disable_mmap():
+    module = _module()
+    assert "--no-mmap" in module.build_server_command(_envelope(), _paths(), no_mmap=True)
+    assert "--no-mmap" not in module.build_server_command(_envelope(), _paths())
+
+
+def test_parse_version_output_extracts_built_commit():
+    module = _module()
+    parsed = module.parse_version_output(
+        "version: 0.4.1-dev (build 1, commit 4bc272f)\nbuilt with GNU 11.4.0 for Linux aarch64\n"
+    )
+    assert parsed["commit"] == "4bc272f"
+    assert parsed["version_line"].startswith("version: 0.4.1-dev")
+    assert module.parse_version_output("no version here")["commit"] is None
+
+
+def test_runtime_findings_separate_stale_records_from_mismatches():
+    module = _module()
+    records = {
+        "RUNTIME-SHA256": {"llama-server": "a" * 64},
+        "BUILD-METADATA": {"llama-server": "b" * 64},
+    }
+    findings = module.runtime_findings(records, {"llama-server": "a" * 64})
+    assert findings["anomalies"] == []
+    assert len(findings["notes"]) == 1
+    assert "stale" in findings["notes"][0]
+
+    mismatch = module.runtime_findings(records, {"llama-server": "c" * 64})
+    assert len(mismatch["anomalies"]) == 1
+
+
+def test_drop_file_cache_reports_missing_file(tmp_path: Path):
+    module = _module()
+    result = module.drop_file_cache(tmp_path / "missing.gguf")
+    assert result["dropped"] is False
+    assert result["error"]
+
+
 def test_harness_module_imports_without_side_effects():
     module = _module()
     assert json.dumps(module.PROBE_SCHEMA) == "1"

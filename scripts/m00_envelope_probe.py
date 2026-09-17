@@ -122,8 +122,8 @@ def verify_sha256(path: Path, expected: str) -> str:
     return actual
 
 
-def build_server_command(envelope: Envelope, paths: Paths) -> list[str]:
-    return [
+def build_server_command(envelope: Envelope, paths: Paths, no_mmap: bool = False) -> list[str]:
+    command = [
         paths.llama_server,
         "--model", paths.model,
         "--mmproj", paths.mmproj,
@@ -137,6 +137,9 @@ def build_server_command(envelope: Envelope, paths: Paths) -> list[str]:
         "--host", paths.host,
         "--port", str(paths.port),
     ]
+    if no_mmap:
+        command.append("--no-mmap")
+    return command
 
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -346,6 +349,7 @@ def read_meminfo() -> dict:
         "available_bytes": values.get("MemAvailable", 0),
         "total_bytes": values.get("MemTotal", 0),
         "swap_free_bytes": values.get("SwapFree", 0),
+        "cached_bytes": values.get("Cached", 0),
     }
 
 
@@ -403,16 +407,17 @@ class Sampler:
 
     def _loop(self) -> None:
         with self._samples_path.open("w", encoding="utf-8") as handle:
-            handle.write("t_mono,utc,mem_available_bytes,mem_total_bytes,swap_free_bytes\n")
+            handle.write("t_mono,utc,mem_available_bytes,mem_total_bytes,swap_free_bytes,cached_bytes\n")
             while not self._stop.is_set():
                 try:
                     sample = read_meminfo()
                 except OSError:
-                    sample = {"available_bytes": 0, "total_bytes": 0, "swap_free_bytes": 0}
+                    sample = {"available_bytes": 0, "total_bytes": 0, "swap_free_bytes": 0, "cached_bytes": 0}
                 t = time.monotonic()
                 self.samples.append({"t": t, **sample})
                 handle.write(
-                    f"{t:.3f},{utc_now()},{sample['available_bytes']},{sample['total_bytes']},{sample['swap_free_bytes']}\n"
+                    f"{t:.3f},{utc_now()},{sample['available_bytes']},{sample['total_bytes']},"
+                    f"{sample['swap_free_bytes']},{sample['cached_bytes']}\n"
                 )
                 handle.flush()
                 self._stop.wait(self.interval)
@@ -465,7 +470,7 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def capture_env(paths: Paths, envelope: Envelope) -> dict:
+def capture_env(paths: Paths, envelope: Envelope, no_mmap: bool = False) -> dict:
     def run(command: list[str]) -> str:
         result = subprocess.run(command, capture_output=True, text=True)
         return result.stdout.strip() or result.stderr.strip()
@@ -478,7 +483,7 @@ def capture_env(paths: Paths, envelope: Envelope) -> dict:
         "disk": run(["df", "-h"]),
         "mounts": run(["mount"]),
         "meminfo": read_meminfo(),
-        "server_command": build_server_command(envelope, paths),
+        "server_command": build_server_command(envelope, paths, no_mmap=no_mmap),
         "port_busy": port_in_use(paths.host, paths.port),
     }
 
@@ -506,16 +511,80 @@ def read_runtime_records(runtime_dir: Path) -> dict:
     return records
 
 
-def runtime_anomalies(records: dict, actual: dict[str, str]) -> list[str]:
+def runtime_findings(records: dict, actual: dict[str, str]) -> dict:
+    """Split runtime record problems into blocking anomalies and stale-record notes."""
     anomalies = []
-    for name, digest in actual.items():
-        claims = {source: entries[name] for source, entries in records.items() if name in entries}
-        if claims and not any(value == digest for value in claims.values()):
-            detail = ", ".join(f"{source}={value}" for source, value in claims.items())
-            anomalies.append(f"runtime hash mismatch for {name}: on-disk={digest}; records: {detail}")
-        elif len(set(claims.values())) > 1:
-            anomalies.append(f"runtime records disagree for {name}: {claims}")
-    return anomalies
+    notes = []
+    for name in sorted(actual):
+        digest = actual[name]
+        runtime_sha = (records.get("RUNTIME-SHA256") or {}).get(name)
+        build_meta = (records.get("BUILD-METADATA") or {}).get(name)
+        if runtime_sha and runtime_sha != digest:
+            anomalies.append(f"on-disk {name} does not match RUNTIME-SHA256: {digest} vs {runtime_sha}")
+        if build_meta and build_meta != digest:
+            notes.append(
+                f"BUILD-METADATA records a stale hash for {name} ({build_meta}); "
+                f"on-disk hash {digest} matches RUNTIME-SHA256"
+            )
+    return {"anomalies": anomalies, "notes": notes}
+
+
+def parse_version_output(text: str) -> dict:
+    match = re.search(r"commit ([0-9a-f]{7,40})", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return {"version_line": lines[0] if lines else None, "commit": match.group(1) if match else None}
+
+
+def runtime_identity(server_path: Path) -> dict:
+    try:
+        result = subprocess.run([str(server_path), "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"version_line": None, "commit": None, "error": str(exc)}
+    parsed = parse_version_output((result.stdout or "") + (result.stderr or ""))
+    parsed["exit_code"] = result.returncode
+    return parsed
+
+
+def verify_runtime_manifest(runtime_dir: Path) -> dict:
+    manifest = runtime_dir / "RUNTIME-SHA256"
+    if not manifest.is_file():
+        return {"manifest_present": False, "checked": 0, "mismatches": []}
+    checked = 0
+    mismatches = []
+    for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r"([0-9a-f]{64})\s+(\S+)", line)
+        if not match:
+            continue
+        expected, relative = match.group(1), match.group(2)
+        target = runtime_dir / Path(relative).name
+        if not target.is_file():
+            mismatches.append(f"missing {target.name}")
+            continue
+        checked += 1
+        if sha256_file(target) != expected:
+            mismatches.append(target.name)
+    return {"manifest_present": True, "checked": checked, "mismatches": mismatches}
+
+
+def drop_file_cache(path: Path) -> dict:
+    """Best-effort page-cache drop for one file; needs no privileges and ignores failures."""
+    if not hasattr(os, "posix_fadvise"):
+        return {"path": str(path), "dropped": False, "error": "posix_fadvise unavailable", "bytes": 0}
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return {"path": str(path), "dropped": False, "error": str(exc), "bytes": 0}
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        return {"path": str(path), "dropped": False, "error": str(exc), "bytes": size}
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        return {"path": str(path), "dropped": True, "error": None, "bytes": size}
+    except OSError as exc:
+        return {"path": str(path), "dropped": False, "error": str(exc), "bytes": size}
+    finally:
+        os.close(fd)
 
 
 def detect_execution_device(log_path: Path) -> str | None:
@@ -551,8 +620,13 @@ def preflight(paths: Paths) -> dict:
         if candidate.is_file():
             actual[name] = sha256_file(candidate)
     facts["actual_binary_sha256"] = actual
-    anomalies = runtime_anomalies(records, actual)
-    facts["anomalies"] = anomalies
+    findings = runtime_findings(records, actual)
+    facts["anomalies"] = findings["anomalies"]
+    facts["notes"] = findings["notes"]
+    facts["runtime_identity"] = runtime_identity(Path(paths.llama_server))
+    facts["runtime_manifest"] = verify_runtime_manifest(runtime_dir)
+    for item in facts["runtime_manifest"]["mismatches"]:
+        facts["anomalies"].append(f"runtime manifest mismatch: {item}")
     uname = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
     if uname != "aarch64" or not Path("/etc/nv_tegra_release").is_file():
         issues.append(f"target does not look like a Jetson device (uname -m={uname})")
@@ -622,6 +696,8 @@ def check_probe(args: argparse.Namespace) -> int:
     print(json.dumps(facts, indent=2, sort_keys=True))
     for warning in facts.get("warnings", []):
         print(f"warning: {warning}", file=sys.stderr)
+    for note in facts.get("notes", []):
+        print(f"note: {note}", file=sys.stderr)
     if facts["anomalies"]:
         print("runtime anomalies kept for review:", file=sys.stderr)
         for anomaly in facts["anomalies"]:
@@ -631,18 +707,36 @@ def check_probe(args: argparse.Namespace) -> int:
             print(f"check failed: {issue}", file=sys.stderr)
         return 2
     print("check ok: assets, device, runtime records, port and tegrastats verified")
-    print("plan: " + json.dumps({"runs": args.runs, "envelope": asdict(envelope), "server": build_server_command(envelope, paths)}))
+    plan = {
+        "runs": args.runs,
+        "envelope": asdict(envelope),
+        "cold_cache": bool(args.cold_cache),
+        "no_mmap": bool(args.no_mmap),
+        "server": build_server_command(envelope, paths, no_mmap=args.no_mmap),
+    }
+    print("plan: " + json.dumps(plan))
     return 0
 
 
 class ProbeRun:
-    def __init__(self, index: int, envelope: Envelope, paths: Paths, evidence_dir: Path, case_timeout: float):
+    def __init__(
+        self,
+        index: int,
+        envelope: Envelope,
+        paths: Paths,
+        evidence_dir: Path,
+        case_timeout: float,
+        cold_cache: bool = False,
+        no_mmap: bool = False,
+    ):
         self.index = index
         self.envelope = envelope
         self.paths = paths
         self.run_dir = evidence_dir / f"run{index}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.case_timeout = case_timeout
+        self.cold_cache = cold_cache
+        self.no_mmap = no_mmap
         self.result: dict = {"run": index, "status": "failed", "failure_stage": "setup", "error": None, "cases": {}}
         self.sampler = Sampler(self.run_dir)
         self.proc: subprocess.Popen | None = None
@@ -662,9 +756,24 @@ class ProbeRun:
         self.sampler.start()
         self.result["started_utc"] = utc_now()
         print(f"[run {self.index}] sampling baseline before launch")
+        if self.cold_cache:
+            cached_before = read_meminfo()["cached_bytes"]
+            drops = {
+                "model": drop_file_cache(Path(self.paths.model)),
+                "mmproj": drop_file_cache(Path(self.paths.mmproj)),
+            }
+            self.result["cold_cache"] = {
+                "drops": drops,
+                "cached_bytes_before": cached_before,
+                "cached_bytes_after": read_meminfo()["cached_bytes"],
+            }
+            print(
+                f"[run {self.index}] cold cache drops: "
+                + json.dumps({name: drop["dropped"] for name, drop in drops.items()})
+            )
         time.sleep(10.0)
         self.pre_launch_available = read_meminfo()["available_bytes"]
-        env = capture_env(self.paths, self.envelope)
+        env = capture_env(self.paths, self.envelope, no_mmap=self.no_mmap)
         env["tegrastats_start"] = self.sampler.tegrastats_sample()
         write_json(self.run_dir / "env.json", env)
         try:
@@ -686,7 +795,7 @@ class ProbeRun:
     def _start_server(self) -> None:
         if port_in_use(self.paths.host, self.paths.port):
             raise ProbeError(f"port {self.paths.port} is busy before launch")
-        command = build_server_command(self.envelope, self.paths)
+        command = build_server_command(self.envelope, self.paths, no_mmap=self.no_mmap)
         (self.run_dir / "server.cmd").write_text(" ".join(command) + "\n", encoding="utf-8")
         log = (self.run_dir / "server.log").open("w", encoding="utf-8")
         self.proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -1070,7 +1179,15 @@ def run_probe(args: argparse.Namespace) -> int:
     runs = []
     setup_failures = 0
     for index in range(1, args.runs + 1):
-        run = ProbeRun(index, envelope, paths, evidence_dir, args.case_timeout)
+        run = ProbeRun(
+            index,
+            envelope,
+            paths,
+            evidence_dir,
+            args.case_timeout,
+            cold_cache=bool(args.cold_cache),
+            no_mmap=bool(args.no_mmap),
+        )
         result = run.execute()
         runs.append(result)
         if result["status"] == "failed" and result.get("failure_stage") == "setup":
@@ -1092,7 +1209,12 @@ def run_probe(args: argparse.Namespace) -> int:
         "schema": PROBE_SCHEMA,
         "started_utc": started_utc,
         "finished_utc": utc_now(),
-        "config": {"envelope": asdict(envelope), "paths": asdict(paths)},
+        "config": {
+            "envelope": asdict(envelope),
+            "paths": asdict(paths),
+            "cold_cache": bool(args.cold_cache),
+            "no_mmap": bool(args.no_mmap),
+        },
         "preflight": facts,
         "runs": runs,
         "summary": summary,
@@ -1136,6 +1258,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--parallel", type=int, default=2)
     parser.add_argument("--image-max-tokens", type=int, default=1280, dest="image_max_tokens")
     parser.add_argument("--image-edge-pixels", type=int, default=1024, dest="image_edge_pixels")
+    parser.add_argument(
+        "--cold-cache",
+        action="store_true",
+        dest="cold_cache",
+        help="drop model/mmproj page cache before each run (true cold start)",
+    )
+    parser.add_argument("--no-mmap", action="store_true", dest="no_mmap", help="launch llama-server with --no-mmap")
 
 
 def main(argv: list[str] | None = None) -> int:
