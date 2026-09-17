@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 
 from .config import ConfigError, load_config
+from .migration_v2 import MissingInventory, MigrationError, migrate_v2
 from .storage_monitor import StorageMonitor
 
 
@@ -381,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
     collect_parser = sub.add_parser("collect"); collect_parser.add_argument("--output", required=True)
     migrate_parser = sub.add_parser("migrate"); migrate_parser.add_argument("--input", required=True); migrate_parser.add_argument("--output", required=True)
+    migrate_v2_parser = sub.add_parser("migrate-v2"); migrate_v2_parser.add_argument("--input", required=True); migrate_v2_parser.add_argument("--inventory", required=True); migrate_v2_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
@@ -389,8 +391,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(preflight(args.manifest), sort_keys=True))
         elif args.command == "collect":
             print(json.dumps(collect_facts(args.output), sort_keys=True))
+        elif args.command == "migrate-v2":
+            document = migrate_v2(args.input, args.inventory, args.output)
+            print(json.dumps({"ok": True, "output": args.output, "models": sorted(model["model_id"] for model in document["registration"]["models"])}, sort_keys=True))
         else:
             migrate(args.input, args.output)
+    except MissingInventory as exc:
+        print(json.dumps(exc.report, sort_keys=True))
+        return 2
+    except MigrationError as exc: print(f"migration error: {exc}", file=sys.stderr); return 2
     except DeployError as exc: print(f"deployment error: {exc}", file=sys.stderr); return 78
     return 0
 

@@ -449,12 +449,42 @@ terminal 必须有）、MemorySample 与 C02 `0..2s` freshness 边界、EventRec
 **Description:** 让check-config理解动态登记及运行策略；转换旧四ID，禁止隐式猜测runtime/hash/预算。
 **Files likely touched:** `model_scheduler/config.py`、`model_scheduler/migration_v2.py`（新增）、`model_scheduler/deploy.py`、`tests/test_config.py`、`tests/test_migration_v2.py`（新增）。
 **Acceptance criteria:**
-- [ ] 顶层v2必填schema_version、registration、server、scheduler、resources、storage、gateway、control、blobs；
+- [x] 顶层v2必填schema_version、registration、server、scheduler、resources、storage、gateway、control、blobs；
   仅额外允许顶层派生candidate_sha256（草案null，绑定候选后64hex）；registration复用v2登记解析器。
-- [ ] 保留旧scheduler/heat/thrash/preload/pinned值；新增C04/C07/C08字段有显式类型/默认；candidate回填字段按C09处理。
-- [ ] 新命令 `python -m model_scheduler.deploy migrate-v2 --input OLD --inventory INVENTORY --output NEW` 不覆盖OLD/已存在NEW；缺项exit2并输出missing字段JSON，不输出可启动的半成品。
-- [ ] 完整inventory产出配置并通过check-config；旧四ID不重命名，v1仍可检查，迁移不会静默取消pinned/preload。
+- [x] 保留旧scheduler/heat/thrash/preload/pinned值；新增C04/C07/C08字段有显式类型/默认；candidate回填字段按C09处理。
+- [x] 新命令 `python -m model_scheduler.deploy migrate-v2 --input OLD --inventory INVENTORY --output NEW` 不覆盖OLD/已存在NEW；缺项exit2并输出missing字段JSON，不输出可启动的半成品。
+- [x] 完整inventory产出配置并通过check-config；旧四ID不重命名，v1仍可检查，迁移不会静默取消pinned/preload。
 **Verification:** `python -m pytest tests/test_config.py tests/test_migration_v2.py -q`；对临时v1 fixture完整/缺项迁移并 `python run.py --config NEW --check-config`。
+**本轮执行记录（2026-09-17）:** status=software_only；起点 commit `8d4edcd`；python=3.12.11
+（`/Users/monster/.local/share/selfmodelswitch/venv312`）；
+`pytest tests/test_config.py tests/test_migration_v2.py -q` = 41 passed（实现前 `AppConfigV2` 与 `migration_v2`
+均不存在，两个测试文件收集即失败）；`pytest tests -m 'not thor' -q` = 331 passed, 1 deselected（P03 基线 299）；
+`ruff check .` exit 0；`run.py --check-config` 仍输出 `schema_version=1` 与旧四 ID，v1 运行行为未变。
+`config.py` 新增 `AppConfigV2`：`registration` 直接交由 `contracts_v2.parse_deployment` 解析（未知 profile、
+重复 port、资产基数和未测组合仍由登记解析器裁决），模型 port 不得复用 server port，`scheduler.pinned_models`
+必须是 `preload_models` 子集且均已登记；C04 会话、C08 控制与 C07 传输各有显式类型/范围/默认（会话默认值取自
+`contracts_v2.SESSION_LIMITS`，`hard_timeout_seconds` 默认 3600s），`control.allowed_uids` 与 `blobs.root`
+不给默认——分别属身份与站点决策，`resources.model_budget_bytes` 同样必须显式；新增 `config_digest()`
+以规范 JSON 计算且排除顶层派生 `candidate_sha256`，满足 C09 回填无环，并拒绝非 JSON 原生值与非有限数。
+`load_config` 从此按 `schema_version` 分派，python 侧保持 `AppConfig`/`v1` 路径零改动，`run.py --check-config`
+对 v1/v2 均可用（v2 打印 `schema_version=2` 与动态模型集合）。
+新增 `migration_v2.py` 与 `python -m model_scheduler.deploy migrate-v2`：只有 v1 输入可迁移，输出已存在即拒绝；
+runtime/profile/镜像/adapter/lock/argv、逐文件 asset size/hash、envelope、timeout、是否实测及其测量材料、
+`resources.model_budget_bytes`、`control.allowed_uids`、`blobs.root` 全部来自 inventory，缺一项即 exit 2 并输出
+`{"missing": [...], "conflicts": [...]}` JSON 且不落盘；asset path/sha256 与 v1 的 file/sha256 不一致，或
+`envelope.max_parallel` 与 v1 `max_concurrency` 不一致，或 inventory 声明 v1 不存在的模型，均为 conflicts；
+派生且确定的只有 model_id、capability、port（来自 v1 upstream_url）和 `reserved_bytes`（对 v1 原始值按
+`effective_reserved_bytes` 乘一次 `resource_safety_margin`），pinned/preload 原样进入
+`scheduler.pinned_models/preload_models`，不在两者之一则视为静默取消。
+真实端到端核对：以仓库 `config.yaml` 的临时副本为 v1 fixture，`migrate-v2` 产出同名四 ID 的 v2 配置，
+`python run.py --config NEW --check-config` exit 0 且 `schema_version=2`；同一 v1 副本 `--check-config` 仍 exit 0；
+缺项 inventory（删 `models.qwen-large.timeout_seconds`、`resources.model_budget_bytes`、`blobs.root` 并篡改
+asset sha256）返回 exit 2、报告四项 missing/conflicts 且未生成输出文件；重复输出到同一路径返回 exit 2。
+**Files touched:** `model_scheduler/config.py`、`model_scheduler/migration_v2.py`（新增）、
+`model_scheduler/deploy.py`、`tests/test_config.py`、`tests/test_migration_v2.py`（新增）。
+未解决：per-model v1 `priority`/`ttl_seconds` 未带入 v2（v3 的整形 priority 为服务端 owner 配置，属 C04/P09 范围），
+迁移前后并发语义只由 `envelope.max_parallel` 保证；产物为草案配置，`candidate_sha256=null`，未绑定任何候选，
+也不构成任何硬件或 B/O 证据。
 
 ### P05 — 多资产及挂载身份核验（M02）
 
