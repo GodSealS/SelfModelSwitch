@@ -1,10 +1,15 @@
 """Safe Docker argv construction for manifest-managed model containers."""
 from __future__ import annotations
 
+import os
 import re
 import signal
 import subprocess
+import time
 from typing import Any, Callable, Mapping
+
+from .control_protocol_v1 import Fence
+from .ports_v3 import LaunchOperation
 
 
 class RunnerError(ValueError):
@@ -35,6 +40,108 @@ def run_child_with_signal_forwarding(
     finally:
         for signum, handler in previous.items():
             set_handler(signum, handler)
+
+
+class SupervisedLaunch:
+    """One supervised launcher child whose state is an observable LaunchOperation.
+
+    The operation stays `starting` until the launcher process itself exits: an
+    elapsed timeout never makes it terminal, so `stopped_is_proven` cannot be
+    satisfied while the launcher is still running (plan/08-execution-plan.md C03).
+    """
+
+    def __init__(
+        self,
+        argv: list[str],
+        fence: Fence,
+        *,
+        popen: Callable[..., Any] = subprocess.Popen,
+        monotonic: Callable[[], float] = time.monotonic,
+        start_new_session: bool = True,
+        getpgid: Callable[[int], int] = os.getpgid,
+        killpg: Callable[[int, int], Any] = os.killpg,
+    ) -> None:
+        if not isinstance(fence, Fence):
+            raise RunnerError("a supervised launch requires a fence")
+        self._argv = list(argv)
+        self._fence = fence
+        self._popen = popen
+        self._monotonic = monotonic
+        self._start_new_session = start_new_session
+        self._getpgid = getpgid
+        self._killpg = killpg
+        self._child: Any = None
+        self._operation: LaunchOperation | None = None
+
+    @property
+    def operation(self) -> LaunchOperation:
+        if self._operation is None:
+            raise RunnerError("the supervised launch is not started")
+        return self._operation
+
+    def start(self) -> LaunchOperation:
+        """Start the launcher once and record pid, process group and fence."""
+        if self._child is not None:
+            raise RunnerError("the supervised launch is already started")
+        try:
+            child = self._popen(self._argv, start_new_session=self._start_new_session)
+        except OSError as exc:
+            raise RunnerError(f"cannot start the supervised launcher: {exc}") from exc
+        pid = getattr(child, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+            raise RunnerError("the supervised launcher reported no process id")
+        self._child = child
+        process_group_id = pid if self._start_new_session else self._query_process_group(pid)
+        self._operation = LaunchOperation(
+            operation_id=self._fence.operation_id,
+            fence=self._fence,
+            started_at_monotonic=self._monotonic(),
+            state="starting",
+            pid=pid,
+            process_group_id=process_group_id,
+        )
+        return self._operation
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        """Wait for the launcher; a timeout returns None and proves nothing."""
+        if self._child is None:
+            raise RunnerError("the supervised launch is not started")
+        try:
+            exit_code = self._child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise RunnerError("the supervised launcher reported no exit code")
+        if not self.operation.is_terminal:
+            self._operation = LaunchOperation(
+                operation_id=self._fence.operation_id,
+                fence=self._fence,
+                started_at_monotonic=self.operation.started_at_monotonic,
+                state="completed" if exit_code == 0 else "failed",
+                pid=self.operation.pid,
+                process_group_id=self.operation.process_group_id,
+                terminal_at_monotonic=self._monotonic(),
+            )
+        return exit_code
+
+    def signal_group(self, signum: int) -> None:
+        """Signal the recorded process group so a launcher cannot leave children behind."""
+        operation = self.operation
+        if operation.process_group_id is None:
+            raise RunnerError("the supervised launch has no process group to signal")
+        try:
+            self._killpg(operation.process_group_id, signum)
+        except OSError as exc:
+            raise RunnerError(f"cannot signal the launch process group: {exc}") from exc
+
+    def terminate(self) -> None:
+        self.signal_group(signal.SIGTERM)
+
+    def _query_process_group(self, pid: int) -> int | None:
+        try:
+            return self._getpgid(pid)
+        except OSError:
+            return None
 
 
 def require_storage_ready(storage: Any, models: Mapping[str, Any]) -> None:
