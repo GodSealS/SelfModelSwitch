@@ -334,6 +334,7 @@ def _render(
     config_sha256="d" * 64,
     mode="production",
     temporary_budget_bytes=None,
+    container_runtime="nvidia",
 ):
     return render_container_launch(
         _registration(
@@ -345,6 +346,7 @@ def _render(
         config_sha256=config_sha256,
         mode=mode,
         temporary_budget_bytes=temporary_budget_bytes,
+        container_runtime=container_runtime,
     )
 
 
@@ -370,6 +372,10 @@ def test_profile_render_reproduces_the_m00_server_arguments() -> None:
     assert M00_IMAGE in launch.argv
     # The M00 runtime has no --no-mmap; the profile fixes --load-mode auto instead.
     assert "--no-mmap" not in launch.argv
+    # Docker 29 on the target rejects --gpus for the NVIDIA hook runtime, so the
+    # deployment names the GPU-capable container runtime instead.
+    assert "--runtime=nvidia" in launch.argv
+    assert "--gpus" not in launch.argv
 
 
 def test_profile_render_keeps_the_registered_port_and_read_only_assets() -> None:
@@ -471,6 +477,7 @@ def test_profile_render_refuses_a_registration_only_profile() -> None:
             model_directory=MODEL_DIRECTORY,
             config_sha256="d" * 64,
             mode="lab",
+            container_runtime="nvidia",
             temporary_budget_bytes=16_000_000_000,
         )
 
@@ -486,6 +493,21 @@ def test_profile_render_refuses_unsafe_model_directories_and_bad_identity() -> N
         _render(deployment_id="Lab Orin")
     with pytest.raises(LaunchRenderError, match="config"):
         _render(config_sha256="not-a-digest")
+
+
+def test_profile_render_requires_a_deployment_container_runtime() -> None:
+    launch = _render(container_runtime="nvidia")
+    assert launch.container_runtime == "nvidia"
+    assert "--runtime=nvidia" in launch.argv
+
+    with pytest.raises(LaunchRenderError, match="container runtime"):
+        _render(container_runtime=None)
+    with pytest.raises(LaunchRenderError, match="container runtime"):
+        _render(container_runtime="")
+    with pytest.raises(LaunchRenderError, match="container runtime"):
+        _render(container_runtime="Nvidia Runtime")
+    with pytest.raises(LaunchRenderError, match="container runtime"):
+        _render(container_runtime="--gpus all")
 
 
 def test_profile_render_uses_the_runtime_the_model_is_bound_to() -> None:

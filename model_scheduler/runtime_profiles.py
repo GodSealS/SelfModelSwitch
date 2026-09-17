@@ -12,6 +12,10 @@ One registered runtime profile owns the argv vocabulary of its launches:
 * the only bind mount is the verified model directory, read-only, at
   `/models`; arbitrary entrypoints, volumes, `--privileged` and the Docker
   socket are impossible because the renderer builds every token itself;
+* the GPU-capable container runtime is a deployment input rendered as
+  `--runtime=<name>`: the target's Docker 29 with the NVIDIA hook runtime
+  rejects `--gpus` outright ("invoking the NVIDIA Container Runtime Hook
+  directly ... is not supported"), so no renderer may hardcode it;
 * the loopback port comes from the registered model, never from a fixed
   four-model table, and the deployment/model/runtime/profile/mode labels keep
   two runtime identities from ever sharing one container identity;
@@ -48,6 +52,7 @@ LAUNCH_MODES = (LAB, PRODUCTION)
 
 _DEPLOYMENT_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_CONTAINER_RUNTIME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
 
 
 class LaunchRenderError(ValueError):
@@ -131,6 +136,7 @@ class ContainerLaunch:
     mode: str
     config_sha256: str
     model_directory: str
+    container_runtime: str
 
     @property
     def is_lab(self) -> bool:
@@ -145,6 +151,7 @@ def render_container_launch(
     model_directory: str | Path,
     config_sha256: str,
     mode: str,
+    container_runtime: str,
     temporary_budget_bytes: int | None = None,
 ) -> ContainerLaunch:
     """Render the exact argv for one registered model, or refuse to launch it."""
@@ -159,6 +166,7 @@ def render_container_launch(
     deployment = _deployment_id(deployment_id)
     digest = _config_sha256(config_sha256)
     directory = _model_directory(model_directory)
+    gpu_runtime = _container_runtime(container_runtime)
     model, runtime = _lookup(registration, model_id)
     try:
         profile = require_startable_profile(runtime)
@@ -194,7 +202,7 @@ def render_container_launch(
         "--init",
         "--rm",
         "--restart=no",
-        "--gpus", "all",
+        f"--runtime={gpu_runtime}",
         *label_args,
         "--publish", f"127.0.0.1:{model.port}:{CONTAINER_SERVER_PORT}",
         "--mount", mount,
@@ -217,6 +225,7 @@ def render_container_launch(
         mode=mode,
         config_sha256=digest,
         model_directory=directory,
+        container_runtime=gpu_runtime,
     )
 
 
@@ -310,6 +319,15 @@ def _config_sha256(value: Any) -> str:
     return value
 
 
+def _container_runtime(value: Any) -> str:
+    """The GPU-capable Docker runtime name, a required deployment input."""
+    if not isinstance(value, str) or not _CONTAINER_RUNTIME_RE.fullmatch(value):
+        raise LaunchRenderError(
+            f"container runtime {value!r} is not a registered Docker runtime name"
+        )
+    return value
+
+
 def _model_directory(value: Any) -> str:
     if not isinstance(value, (str, Path)):
         raise LaunchRenderError("the model directory must be an absolute host path")
@@ -342,6 +360,8 @@ def _assert_no_host_escape(argv: tuple[str, ...], mount: str) -> None:
     """Structural re-check: no entrypoint, no extra mount, never the Docker socket."""
     if "--entrypoint" in argv or "--privileged" in argv:
         raise LaunchRenderError("a launch must not override the entrypoint or run privileged")
+    if any(token == "--gpus" or token.startswith("--gpus=") for token in argv):
+        raise LaunchRenderError("a launch selects the GPU through its deployment runtime, not --gpus")
     mounts = [argv[index + 1] for index, token in enumerate(argv) if token == "--mount"]
     if mounts != [mount]:
         raise LaunchRenderError("a launch mounts exactly the verified read-only model directory")
