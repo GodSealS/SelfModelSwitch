@@ -14,7 +14,7 @@ executor 通过正式API施加动作，collector 采集真实实例/资源/事�
 不能直接改registry制造结果，不能把手填passed、GPU布尔或summary数字当依据。
 候选摘要覆盖04列明的模型服务范围；每个注册模型、每项能力必须有对应fixture和evaluator，缺映射拒绝候选。
 每个场景恰有一个最终结论；历史失败保留，not_run/skipped/unknown/failed均不通过。
-新报告schema v3具体字段在M01建立，不直接使用归档的混合Candidate/AcceptanceReport。
+新报告schema v3由M01/P03固定在 `model_scheduler/evidence_contracts.py`（严格解析、必测集合唯一映射、失败attempt保留、无summary字段），不直接使用归档的混合Candidate/AcceptanceReport。
 
 原始包关联candidate、run/case/attempt、实际设备、代码/collector/evaluator版本、boot/generation/实例身份。
 材料逐文件bytes/hash及相对路径；拒绝symlink、路径逃逸、缺失材料、hash错配、重复/未知场景。
@@ -39,6 +39,10 @@ executor 通过正式API施加动作，collector 采集真实实例/资源/事�
 | O04 | 服务重启/残留实例、旧token拒绝、清理后准入、无自动推理重放 |
 | O05 | 正确及篡改candidate/证据/资产/设备的preflight，错配在加载前拒绝 |
 | O06 | graceful shutdown、日志容量/脱敏、配置/证据/暂存元数据备份恢复和回滚 |
+
+case id 语法（P03 固定）：`S01`—`S06`、`O01`—`O06`、`B:<model_id>:<load|infer|envelope|cancel|stop|reload>`、
+`B:<model_id>:cap:<chat|vision|embeddings|rerank>`。必测集合从候选登记集合派生；报告对每个case恰映射一个存在的最终attempt，
+失败attempt永久保留且可追溯，缺case、未知case、重复最终结论、伪造summary一律拒绝。结构合法不等于passed：判定只来自evaluator对原始材料的重算。
 
 S可用可控fake/event/时钟；B/O须真实目标设备，不用mock代替。维护故障只影响本deployment，不制造整机OOM或破坏其他磁盘/容器。
 模型infer成功只说明能力运行及基本输出契约成立，不声称转写/人脸/声纹/视频质量达标。
