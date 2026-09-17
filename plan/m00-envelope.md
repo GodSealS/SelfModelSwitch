@@ -1,6 +1,6 @@
 # M00 首个候选最大输入与并发规格 v0.1
 
-状态：规格已执行 3 轮探测并通过（见第 9 节实测回填）；M00 整体裁定见第 9 节遗留项。
+状态：3 轮真冷启动探测通过（第 9 节）；runtime 记录、冷启动与内存口径均已裁定。
 日期：2026-09-17。配套工具：`scripts/m00_envelope_probe.py`（见第 6 节）。
 
 ## 1. 范围
@@ -65,6 +65,7 @@ projector 资产此前缺失的说法不成立：文件已在设备上且与本�
 
 每轮冷启动（容器/进程从未运行状态开始）执行 E0→E1→E2→E3，随后停止并确认静止；
 共 3 轮独立冷启动。E1 用 `cache_prompt=false` 保证全量 prompt 计算。
+加 `--cold-cache` 时每轮丢弃模型与 mmproj 的页缓存，得到真冷介质加载基线（见 9）。
 
 ## 5. 测量、证据与判定
 
@@ -80,9 +81,14 @@ projector 资产此前缺失的说法不成立：文件已在设备上且与本�
 harness 为纯标准库 Python（目标机 Python 3.10），不启动生产服务、不写模型盘、不下载资产：
 
 ```bash
-python3 scripts/m00_envelope_probe.py check   # 校验资产 hash、设备身份、runtime、端口、打印计划
-python3 scripts/m00_envelope_probe.py run --runs 3
+python3 scripts/m00_envelope_probe.py check                              # 资产 hash、设备、runtime、端口、计划
+python3 scripts/m00_envelope_probe.py run --runs 3                       # 默认加载模式，3 轮
+python3 scripts/m00_envelope_probe.py run --runs 3 --cold-cache           # 真冷启动（丢弃模型页缓存）
+python3 scripts/m00_envelope_probe.py run --runs 1 --load-mode none       # 非 mmap 加载对比
 ```
+
+`--cold-cache` 在每轮发射前对模型与 mmproj 执行 `POSIX_FADV_DONTNEED`（无需特权）；
+`--load-mode` 把加载方式透传给 runtime（该运行时无 `--no-mmap`）。
 
 按 AGENTS.md 流程：本地提交 → 目标机 `git pull --ff-only` 到同一 commit → 目标机运行 → 证据回传评审。
 
@@ -97,28 +103,61 @@ python3 scripts/m00_envelope_probe.py run --runs 3
 探测通过后，本文件第 3 节数字加上实测 `measured_peak`、R、加载/推理耗时成为
 M01/M02 模型登记 envelope 与 `reserved_bytes` 的输入；未通过前不得用于配置或验收声明。
 
-## 9. 实测回填（2026-09-17，探测 2）
+## 9. 实测回填（2026-09-17）
 
-证据：`/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T052121Z`
-（commit `1b87d35`，3 轮独立冷启动，result=passed，3/3 quiescent）。
+三轮真冷启动（`--cold-cache`，每轮发射前丢弃模型页缓存）证据：
+`/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T055502Z`
+（commit `cbefb5b`，result=passed，3/3 quiescent）。
 
 | 项目 | 实测 | 备注 |
 |---|---|---|
-| E1 文本最大 | prompt 28672 精确、输出 4096 满额 | prompt 约 821 t/s、生成约 20.8 t/s、单请求 232 s |
+| E1 文本最大 | prompt 28672 精确、输出 4096 满额（3/3） | prompt 约 821 t/s、生成约 20.7–20.8 t/s、单请求 232 s |
 | E2 图像 | 视觉 1227 token（≤1280） | 1024×1024 输入，`--image-max-tokens 1280` 生效 |
 | E3 并发组合 | 2×（28672 prompt + 4096 输出），发送偏差 ≤0.9 ms | prompt 657–715 t/s、生成 15.0–17.1 t/s |
-| 内存 | delta 4.87–4.90 GiB（gaps=0，前后基线差 ≤18 MB） | measured_peak=5263122432 B；R=ceil(peak×1.15)=6052590797 B |
+| 内存（MemAvailable） | delta 4.87–4.94 GiB，gaps=0，前后基线差 ≤20 MB | measured_peak=5309693952 B；R=ceil(peak×1.15)=6106148045 B |
+| 内存（tegrastats RAM） | 峰值−基线 4.83–4.87 GiB | 与 MemAvailable 口径交叉一致 |
+| 加载 | 冷启动 18.07 s（3/3，±0.01 s）；页缓存热 5.02 s | 冷启动前 Cached 9.58→3.96 GiB |
 | 停止 | 3/3 quiescent | exit 0、端口释放、内存回收、无残留 PID |
 | 执行设备 | CUDA0 | CUDA 库映射 + GR3D 峰值 99% + `--n-gpu-layers 99` |
-| 加载 | 5.02 s（页缓存热） | 见遗留项 |
 
-遗留与裁定项（M00 完成前处理）：
+### 9.1 runtime 记录裁定（已完成）
 
-- runtime 记录不一致：现场 llama-server 实际 hash 与 `RUNTIME-SHA256` 一致（`65a23c6e…`），
-  `BUILD-METADATA` 记 `2a7131bb…`（llama-cli 同理）。建议以 `RUNTIME-SHA256` 与现场为准，
-  M01 定契约前确认。
-- 5.02 s 加载为页缓存热读数；真冷介质启动基线未测（需 `drop_caches` 或重启后复测），不阻塞 envelope 结论。
-- 内存 delta 主要反映 2×32768 KV（f16）与计算缓冲；mmap 权重页进入可回收缓存、不计入 delta。
-  M01/M02 登记 `reserved_bytes` 时按 R=5.64 GiB，或按非 mmap 模式复测后调整。
-- 首轮 not_passed 证据（前次 harness 缺陷）保留于
-  `/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T045919Z`，不计入结论。
+- 现场二进制与 `RUNTIME-SHA256` 一致：llama-server `65a23c6e…`、llama-cli `ae6ab171…`；
+  `BUILD-METADATA` 记 `2a7131bb…`/`4b9cefe0…`，其时间戳 09:13:04 早于二进制替换 09:14:50。
+- `llama-server --version` 与 `llama-cli --version` 均为 `0.4.1-dev (build 1, commit 4bc272f)`；
+  probe checkout HEAD 同为 `4bc272f…`；`sha256sum -c RUNTIME-SHA256` 11/11 通过。
+- 结论：以现场 + `RUNTIME-SHA256` 为生效记录，`BUILD-METADATA` 为陈旧快照。
+  harness 已自动分类：阻塞异常为空，陈旧记录进入 `notes`。
+
+### 9.2 加载模式与内存账本
+
+- 该运行时用 `--load-mode auto|none|mmap|mlock|mmap+mlock|dio` 控制加载，**不存在 `--no-mmap`**；
+  M02 启动参数与 preflight 必须按此实现。
+- 对比测量 `--load-mode none`（单轮，result=passed）：
+  `/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T063212Z`，
+  measured_peak=5228285952 B，与 mmap 模式差异 <1.5%。
+- 账本分解：MemAvailable 增量 ≈ KV（2×32768 f16 ≈ 3.5 GiB）+ 计算/视觉缓冲 ≈ 1.4 GiB；
+  权重 5.36 GiB 与 mmproj 1.26 GiB 无论 mmap 与否都不产生额外净下降（已在基线中或被算作可回收）。
+- 给 M01/M02 的登记口径：`reserved_bytes` 按 R=6106148045 B（≈5.69 GiB）服务于 MemAvailable 准入；
+  另需登记常驻总量（权重+mmproj+增量 ≈ 10.5 GiB）用于物理内存与多模型共存核算。
+- 加载预算：真冷介质首次加载 18.1 s，页缓存热 5.0 s。`--load-mode mlock` 未测（memlock 上限 7.67 GiB，可行但未验证）。
+
+### 9.3 保留的失败证据（不计入结论）
+
+| 目录 | 原因 |
+|---|---|
+| `…-20260917T045919Z` | harness 缺陷：`/completion` 字段名、EOS 早停、停止窗口时序 |
+| `…-20260917T062554Z` | 使用 `--no-mmap`：该运行时为无效参数；改 `--load-mode` 后通过 |
+
+## 10. M00 验收对照
+
+| 05-tasks M00 验收项 | 结果 | 证据 |
+|---|---|---|
+| 最小推理 | 通过 | `…-20260917T011746Z`（`probe-ok`、exit 0、compute_quiescent=true） |
+| 最大 envelope 输入 | 通过 | 第 9 节，3 轮真冷启动 E1/E2/E3 全达标 |
+| 峰值/耗时 | 通过 | delta 4.87–4.94 GiB、R=6106148045 B；prompt 821 t/s、生成 20.8 t/s、并发 15.0–17.1 t/s、冷加载 18.07 s |
+| 执行设备 | 通过 | CUDA0（CUDA 库映射 + GR3D 峰值 99% + `--n-gpu-layers 99`） |
+| 停止证据 | 通过 | 3/3 quiescent（exit 0、端口释放、内存回收、无残留 PID） |
+
+M00 五项验收均有目标设备真实证据且 runtime 身份已裁定，可标记 M00 完成。
+M01/M02 的登记输入见第 8 与 9.2 节；本轮不进入 M01 实施。
