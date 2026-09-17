@@ -485,6 +485,12 @@ asset sha256）返回 exit 2、报告四项 missing/conflicts 且未生成输出
 未解决：per-model v1 `priority`/`ttl_seconds` 未带入 v2（v3 的整形 priority 为服务端 owner 配置，属 C04/P09 范围），
 迁移前后并发语义只由 `envelope.max_parallel` 保证；产物为草案配置，`candidate_sha256=null`，未绑定任何候选，
 也不构成任何硬件或 B/O 证据。
+**同步状态（2026-09-17）:** 本地提交 `cea36ca`（作者/远端核对：`origin` 仍为
+`https://github.com/GodSealS/SelfModelSwitch.git`）在本环境无法推送：`git push` 报
+`fatal: could not read Username for 'https://github.com': Device not configured`，`credential.helper=osxkeychain`
+在此 shell 不可达且不能交互输入凭据。按 [AGENTS.md](../AGENTS.md) 标 **待同步**：该提交尚未发布到共享远端，
+目标 clean checkout 未 fast-forward 到同一 SHA，因此本次结论为 `software_only`，不能作为最终交付或 M02 完成依据；
+待凭据可用后重新执行 §1.3 第 4—5 步的推送与干净 checkout 同步，不得改用其他远端路径、金钥或向目标复制 tracked 文件绕过。
 
 ### P05 — 多资产及挂载身份核验（M02）
 
