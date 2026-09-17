@@ -400,11 +400,22 @@ M00 通过轮 run1—run3 均 `quiescent=true`，模型资产与 runtime 自校�
 **Description:** 以C03—C06消除现有测试草稿对应实现缺失，导出可供独立客户端使用的schema。
 **Files likely touched:** `model_scheduler/control_protocol_v1.py`（新增）、`tests/test_control_protocol_v1.py`、`schemas/control-v1.json`（新增）、`plan/03-api.md`。
 **Acceptance criteria:**
-- [ ] parser/schema状态、字段、字节限制、版本、错误码一致；succeeded无result/不静止/缺Fence全部拒绝。
-- [ ] queued取消用not_started证据合法；不得要求伪造未创建的container；扩展草稿中缺失字段测试。
-- [ ] inline/blob互斥、parameters能力白名单、所有int/bool/NaN/未知字段正反例完备；schema生成可重现。
+- [x] parser/schema状态、字段、字节限制、版本、错误码一致；succeeded无result/不静止/缺Fence全部拒绝。
+- [x] queued取消用not_started证据合法；不得要求伪造未创建的container；扩展草稿中缺失字段测试。
+- [x] inline/blob互斥、parameters能力白名单、所有int/bool/NaN/未知字段正反例完备；schema生成可重现。
   新命令 `python -m model_scheduler.control_protocol_v1 export-schema --output schemas/control-v1.json` 只从DTO生成；测试重导出并按字节比较。
 **Verification:** `python -m pytest tests/test_control_protocol_v1.py tests/test_contracts_v2.py -q`；全tests收集不再ImportError。到K0。
+**本轮执行记录（2026-09-17）:** status=complete；起点 commit `5a8e2d9`（GitHub 推送记录）；
+实现提交 `c17eb7b`；python=3.12.11（`/Users/monster/.local/share/selfmodelswitch/venv312`）；
+`pytest tests/test_control_protocol_v1.py -q` = 31 passed（草稿期 3 项因缺少新必填字段失败，扩展后全覆盖）；
+`pytest tests/test_control_protocol_v1.py tests/test_contracts_v2.py -q` = 66 passed；
+`pytest tests -m 'not thor' -q` = 271 passed, 1 deselected（不再需要 ignore，K0 达成）；`ruff check .` exit 0；
+`run.py --check-config` 仍为旧四 ID，v1 运行行为未变。
+新增 `model_scheduler/control_protocol_v1.py`（严格 DTO、错误表、每能力参数闭集、schema 导出）与 `schemas/control-v1.json`
+（16969 B，测试重导出按字节比较）；测试覆盖 terminal 证据（result/error/quiescent/必填 fence、fence 必须指向该 execution）、
+dispatch/instance 配对（not_started 不得携带容器身份）、会话视图全字段与 owner_token 恰在 closed 为 null、
+参数范围与非有限/bool 拒绝、字节与 UTF-8/NUL 限制、24 码错误表逐项一致。
+`plan/03-api.md` 新增 §5 并标注 §2 的已固定部分。HTTP 路由、身份接线与 Blob 存储仍待 M04；本任务不产生硬件证据。
 
 ### P03 — 固定内部端口与candidate/report结构（M01）
 
