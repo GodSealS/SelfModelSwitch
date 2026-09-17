@@ -638,9 +638,35 @@ unload 的 request/status/content-type/body 与实例证据；③ 按原始材�
   \+ 宿主 glibc/libstdc++/openssl/libgomp（路径按 `ldd` 的 NEEDED 布局 `/lib/aarch64-linux-gnu/…`，含 `/lib/ld-linux-aarch64.so.1`），
   `ENTRYPOINT ["/opt/llama-cpp/llama-server"]`，`--network=none` 构建；冒烟项为 `--version`、`--gpus all --list-devices`、
   只读挂载 `/media/jtzn/sandisk-ext4/models` 后被指向 `/models/<缺失文件>` 的报错。构建上下文与命令已定稿，
-  但目标侧构建命令本轮两次因**交互审批超时被取消**（`Execution Cancelled: permission request timed out`），因此
-  **image digest 尚未产生**，P06a 探测 manifest 与 P06b lab 仍缺该输入；恢复动作 = 用户批准目标侧 `docker build` 命令（或改为
-  在受控维护窗口内由用户执行同一命令）。
+  但目标侧构建命令本轮三次因**交互审批超时被取消**（`Execution Cancelled: permission request timed out`），因此
+  **image digest 尚未产生**，P06a 探测 manifest 与 P06b lab 仍缺该输入。目标 checkout 已同步到 `397a401`。
+  可复现命令（在目标上执行，全部写入 `/home/jtzn/` 下，无 sudo、无网络）：
+
+  ```bash
+  R=/opt/self-model-switch/probes/llama.cpp-4bc272fd729bd094c0422e4b8353da8d2fec91f8
+  B=/home/jtzn/self-model-switch-build/runtime-image-4bc272f-v1
+  mkdir -p "$B/rootfs/opt/llama-cpp" "$B/rootfs/lib/aarch64-linux-gnu" \
+           "$B/rootfs/usr/lib/aarch64-linux-gnu" "$B/rootfs/usr/local/cuda/targets/aarch64-linux/lib" "$B/rootfs/tmp"
+  sha256sum -c "$R/RUNTIME-SHA256"                      # 必须全部 OK
+  cp -a "$R/." "$B/rootfs/opt/llama-cpp/"
+  rm -f "$B/rootfs/opt/llama-cpp/RUNTIME-SHA256" "$B/rootfs/opt/llama-cpp/BUILD-METADATA"
+  for f in libc.so.6 libm.so.6 libstdc++.so.6.0.30 libgcc_s.so.1 libssl.so.3 libcrypto.so.3 \
+           libgomp.so.1.0.0 libdl.so.2 libpthread.so.0 librt.so.1; do
+    cp -a "/usr/lib/aarch64-linux-gnu/$f" "$B/rootfs/lib/aarch64-linux-gnu/$f"; done
+  cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 "$B/rootfs/lib/ld-linux-aarch64.so.1"
+  ln -sf libstdc++.so.6.0.30 "$B/rootfs/lib/aarch64-linux-gnu/libstdc++.so.6"
+  ln -sf libgomp.so.1.0.0 "$B/rootfs/lib/aarch64-linux-gnu/libgomp.so.1"
+  printf 'FROM scratch\nCOPY rootfs/ /\nENV LD_LIBRARY_PATH=/opt/llama-cpp\nENTRYPOINT ["/opt/llama-cpp/llama-server"]\n' > "$B/Dockerfile"
+  docker build --network=none -t sms-llama-cpp:4bc272f "$B"
+  docker inspect --format '{{.Id}}' sms-llama-cpp:4bc272f      # 记录 image digest
+  docker run --rm sms-llama-cpp:4bc272f --version
+  docker run --rm --gpus all sms-llama-cpp:4bc272f --list-devices
+  docker run --rm --gpus all --mount type=bind,src=/media/jtzn/sandisk-ext4/models,dst=/models,readonly \
+    sms-llama-cpp:4bc272f --model /models/does-not-exist.gguf  # 证明只读挂载可见
+  ```
+
+  镜像内容必须同时满足：`RUNTIME-SHA256` 中的每一项逐项通过，且 runtime 目录内不存在未列入该清单的常规文件；
+  `--version`、`--gpus all --list-devices`、只读模型挂载三项冒烟全部通过后才可把 digest 作为 P06a 探测/P06b lab 的输入。
 - **llama-swap 发行物：本环境无法取得**。开发机与目标均无 HTTPS 出口（`curl https://github.com` / release 下载均超时；
   GitHub 不通过 SSH 提供 release 资产），两机本地与 Spotlight 缓存内均无 `llama-swap_217_linux_arm64.tar.gz`，目标无 Go 无法自建。
   恢复动作：由仓库所有者提供该固定发行物（例如放至开发机 `~/Downloads/llama-swap_217_linux_arm64.tar.gz`），
