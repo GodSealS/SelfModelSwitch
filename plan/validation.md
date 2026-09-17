@@ -227,3 +227,30 @@ M00 材料完整、hash 与 3 轮停止记录均可复核，本轮**没有**缺�
 
 本记录的命令 exit code 2 是 08-execution-plan §1.2 已预期的草稿收集失败，不是 P00 未通过；
 P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 生产文件。
+
+## GitHub 基线推送记录（2026-09-17，闭合 P00 §7 第 5 项）
+
+范围：只推送既有已提交历史，不修改任何 tracked 生产文件、不新建任务实现；本条记录为唯一新增内容。
+
+### 1. 推送范围与内容审查
+
+| 项 | 值 |
+|---|---|
+| 推送前 `origin/main` | `cbefb5b` |
+| 推送后 `origin/main` | `c99e2ca83a66841585405f59d63a2206678ffdeb`（与本地 HEAD 相同） |
+| 提交数 | 10（`cbefb5b..c99e2ca`：P00 基线、M01/P01 契约实现与 plan 文档集） |
+| 内容审查 | 43 文件、+7467/−37；无二进制/权重/凭据；关键词命中均为“禁止提交凭据”类规则文本与字段名，逐条核对无真实凭据 |
+| 远端 SHA 校验 | `git ls-remote` 返回 `refs/heads/main` == 本地 HEAD，判定 `SHA_MATCH` |
+
+### 2. 认证通路
+
+- HTTPS 直连 GitHub 被阻断（443 超时）；本机代理 `127.0.0.1:7897` 可达（HTTP 200），但钥匙串无 GitHub HTTPS 凭据。
+- 本机 4 个既有 SSH key（`id_ed25519`、`GodSealS-GitHub`、两个 target key）推送前均被 GitHub 拒绝；
+  将 `~/.ssh/id_ed25519.pub` 登记到 GitHub 账户后 `ssh -T` 返回 `Hi GodSealS!`。
+- 推送使用单次命令级 SSH 覆盖（`url.<ssh>.insteadOf` 与 `GIT_SSH_COMMAND`），未修改 `origin`（仍为 HTTPS）及任何 git 配置。
+
+### 3. 推送后状态与目标同步
+
+- 开发机：`git branch -vv` 为 `main c99e2ca [origin/main]` 且无 ahead；`git status --short` 仅未跟踪 `plan/video-analysis/`；`origin/main...HEAD` = 0/0。
+- 目标机：本记录写入前 `/home/jtzn/SelfModelSwitch` 位于 `c99e2ca`、工作区干净；本记录提交后按 [AGENTS.md](../AGENTS.md)
+  流程 fast-forward 同步到本记录所在提交，同步前后核对工作区为空。
