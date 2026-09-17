@@ -423,10 +423,25 @@ dispatch/instance 配对（not_started 不得携带容器身份）、会话视�
 **Description:** 实现C03/C09的纯类型/严格解析器及材料字段，使下游不通过互相导入业务模块获得类型。
 **Files likely touched:** `model_scheduler/ports_v3.py`、`model_scheduler/evidence_contracts.py`、`tests/test_ports_v3.py`、`tests/test_evidence_contracts.py`（均新增）、`plan/06-acceptance.md`。
 **Acceptance criteria:**
-- [ ] observation/terminal/fence可以表达启动中、未知和未dispatch终结；每消费者有fake端口契约测试。
-- [ ] CandidateV3/CaseAttempt/Report与必测集合唯一映射可解析；结构合法不等于passed。
-- [ ] canonical/default展开/hash无环有golden例；绝对/逃逸/重复artifact路径拒绝；hash不包含report生成时间。
+- [x] observation/terminal/fence可以表达启动中、未知和未dispatch终结；每消费者有fake端口契约测试。
+- [x] CandidateV3/CaseAttempt/Report与必测集合唯一映射可解析；结构合法不等于passed。
+- [x] canonical/default展开/hash无环有golden例；绝对/逃逸/重复artifact路径拒绝；hash不包含report生成时间。
 **Verification:** `python -m pytest tests/test_ports_v3.py tests/test_evidence_contracts.py -q`。
+**本轮执行记录（2026-09-17）:** status=complete；起点 commit `0bb8298`；实现提交 `8974a10`；python=3.12.11；
+`pytest tests/test_ports_v3.py tests/test_evidence_contracts.py -q` = 28 passed（ports 16 + evidence 12）；
+`pytest tests -m 'not thor' -q` = 299 passed, 1 deselected；`ruff check .` exit 0；`run.py --check-config` 仍为旧四 ID。
+新增 `ports_v3.py`：Observation（running/stopped/unknown 加端口、启动操作、子进程事实）、LaunchOperation（starting 无终结时间、
+terminal 必须有）、MemorySample 与 C02 `0..2s` freshness 边界、EventRecord（sequence 从 1、UTC aware）、ExecutionRequest
+（inline/blob 互斥）、ExecutionHandle、CancelAck/StopAck（只表示命令已处理）、TerminationEvidence（dispatched 必须有完整
+实例身份与 execution fence；not_started 不得携带容器身份）、BackendPort/ObserverPort/Clock/EventSink 四个 runtime_checkable
+端口及 fake 契约测试（含缺方法必须不满足协议），以及唯一 STOPPED 计算 `stopped_is_proven`（容器不存在+启动操作终结+
+子进程退出+端口无监听；未知进程占用端口保持 UNKNOWN）。
+新增 `evidence_contracts.py`：CandidateV3/DeviceFact/RuntimeStackFact/PolicyV3/CaseAttempt/CaseFinal/AcceptanceReportV3
+严格解析（复用 contracts_v2 的模型/runtime 解析器）；必测集合由候选派生（S01—S06、O01—O06、每模型六类 B、每能力 B），
+每 case 恰一个可追溯 final、失败 attempt 永久保留、未知/缺 case/重复最终结论/伪造 summary 拒绝、报告起止必须等于
+最早/最晚 attempt 时间；policy 只可比 06-acceptance 门槛更严（1800s、100 请求、0.1 错误率等）；candidate/device/artifact
+摘要使用规范 JSON（字段全展开、无自摘要、无 report、无生成时间、无宿主路径），artifact 路径拒绝绝对/逃逸/控制字符/重复。
+`plan/06-acceptance.md` 补充 schema v3 来源与 case id 语法。HTTP 接线与真实执行仍待后续任务；本任务不产生硬件证据。
 
 ### P04 — 配置v2读入与显式v1迁移（M02）
 
