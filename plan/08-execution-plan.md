@@ -538,11 +538,52 @@ reason 统一改为 `asset_changed`，其余快照结构、`StorageAdmissionGuar
 **Description:** 用profile生成argv，按runtime选择adapter；每个load注册可观察的启动操作。
 **Files likely touched:** `model_scheduler/model_runner.py`、`model_scheduler/backend_router.py`、`model_scheduler/runtime_profiles.py`（后二者新增）、`tests/test_model_runner.py`、`tests/test_backend_router.py`（新增）。
 **Acceptance criteria:**
-- [ ] 无固定四ID端口表；主模型/projector按验证资产只读挂载，禁止Docker socket/宿主根、任意entrypoint/extra_args。
-- [ ] M00参数值可重现；未知flag/profile/能力拒绝；restart=no、无自动换模；不同runtime身份互不串用。
-- [ ] P06/P15真实执行只在隔离lab维护环境；生产profile必须绑定同镜像/参数/envelope的P21测量和最终B证据。
-- [ ] 启动操作具有PID/process group、Fence、开始/终结状态；timeout后启动者未退出仍不报告STOPPED。
+- [x] 无固定四ID端口表；主模型/projector按验证资产只读挂载，禁止Docker socket/宿主根、任意entrypoint/extra_args。
+- [x] M00参数值可重现；未知flag/profile/能力拒绝；restart=no、无自动换模；不同runtime身份互不串用。
+- [x] P06/P15真实执行只在隔离lab维护环境；生产profile必须绑定同镜像/参数/envelope的P21测量和最终B证据。
+- [x] 启动操作具有PID/process group、Fence、开始/终结状态；timeout后启动者未退出仍不报告STOPPED。
 **Verification:** `python -m pytest tests/test_model_runner.py tests/test_backend_router.py -q`；目标使用无权重测试镜像检查只读挂载、信号转发和身份标签。
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `41656cc`（P05 记录提交，本地 main 仍领先 origin/main 4 个提交）；
+python=3.12.11（`/Users/monster/.local/share/selfmodelswitch/venv312`）；
+`pytest tests/test_model_runner.py tests/test_backend_router.py -q` = 28 passed（实现前 `model_scheduler.runtime_profiles`、
+`model_scheduler.backend_router` 与 `model_runner.SupervisedLaunch` 均不存在，两个测试文件先收集失败）；
+`pytest tests -m 'not thor' -q` = 379 passed, 1 deselected（P05 基线 359）；`ruff check .` exit 0；
+`run.py --check-config` 仍输出 `schema_version=1` 与旧四 ID，v1 运行行为未变。
+新增 `model_scheduler/runtime_profiles.py`：`render_container_launch(registration, model_id, ...)` 只从同一份已解析登记中
+取 model+runtime（不接收二者配对参数），按 profile 的 `flag_sources` 渲染启用 flag，值来源为固定常量（`--load-mode auto`、
+`--n-gpu-layers 99`、`--flash-attn auto`、`--no-warmup`、`--no-webui`、容器内 `--host 0.0.0.0`/`--port 8080`）或登记 envelope
+（`--parallel`、`--kv-unified-per-slot`/`--ctx-size`、`--image-max-tokens`）；M00 登记的 flag→值集合与
+`scripts/m00_envelope_probe.py` 的 `build_server_command` 逐项相等，且不生成 `--no-mmap`。enabled 但无值来源的 flag
+（如 `--threads`）、必需 envelope flag 缺失（`--host/--port/--parallel/--kv-unified-per-slot`）、非 vision 模型启用
+`--image-max-tokens`、无 `--embedding/--pooling` 值来源的 embeddings/rerank、registration-only profile（`hf-sharded-v1`）
+全部拒绝渲染。挂载只有 `type=bind,src=<model_directory>,dst=/models,readonly`，容器路径由 asset 逐文件生成；
+`--entrypoint`/`--privileged`/`--volume`/docker.sock/非只读 mount 在渲染后被结构性复核拒绝。loopback 端口取
+`ModelSpec.port`（测试用 10077 证明未走旧四 ID 端口表），标签含 deployment/runtime/profile/model/mode/config-sha256，
+镜像取该 runtime 的 `image_digest`，容器名前缀 `sms-<deployment>-<model>`；`restart=no`、前台子进程、无自动换模入口。
+production 分支要求 `require_production_openable`（measured=true 且绑定 measurement_ref 与 physical_resident_peak_bytes），
+lab 分支必须显式传入临时 budget 并保留 `mode=lab` 标签；生产携带临时 budget、未知 mode、相对/`/`/含逗号模型目录、
+非法 deployment id 与 config 摘要均拒绝。
+新增 `model_scheduler/backend_router.py`：`BackendRouter(runtimes, models)` 只接受已登记 runtime，注册时执行
+`require_startable_profile`，拒绝重复 runtime、声明了其他 runtime 身份的 adapter、复用到第二个 runtime 的同一 adapter 对象
+以及不满足 `BackendPort` 的对象；`backend_for(model_id)` 只返回该模型自身 runtime 的 adapter，无 adapter 时显式拒绝而
+不回退到其他 runtime。
+`model_runner.py` 新增 `SupervisedLaunch`：以注入的 `popen`/`monotonic`/`killpg` 启动一次性前台子进程，产出的
+`LaunchOperation` 带 operation_id/Fence/PID/进程组（`start_new_session` 时 pgid=pid）、开始时间与 starting 状态，
+退出码决定 completed/failed 并只写一次终结时间；`wait(timeout)` 超时返回 None 且保持 starting，因此
+`stopped_is_proven` 在启动者未退出时不可能为真（测试用超时→未终结→子进程退出后才可证明的顺序验证）；
+`terminate()`/`signal_group()` 对记录下的进程组发信号，未启动时拒绝。旧 `docker_run_argv`、
+`run_child_with_signal_forwarding`、`docker_stop_argv` 等 v1 入口零改动。
+未解决/边界：`model_runner._PORTS` 固定四 ID 表仍只服务于 v1 `docker_run_argv` 兼容路径（P06b 要求旧 schema1 入口继续
+通过原测试），新动态渲染器不读取它；`--batch-size`/`--ubatch-size`/`--threads` 有意保留为"无值来源"以拒绝猜测，
+embeddings/rerank 需各自 profile、flag 值来源与 fixture 后才能启动。本轮未接线路由与渲染器到 runtime/deploy 入口
+（属 P06b/P07/P16/P17），未构建镜像、未启动模型、未产生任何设备或 B 证据；production 正式门禁仍由 P26/P31 实现。
+**同步状态（2026-09-18）:** 与 P04/P05 相同。本任务提交 `26e9d6c`（`expected_sha=26e9d6c9e8a41610c8d666847f6b9cf2155fdbe0`）后尝试推送
+`origin`（`https://github.com/GodSealS/SelfModelSwitch.git`）失败：`fatal: could not read Username for 'https://github.com':
+Device not configured`；`git ls-remote origin refs/heads/main` 仍为 `8d4edcd496423cbeaefe2e94d2f5cd75080d7823`，
+即本地 main 有 5 个提交（`cea36ca`、`dbdab2a`、`218e7c0`、`41656cc`、`26e9d6c`）未发布。只读 SSH 核对目标
+（`jtzn-desktop`，L4T R36.4.7，aarch64）：`/home/jtzn/SelfModelSwitch` 工作区干净且 HEAD=`8d4edcd4…`，与远端一致、
+无法 fast-forward 到本任务提交，因此本轮不执行目标 lab 测试，结论为 `software_only`，不是设备侧通过。
+待凭据可用后按 §1.3 第 4—5 步重新推送并同步，不得改用其他远端路径或向目标复制 tracked 文件绕过。
 
 ### P06a — 固定llama-swap真实控制契约（M02）
 
