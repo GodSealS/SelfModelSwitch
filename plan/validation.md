@@ -71,6 +71,10 @@ M00/V00仍待真实环境；新增控制/表格schema仍待M01/V01，不声称�
   整体清单摘要：`f87f5df8ab83f10ff6037182381280e32470843718ac364d5b68e532bd82a8f0`。
   这些文件的存在不表示其中描述的功能已实施。
 - **旧事实冲突：** 见第 5 节；不删除原文，只追加本轮较新事实。
+- **后续说明（同日）：** 用户确认基线归属后，上述未提交项已按“排除 `plan/video-analysis`”的要求提交：
+  `8bf62b6`（`AGENTS.md`、`README.md`、`plan/01`—`07`、`plan/adr`、`plan/legacy-v1`、`plan/legacy-v2`）
+  与 `b3efb78`（`tests/test_control_protocol_v1.py` 草稿；纳入后 `pytest tests` 的收集失败由 P02 修复）。
+  `plan/video-analysis` 保持未跟踪，指向它的 README/plan 链接在它迁出前仍为悬空链接。
 
 ### 3. 基线清单（P00 写入前）
 
