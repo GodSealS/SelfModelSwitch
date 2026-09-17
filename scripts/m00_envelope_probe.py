@@ -175,6 +175,7 @@ def build_completion_payload(token_ids: list[int], n_predict: int) -> dict:
         "cache_prompt": False,
         "stream": False,
         "add_special": False,
+        "ignore_eos": True,
     }
 
 
@@ -194,6 +195,7 @@ def build_chat_payload(filler: str, image_data_url: str, max_tokens: int) -> dic
         "seed": SEED,
         "cache_prompt": False,
         "stream": False,
+        "ignore_eos": True,
     }
 
 
@@ -300,6 +302,26 @@ def parse_tegrastats_line(line: str) -> dict | None:
         "swap_used_mb": int(swap.group(1)),
         "gr3d_freq_pct": int(gr3d.group(1)),
     }
+
+
+def max_gr3d_freq(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    peak: int | None = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parsed = parse_tegrastats_line(line)
+        if parsed:
+            value = parsed["gr3d_freq_pct"]
+            peak = value if peak is None else max(peak, value)
+    return peak
+
+
+def cuda_library_mapped(pid: int) -> bool:
+    try:
+        maps = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "libggml-cuda" in maps
 
 
 def classify_stop(exit_code: int | None, port_free: bool, reclaimed: bool, kill_used: bool) -> dict:
@@ -690,6 +712,7 @@ class ProbeRun:
         self.result["load_seconds"] = round(time.monotonic() - self.launch_ts, 3)
         self.result["slots"] = self._verify_slots(slots)
         self.result["props_n_ctx"] = (props.get("default_generation_settings") or {}).get("n_ctx")
+        self.result["cuda_library_mapped"] = cuda_library_mapped(self.proc.pid)
         if not self.result["slots"]["ok"]:
             raise ProbeError(f"slot context below envelope: {self.result['slots']}")
         print(f"[run {self.index}] ready in {self.result['load_seconds']}s, slots={self.result['slots']}")
@@ -711,6 +734,7 @@ class ProbeRun:
     def _stop_server(self) -> None:
         stop: dict = {"signaled_utc": utc_now()}
         if self.proc is None:
+            self.end_ts = time.monotonic()
             self.sampler.stop(10.0)
             self.result["stop"] = classify_stop(None, True, False, False) | stop
             return
@@ -735,6 +759,7 @@ class ProbeRun:
         residuals = list_residual_llama_servers(self.paths.llama_server)
         baseline = self.pre_launch_available if self.pre_launch_available is not None else self._baseline_now()
         reclaimed = self._wait_reclaim(baseline, timeout=10.0)
+        self.end_ts = time.monotonic()
         self.sampler.stop(10.0)
         stop.update(
             {
@@ -748,7 +773,6 @@ class ProbeRun:
             }
         )
         self.result["stop"] = classify_stop(exit_code, port_free, reclaimed, kill_used) | stop
-        self.end_ts = time.monotonic()
 
     def _baseline_now(self) -> int:
         return read_meminfo()["available_bytes"]
@@ -767,7 +791,15 @@ class ProbeRun:
             self.result["memory"] = compute_memory_metrics(self.sampler.samples, self.launch_ts, end)
         if self.proc is not None:
             self.result["server_exit_code"] = self.proc.returncode
-        self.result["execution_device"] = detect_execution_device(self.run_dir / "server.log")
+        gr3d_peak = max_gr3d_freq(self.run_dir / "sampling" / "tegrastats.log")
+        cuda_mapped = bool(self.result.get("cuda_library_mapped"))
+        self.result["execution_device_evidence"] = {
+            "cuda_library_mapped": cuda_mapped,
+            "gr3d_peak_pct": gr3d_peak,
+            "n_gpu_layers": 99,
+            "log_device_marker": detect_execution_device(self.run_dir / "server.log"),
+        }
+        self.result["execution_device"] = "CUDA0" if cuda_mapped and (gr3d_peak or 0) >= 50 else None
         self.result["compliance"] = self._compliance()
         self.result["finished_utc"] = utc_now()
         write_json(self.run_dir / "run.json", self.result)
@@ -791,8 +823,7 @@ class ProbeRun:
         image_tokens = image.get("image_tokens_measured")
         checks = {
             "text_max_input_exact": text.get("prompt_tokens") == self.envelope.max_input_tokens,
-            "text_max_output_completed": (text.get("completion_tokens") or 0) >= 1
-            and text.get("finish_reason") in ("length", "stop"),
+            "text_max_output_completed": (text.get("completion_tokens") or 0) >= self.envelope.max_output_tokens,
             "image_max_consumed": isinstance(image_tokens, int) and image_tokens > 0,
             "image_within_budget": isinstance(image_tokens, int)
             and image_tokens <= self.envelope.image_max_tokens * 1.05,
@@ -802,7 +833,10 @@ class ProbeRun:
                 for request in concurrent_requests
             ),
             "concurrent_outputs_completed": len(concurrent_requests) == self.envelope.parallel
-            and all((request.get("completion_tokens") or 0) >= 1 for request in concurrent_requests),
+            and all(
+                (request.get("completion_tokens") or 0) >= self.envelope.max_output_tokens
+                for request in concurrent_requests
+            ),
             "send_skew_ms_ok": (concurrent.get("send_skew_ms") or 0) <= 1000,
         }
         checks["all_ok"] = all(checks.values())
@@ -884,19 +918,22 @@ class ProbeRun:
         payload = build_completion_payload(tokens, envelope.max_output_tokens)
         response = http_post_json(f"{self.paths.base_url}/completion", payload, timeout=self.case_timeout)
         usage = response.get("usage") or {}
+        timings = response.get("timings") or {}
+        prompt_tokens = usage.get("prompt_tokens", timings.get("prompt_n", response.get("tokens_evaluated")))
+        completion_tokens = usage.get("completion_tokens", timings.get("predicted_n", response.get("tokens_predicted")))
         self._record_case(
             "text_max",
             {
                 "started_utc": utc_stamp(started),
                 "elapsed_seconds": round(time.monotonic() - started, 3),
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
                 "finish_reason": response.get("stop_type") or response.get("finish_reason"),
-                "timings": response.get("timings"),
+                "timings": timings,
                 "summary": {
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "predicted_per_second": (response.get("timings") or {}).get("predicted_per_second"),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "predicted_per_second": timings.get("predicted_per_second"),
                 },
             },
         )

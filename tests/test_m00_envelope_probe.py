@@ -127,6 +127,7 @@ def test_completion_payload_carries_exact_token_array():
     assert payload["cache_prompt"] is False
     assert payload["stream"] is False
     assert payload["temperature"] == 0
+    assert payload["ignore_eos"] is True
 
 
 def test_chat_payload_embeds_image_and_bounds_output():
@@ -137,6 +138,19 @@ def test_chat_payload_embeds_image_and_bounds_output():
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert payload["max_tokens"] == 4096
     assert payload["stream"] is False
+
+
+def test_max_gr3d_freq_reports_peak_from_tegrastats_log(tmp_path: Path):
+    module = _module()
+    log = tmp_path / "tegrastats.log"
+    log.write_text(
+        "09-17-2026 10:00:00 RAM 100/100MB SWAP 0/0MB GR3D_FREQ 8%\n"
+        "09-17-2026 10:00:01 RAM 100/100MB SWAP 0/0MB GR3D_FREQ 99%\n"
+        "not a tegrastats line\n",
+        encoding="utf-8",
+    )
+    assert module.max_gr3d_freq(log) == 99
+    assert module.max_gr3d_freq(tmp_path / "missing.log") is None
 
 
 def test_memory_metrics_compute_baseline_and_delta():
