@@ -379,10 +379,20 @@ M00 通过轮 run1—run3 均 `quiescent=true`，模型资产与 runtime 自校�
 **Description:** 在已有v2契约上实现C01/C02/C06缺项，保留v1运行行为。
 **Files likely touched:** `model_scheduler/contracts_v2.py`、`tests/test_contracts_v2.py`、`plan/04-deployment.md`、`plan/02-scheduler.md`。
 **Acceptance criteria:**
-- [ ] 同role分片按path唯一；GGUF profile基数单独校验；新增profile_id、max_images、测量引用和物理峰值字段。
-- [ ] 所有字符串全匹配、path拒绝NUL/父路径；JSON `1e999`、嵌套非有限值、未知字段均拒绝。
-- [ ] v2 reserved精确整数计算，无二次margin；measurement为空只能登记/隔离校准，不能生产开放。
+- [x] 同role分片按path唯一；GGUF profile基数单独校验；新增profile_id、max_images、测量引用和物理峰值字段。
+- [x] 所有字符串全匹配、path拒绝NUL/父路径；JSON `1e999`、嵌套非有限值、未知字段均拒绝。
+- [x] v2 reserved精确整数计算，无二次margin；measurement为空只能登记/隔离校准，不能生产开放。
 **Verification:** `python -m pytest tests/test_contracts_v2.py -q`；补分片、duplicate path、尾换行ID、1-byte和未测生产拒绝案例。
+**本轮执行记录（2026-09-17）:** status=complete；起点 commit `62c0036`；python=3.12.11；
+`pytest tests/test_contracts_v2.py -q` = 35 passed（实现前 18 项失败）；
+`pytest tests -m 'not thor' --ignore=tests/test_control_protocol_v1.py -q` = 240 passed, 1 deselected；
+`ruff check .` exit 0；`run.py --check-config` 仍为旧四 ID，v1 运行行为未变。
+新增契约：`PROFILES`（`llama-cpp-gguf-v1` 可执行、`hf-sharded-v1` 仅登记）、`RuntimeSpec.profile_id`、
+`Envelope.max_images`、`ModelSpec.measurement_ref`/`physical_resident_peak_bytes`、`reserved_bytes_from_peak`、
+`physical_reserved_bytes_from_peak`、`effective_reserved_bytes`（v2 原样、v1 兼容处只乘一次原 margin）、
+`require_startable_profile`、`require_production_openable`、按 path 唯一的 asset 表。
+文档同步：04-deployment §1、02-scheduler §5。未解决：`hf-sharded-v1` 无自身 fixture/实测因而不可启动
+（argv 渲染属 P06，测量与 fixture 属 P15/P21）；本任务不产生硬件证据也无此项。目标 checkout 已同步到同一提交。
 
 ### P02 — 完成控制协议v1 DTO与错误表（M01）
 

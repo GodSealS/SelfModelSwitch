@@ -54,6 +54,8 @@ scheduler 重启先关准入，清理该 deployment 旧实例，确认停止后�
 ## 5. 内存准入
 
 单位 byte，GiB=2^30。R=ceil(measured_model_peak*1.15)，包含模型、KV、推理 workspace 和 adapter 预处理。
+v2 的 `reserved_bytes` 已经是 R，用精确整数 `(measured_peak*115+99)//100` 计算，避免 float 在边界上的取整差异；
+内部统一 `effective_reserved_bytes`：v2 原样使用，v1 只在兼容转换处按原 margin 乘一次，任何路径都不二次乘 margin。
 C 为未证实停止的所有模型预留，B 为受管预算，F 为实时余量（默认2GiB），N 为尚未预留的新增 R。
 同时满足：存储就绪、身份明确、槽可用、C+N<=B、MemAvailable>=N+F。
 MemAvailable 样本最大年龄2s，未来时间戳无效；静态 B<=MemTotal-system_reserve（默认8GiB）。
@@ -61,5 +63,11 @@ MemAvailable 样本最大年龄2s，未来时间戳无效；静态 B<=MemTotal-s
 低于 F 停新执行并取消清理当前受管计算；不能保证采样间无 OOM，必须实测最大组合输入。
 停止后重新采样，内存未回收等待最多10s，仍不足则保持不可准入。
 
+实时门槛之外另有静态物理门槛：每个未 STOPPED 实例按 `physical_reserved_bytes=ceil(physical_resident_peak_bytes*1.15)`
+计入，总和不得超过 B。`physical_resident_peak_bytes` 是该模型及其 adapter 在运行窗口内不重复计数的物理占用上界，
+未测保持 null。首版采集方法固定为 `system_nonfree_upper_bound_v1`：同窗口逐样本取 `MemTotal-MemFree`，
+每轮取最大、三轮再取最大；它包含 OS、page cache 和其他进程，不是“模型净占用”，跨模型相加可能保守重复计入背景占用。
+
 本项目不维护视频工作区 R_w/阶段预算。其他进程消耗通过实时余量约束反映，客户端另外约束自身峰值。
 无测量值只允许关闭服务准入的独占 calibration，使用显式临时预算；测量后形成正式 candidate 再验收。
+未测登记只能停留于登记与隔离校准：`measurement_ref` 为空或 `physical_resident_peak_bytes` 为 null 时不得生产开放。

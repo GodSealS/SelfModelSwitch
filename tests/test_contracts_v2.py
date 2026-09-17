@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
 from model_scheduler import contracts_v2 as cv2
 
+GGUF_PROFILE = "llama-cpp-gguf-v1"
+HF_PROFILE = "hf-sharded-v1"
+
 
 def _valid_deployment() -> dict:
+    """Schema-v2 deployment used by most tests.
+
+    Asset digests and the reserved figure come from the M00 measurement. The
+    physical resident peak is a synthetic test value because M00 has no measured
+    physical upper bound yet (plan/08-execution-plan.md C02).
+    """
     return {
         "schema_version": 2,
         "runtimes": [
             {
                 "runtime_id": "llama-cpp-cuda-sm87-4bc272f",
+                "profile_id": GGUF_PROFILE,
                 "image_digest": "ghcr.io/example/llama-cuda@sha256:" + "a" * 64,
                 "adapter_sha256": "b" * 64,
                 "lock_sha256": "c" * 64,
@@ -46,13 +57,61 @@ def _valid_deployment() -> dict:
                     "max_parallel": 2,
                     "max_image_tokens": 1280,
                     "max_image_edge_pixels": 1024,
+                    "max_images": 1,
                 },
                 "timeout_seconds": 3600,
                 "reserved_bytes": 6106148045,
                 "measured": True,
+                "measurement_ref": "e" * 64,
+                "physical_resident_peak_bytes": 5_000_000_000,
             }
         ],
     }
+
+
+def _sharded_deployment() -> dict:
+    """A sharded HF registration: three model files plus tokenizer and config."""
+    data = _valid_deployment()
+    data["runtimes"].append(
+        {
+            "runtime_id": "hf-transformers-cpu",
+            "profile_id": HF_PROFILE,
+            "image_digest": "ghcr.io/example/hf-serve@sha256:" + "f" * 64,
+            "adapter_sha256": "b" * 64,
+            "lock_sha256": "c" * 64,
+            "startup_args": ["--host", "--port"],
+        }
+    )
+    data["models"].append(
+        {
+            "model_id": "hf-sharded-model",
+            "runtime_id": "hf-transformers-cpu",
+            "capabilities": ["chat"],
+            "assets": [
+                {"role": "model", "path": "hf/shard-00001.safetensors", "sha256": "1" * 64, "size_bytes": 1000},
+                {"role": "model", "path": "hf/shard-00002.safetensors", "sha256": "2" * 64, "size_bytes": 1000},
+                {"role": "model", "path": "hf/shard-00003.safetensors", "sha256": "3" * 64, "size_bytes": 1000},
+                {"role": "tokenizer", "path": "hf/tokenizer.json", "sha256": "4" * 64, "size_bytes": 10},
+                {"role": "config", "path": "hf/config.json", "sha256": "5" * 64, "size_bytes": 10},
+            ],
+            "port": 18082,
+            "envelope": {
+                "ctx_size": 4096,
+                "max_input_tokens": 3072,
+                "max_output_tokens": 1024,
+                "max_parallel": 1,
+                "max_image_tokens": 0,
+                "max_image_edge_pixels": 0,
+                "max_images": 0,
+            },
+            "timeout_seconds": 600,
+            "reserved_bytes": 1150000000,
+            "measured": False,
+            "measurement_ref": None,
+            "physical_resident_peak_bytes": None,
+        }
+    )
+    return data
 
 
 def test_versions_and_protocol_limits_are_locked():
@@ -161,6 +220,7 @@ def test_asset_hash_size_and_role_are_strict():
 def test_runtime_digest_must_be_pinned():
     base = {
         "runtime_id": "llama-cpp-cuda-sm87",
+        "profile_id": GGUF_PROFILE,
         "image_digest": "ghcr.io/example/llama-cuda@sha256:" + "a" * 64,
         "adapter_sha256": "b" * 64,
         "lock_sha256": "c" * 64,
@@ -177,6 +237,7 @@ def test_runtime_digest_must_be_pinned():
 def test_runtime_startup_args_are_whitelisted_and_unique():
     base = {
         "runtime_id": "llama-cpp-cuda-sm87",
+        "profile_id": GGUF_PROFILE,
         "image_digest": "ghcr.io/example/llama-cuda@sha256:" + "a" * 64,
         "adapter_sha256": "b" * 64,
         "lock_sha256": "c" * 64,
@@ -199,6 +260,7 @@ def test_envelope_consistency_rules():
         "max_parallel": 2,
         "max_image_tokens": 1280,
         "max_image_edge_pixels": 1024,
+        "max_images": 1,
     }
     cv2.parse_envelope(base)
     for key, value in (
@@ -207,6 +269,7 @@ def test_envelope_consistency_rules():
         ("max_image_tokens", 28672),
         ("max_image_edge_pixels", 0),
         ("max_output_tokens", 0),
+        ("max_images", 0),
     ):
         envelope = dict(base)
         envelope[key] = value
@@ -261,13 +324,21 @@ def test_model_id_grammar():
         cv2.parse_deployment(data)
 
 
-def test_duplicate_asset_roles_are_rejected():
+def test_asset_paths_are_unique_and_roles_may_repeat():
+    # A second model file is registration-legal in general, but the first GGUF
+    # profile allows exactly one model asset, so it is rejected here.
     data = _valid_deployment()
-    duplicate = dict(data["models"][0]["assets"][0])
-    duplicate["path"] = "other.gguf"
-    data["models"][0]["assets"].append(duplicate)
+    second_model = dict(data["models"][0]["assets"][0])
+    second_model["path"] = "qwen25vl-7b-q4/model-00002.gguf"
+    data["models"][0]["assets"].append(second_model)
     with pytest.raises(cv2.ContractError):
         cv2.parse_deployment(data)
+
+    # Two roles must not name the same path.
+    duplicate_path = _valid_deployment()
+    duplicate_path["models"][0]["assets"][0]["path"] = "qwen25vl-7b-q4/mmproj.gguf"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(duplicate_path)
 
 
 def test_measured_and_reserved_bytes_are_strict():
@@ -300,3 +371,234 @@ def test_digest_is_stable_and_key_order_independent():
     assert cv2.deployment_digest(first) == cv2.deployment_digest(second)
     assert len(cv2.deployment_digest(first)) == 64
     assert cv2.canonical_json_bytes({"b": 1, "a": 2}) == b'{"a":2,"b":1}'
+
+
+# ---------------------------------------------------------------------------
+# M01 P01: runtime profiles, sharding, measurement fields, exact reservations
+
+
+def test_profiles_are_a_closed_registered_set():
+    assert cv2.PROFILES[GGUF_PROFILE].executable is True
+    assert cv2.PROFILES[HF_PROFILE].executable is False
+    unknown = _valid_deployment()
+    unknown["runtimes"][0]["profile_id"] = "onnx-runtime-v9"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(unknown)
+
+
+def test_startable_profile_gate_rejects_registration_only_profiles():
+    deployment = cv2.parse_deployment(_sharded_deployment())
+    by_id = {runtime.runtime_id: runtime for runtime in deployment.runtimes}
+    assert cv2.require_startable_profile(by_id["llama-cpp-cuda-sm87-4bc272f"]).profile_id == GGUF_PROFILE
+    with pytest.raises(cv2.ContractError):
+        cv2.require_startable_profile(by_id["hf-transformers-cpu"])
+
+
+def test_startup_args_are_bounded_by_the_profile():
+    gguf = _valid_deployment()
+    gguf["runtimes"][0]["startup_args"] = ["--load-mode", "--port"]
+    cv2.parse_deployment(gguf)
+
+    # --load-mode and --image-max-tokens are llama.cpp flags, not HF serve flags.
+    sharded = _sharded_deployment()
+    sharded["runtimes"][1]["startup_args"] = ["--load-mode"]
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(sharded)
+
+
+def test_gguf_profile_enforces_asset_cardinality_and_allowed_roles():
+    two_projectors = _valid_deployment()
+    two_projectors["models"][0]["assets"].append(
+        {"role": "projector", "path": "qwen25vl-7b-q4/mmproj-2.gguf", "sha256": "d2" + "0" * 62, "size_bytes": 10}
+    )
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(two_projectors)
+
+    # A projector without the vision capability is an inconsistent registration.
+    projector_without_vision = _valid_deployment()
+    projector_without_vision["models"][0]["capabilities"] = ["chat"]
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(projector_without_vision)
+
+    # Roles outside the profile are not registrable at all.
+    extra_role = _valid_deployment()
+    extra_role["models"][0]["assets"].append(
+        {"role": "tokenizer", "path": "qwen25vl-7b-q4/tokenizer.json", "sha256": "9" * 64, "size_bytes": 10}
+    )
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(extra_role)
+
+
+def test_sharded_profile_accepts_repeated_roles_keyed_by_path():
+    deployment = cv2.parse_deployment(_sharded_deployment())
+    sharded = deployment.models[1]
+    assert [asset.role for asset in sharded.assets].count("model") == 3
+    assert sorted(asset.path for asset in sharded.assets) == [
+        "hf/config.json",
+        "hf/shard-00001.safetensors",
+        "hf/shard-00002.safetensors",
+        "hf/shard-00003.safetensors",
+        "hf/tokenizer.json",
+    ]
+
+
+def test_ids_flags_and_digests_must_match_the_whole_string():
+    for bad_id in ("model-1\n", "model-1\x00", "model-1\x00x"):
+        data = _valid_deployment()
+        data["models"][0]["model_id"] = bad_id
+        with pytest.raises(cv2.ContractError):
+            cv2.parse_deployment(data)
+    runtime_id = _valid_deployment()
+    runtime_id["runtimes"][0]["runtime_id"] = "llama-cpp-cuda\n"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(runtime_id)
+    digest = _valid_deployment()
+    digest["runtimes"][0]["image_digest"] += "\n"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(digest)
+    flag = _valid_deployment()
+    flag["runtimes"][0]["startup_args"] = ["--parallel\n"]
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(flag)
+    checksum = _valid_deployment()
+    checksum["models"][0]["assets"][0]["sha256"] += "\n"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(checksum)
+
+
+def test_asset_paths_reject_control_bytes():
+    for bad_path in ("a\x00b.gguf", "model.gguf\n", "a\tb.gguf", "model.gguf\x7f"):
+        with pytest.raises(cv2.ContractError):
+            cv2.parse_asset_ref({"role": "model", "path": bad_path, "sha256": "a" * 64, "size_bytes": 1})
+
+
+def test_max_images_must_agree_with_the_vision_capability():
+    missing = _valid_deployment()
+    del missing["models"][0]["envelope"]["max_images"]
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(missing)
+
+    non_vision = _valid_deployment()
+    non_vision["models"][0]["capabilities"] = ["chat"]
+    non_vision["models"][0]["assets"] = [non_vision["models"][0]["assets"][0]]
+    non_vision["models"][0]["envelope"].update({"max_image_tokens": 0, "max_image_edge_pixels": 0, "max_images": 0})
+    parsed = cv2.parse_deployment(non_vision)
+    assert parsed.models[0].envelope.max_images == 0
+
+    vision_without_images = _valid_deployment()
+    vision_without_images["models"][0]["envelope"]["max_images"] = 0
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(vision_without_images)
+
+    images_without_token_budget = _valid_deployment()
+    images_without_token_budget["models"][0]["envelope"].update({"max_image_tokens": 0, "max_image_edge_pixels": 0})
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(images_without_token_budget)
+
+    boolean_images = _valid_deployment()
+    boolean_images["models"][0]["envelope"]["max_images"] = True
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(boolean_images)
+
+
+def test_measured_models_must_bind_measurement_material():
+    for key in ("measurement_ref", "physical_resident_peak_bytes"):
+        missing = _valid_deployment()
+        del missing["models"][0][key]
+        with pytest.raises(cv2.ContractError):
+            cv2.parse_deployment(missing)
+
+    bad_ref = _valid_deployment()
+    bad_ref["models"][0]["measurement_ref"] = "not-a-digest"
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(bad_ref)
+
+    for bad_peak in (0, -1, True, 1.5):
+        bad_peak_data = _valid_deployment()
+        bad_peak_data["models"][0]["physical_resident_peak_bytes"] = bad_peak
+        with pytest.raises(cv2.ContractError):
+            cv2.parse_deployment(bad_peak_data)
+
+    inconsistent = _valid_deployment()
+    inconsistent["models"][0]["measured"] = False
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment(inconsistent)
+
+    unmeasured = _valid_deployment()
+    unmeasured["models"][0].update(
+        {"measured": False, "measurement_ref": None, "physical_resident_peak_bytes": None}
+    )
+    assert cv2.parse_deployment(unmeasured).models[0].measured is False
+
+
+def test_production_open_requires_measurement_and_an_executable_profile():
+    unmeasured = _valid_deployment()
+    unmeasured["models"][0].update(
+        {"measured": False, "measurement_ref": None, "physical_resident_peak_bytes": None}
+    )
+    parsed = cv2.parse_deployment(unmeasured)
+    with pytest.raises(cv2.ContractError):
+        cv2.require_production_openable(parsed.models[0], parsed.runtimes[0])
+
+    measured = cv2.parse_deployment(_valid_deployment())
+    assert cv2.require_production_openable(measured.models[0], measured.runtimes[0]) is None
+
+    sharded = cv2.parse_deployment(_sharded_deployment())
+    with pytest.raises(cv2.ContractError):
+        cv2.require_production_openable(sharded.models[1], sharded.runtimes[1])
+
+
+def test_reserved_bytes_use_the_exact_integer_margin_exactly_once():
+    # M00: measured_peak 5309693952 B is registered as R = 6106148045 B.
+    assert cv2.reserved_bytes_from_peak(5309693952) == 6106148045
+    # One byte above an exact multiple of the margin still rounds up.
+    assert cv2.reserved_bytes_from_peak(20) == 23
+    assert cv2.reserved_bytes_from_peak(21) == 25
+    assert cv2.reserved_bytes_from_peak(1) == 2
+    for peak in (1, 7, 20, 21, 999_999, 5309693952):
+        reserved = cv2.reserved_bytes_from_peak(peak)
+        assert reserved * 100 >= peak * 115
+        assert (reserved - 1) * 100 < peak * 115
+    for bad_peak in (0, -1, True, 1.5):
+        with pytest.raises(cv2.ContractError):
+            cv2.reserved_bytes_from_peak(bad_peak)
+
+    # v2 reserved_bytes already is R: the internal figure must not margin it again.
+    assert cv2.effective_reserved_bytes(6106148045) == 6106148045
+    assert cv2.effective_reserved_bytes(23) == 23
+
+
+def test_v1_compatibility_boundary_matches_the_legacy_book():
+    from model_scheduler.contracts import Capability, ModelSpec as LegacyModelSpec
+    from model_scheduler.model_registry import Book
+
+    peak = 5309693952
+    legacy_spec = LegacyModelSpec(
+        model_id="qwen25vl-7b-q4",
+        upstream_url="http://127.0.0.1:18081",
+        capabilities=frozenset({Capability.CHAT}),
+        reserved_bytes=peak,
+    )
+    book = Book({"qwen25vl-7b-q4": legacy_spec}, model_budget=64 * 2**30, free_floor=2 * 2**30)
+    assert book.margin == 0.15
+    for value in (peak, 20, 21, 999_999):
+        v1 = cv2.effective_reserved_bytes(value, legacy_v1_margin=book.margin)
+        assert v1 == math.ceil(value * (1 + book.margin))
+    assert cv2.effective_reserved_bytes(peak, legacy_v1_margin=0.15) == 6106148045
+
+
+def test_physical_threshold_uses_the_same_margin_once():
+    assert cv2.physical_reserved_bytes_from_peak(5_000_000_000) == 5_750_000_000
+    assert cv2.physical_reserved_bytes_from_peak(5_000_000_001) == 5_750_000_002
+    for bad_peak in (0, -1, True):
+        with pytest.raises(cv2.ContractError):
+            cv2.physical_reserved_bytes_from_peak(bad_peak)
+
+
+def test_json_rejects_non_finite_numbers_anywhere():
+    for text in ('{"a": 1e999}', '{"a": -1e999}', '{"a": [1, {"b": 1e999}]}', '{"a": {"b": [1E999]}}'):
+        with pytest.raises(cv2.ContractError):
+            cv2.parse_json_document(text)
+    injected = json.dumps(_valid_deployment()).replace('"max_parallel": 2', '"max_parallel": 1e999')
+    with pytest.raises(cv2.ContractError):
+        cv2.parse_deployment_json(injected)
