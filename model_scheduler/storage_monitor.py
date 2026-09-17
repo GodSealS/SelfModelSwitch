@@ -1,20 +1,30 @@
-"""Validate that models are served from the configured mounted SSD only."""
+"""Validate that models are served from the configured mounted SSD only.
+
+The per-file identity and integrity work lives in `asset_store.AssetStore`: every
+registered asset of a model is opened no-follow and hashed during the full
+startup/recovery/release pass, while the per-second runtime check only compares
+the mount identity with each file's inode, size and mtime. A deadline covers the
+whole hashed set, and exceeding it leaves the result UNKNOWN instead of opening
+more assets (M02/P05).
+"""
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import hashlib
-import json
-import os
-from pathlib import Path
-import stat
-import subprocess
 from time import monotonic
 from typing import Any, Callable, Mapping
 
+from .asset_store import (
+    DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    AssetFault,
+    AssetSnapshot,
+    AssetStore,
+    normalize_assets,
+)
+
 
 class StorageError(RuntimeError):
-    pass
+    """Legacy name kept for callers that catch it; the store now raises AssetFault."""
 
 
 @dataclass(frozen=True)
@@ -34,73 +44,61 @@ class StorageSnapshot:
 
 
 class StorageMonitor:
-    def __init__(self, mount_path: Path, model_directory: Path, expected_uuid: str, filesystem: str, *, runner: Callable[[list[str]], str] | None = None):
+    def __init__(
+        self,
+        mount_path: Any,
+        model_directory: Any,
+        expected_uuid: str,
+        filesystem: str,
+        *,
+        runner: Callable[[list[str]], str] | None = None,
+        verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = monotonic,
+        hasher: Callable[[int, Callable[[], None]], str] | None = None,
+    ):
         self.mount_path = mount_path
         self.model_directory = model_directory
         self.expected_uuid = expected_uuid
         self.filesystem = filesystem
-        self._runner = runner or self._run_findmnt
-        self._baseline: dict[str, ModelFile] | None = None
-
-    @staticmethod
-    def _run_findmnt(args: list[str]) -> str:
-        return subprocess.check_output(args, text=True, timeout=2)
+        self.store = AssetStore(
+            mount_path,
+            model_directory,
+            expected_uuid,
+            filesystem,
+            runner=runner,
+            clock=clock,
+            verify_timeout_seconds=verify_timeout_seconds,
+            hasher=hasher,
+        )
+        self._clock = clock
 
     def check(self, models: Mapping[str, Any]) -> StorageSnapshot:
-        now = monotonic()
+        """Admission check: hash the whole set once, then observe only its metadata."""
+        return self._run(models, force=False)
+
+    def verify_all(self, models: Mapping[str, Any]) -> StorageSnapshot:
+        """Startup, recovery and release always re-hash every registered asset."""
+        return self._run(models, force=True)
+
+    def _run(self, models: Mapping[str, Any], *, force: bool) -> StorageSnapshot:
+        now = self._clock()
         try:
-            data = json.loads(self._runner(["findmnt", "--json", "--target", str(self.mount_path)]))
-            entries = data.get("filesystems")
-            if not isinstance(entries, list) or len(entries) != 1:
-                raise StorageError("mount_not_found")
-            entry = entries[0]
-            if entry.get("target") != str(self.mount_path) or entry.get("uuid") != self.expected_uuid or entry.get("fstype") != self.filesystem:
-                raise StorageError("mount_identity_mismatch")
-            directory_stat = os.lstat(self.model_directory)
-            if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
-                raise StorageError("model_directory_unsafe")
-            files: dict[str, ModelFile] = {}
-            for model_id, value in models.items():
-                filename, expected_hash = self._model_file(value)
-                candidate = self.model_directory / filename
-                file_stat = os.lstat(candidate)
-                if not candidate.is_file() or candidate.is_symlink() or not os.access(candidate, os.R_OK):
-                    raise StorageError("model_file_unsafe")
-                digest = self._sha256(candidate)
-                after = os.lstat(candidate)
-                if (after.st_ino, after.st_size, after.st_mtime_ns) != (file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns):
-                    raise StorageError("model_file_changed")
-                observed = ModelFile(file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns, digest)
-                if self._baseline is not None and self._baseline.get(model_id) != observed:
-                    raise StorageError("model_file_changed")
-                if expected_hash is not None and digest != expected_hash:
-                    raise StorageError("model_hash_mismatch")
-                files[model_id] = observed
-            if self._baseline is not None and files != self._baseline:
-                raise StorageError("model_file_changed")
-            self._baseline = files
-            return StorageSnapshot(True, None, now, files)
-        except (OSError, ValueError, subprocess.SubprocessError, StorageError) as exc:
+            entries = {model_id: normalize_assets(value) for model_id, value in models.items()}
+            unchanged = self.store.verified and entries == self.store.entries
+            snapshot = self.store.observe() if not force and unchanged else self.store.verify(entries)
+        except (OSError, ValueError, AssetFault) as exc:
             return StorageSnapshot(False, str(exc), now, {})
+        return self._to_snapshot(snapshot)
 
-    @staticmethod
-    def _model_file(value: Any) -> tuple[str, str | None]:
-        if isinstance(value, str):
-            return value, None
-        if isinstance(value, tuple) and len(value) == 2 and all(isinstance(item, str) for item in value):
-            return value
-        filename, digest = getattr(value, "file", None), getattr(value, "sha256", None)
-        if isinstance(filename, str) and isinstance(digest, str):
-            return filename, digest
-        raise StorageError("invalid_model_file")
-
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+    def _to_snapshot(self, snapshot: AssetSnapshot) -> StorageSnapshot:
+        if not snapshot.ready:
+            return StorageSnapshot(False, snapshot.reason, snapshot.sampled_at, {})
+        files: dict[str, ModelFile] = {}
+        for model_id, facts in snapshot.facts.items():
+            primary = next((fact for fact in facts if fact.role == "model"), facts[0] if facts else None)
+            if primary is not None:
+                files[model_id] = ModelFile(primary.inode, primary.size_bytes, primary.mtime_ns, primary.sha256 or "")
+        return StorageSnapshot(True, None, snapshot.sampled_at, files)
 
 
 class StorageAdmissionGuard:

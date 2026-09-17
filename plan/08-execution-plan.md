@@ -466,7 +466,7 @@ terminal 必须有）、MemorySample 与 C02 `0..2s` freshness 边界、EventRec
 `contracts_v2.SESSION_LIMITS`，`hard_timeout_seconds` 默认 3600s），`control.allowed_uids` 与 `blobs.root`
 不给默认——分别属身份与站点决策，`resources.model_budget_bytes` 同样必须显式；新增 `config_digest()`
 以规范 JSON 计算且排除顶层派生 `candidate_sha256`，满足 C09 回填无环，并拒绝非 JSON 原生值与非有限数。
-`load_config` 从此按 `schema_version` 分派，python 侧保持 `AppConfig`/`v1` 路径零改动，`run.py --check-config`
+`load_config` 从此按 `schema_version` 分派，并保持 `AppConfig`/v1 解析路径零改动，`run.py --check-config`
 对 v1/v2 均可用（v2 打印 `schema_version=2` 与动态模型集合）。
 新增 `migration_v2.py` 与 `python -m model_scheduler.deploy migrate-v2`：只有 v1 输入可迁移，输出已存在即拒绝；
 runtime/profile/镜像/adapter/lock/argv、逐文件 asset size/hash、envelope、timeout、是否实测及其测量材料、
@@ -498,10 +498,36 @@ asset sha256）返回 exit 2、报告四项 missing/conflicts 且未生成输出
 **Description:** 从单文件模型校验改为逐文件全量启动核验和1s metadata监测，保持故障关准入。
 **Files likely touched:** `model_scheduler/storage_monitor.py`、`model_scheduler/asset_store.py`（新增）、`tests/test_storage.py`、`tests/test_asset_store.py`（新增）。
 **Acceptance criteria:**
-- [ ] 启动/恢复/发布全量hash；运行期1s核挂载UUID、inode/size/mtime，不每秒重复读所有模型hash。
-- [ ] directory fd逐级no-follow，前后fstat一致；父symlink、文件替换、根盘同名目录、UUID错配、读取阻塞全部关准入。
-- [ ] hash总deadline为配置 `storage.verify_timeout_seconds`（默认900s），超时工作不能继续打开新资产；保留UNKNOWN。
+- [x] 启动/恢复/发布全量hash；运行期1s核挂载UUID、inode/size/mtime，不每秒重复读所有模型hash。
+- [x] directory fd逐级no-follow，前后fstat一致；父symlink、文件替换、根盘同名目录、UUID错配、读取阻塞全部关准入。
+- [x] hash总deadline为配置 `storage.verify_timeout_seconds`（默认900s），超时工作不能继续打开新资产；保留UNKNOWN。
 **Verification:** `python -m pytest tests/test_storage.py tests/test_asset_store.py -q`；Linux用临时挂载命名空间/临时文件制造路径与超时，不动实际模型盘。到K1。
+**本轮执行记录（2026-09-17）:** status=software_only；起点 commit `218e7c0`（P04 提交 `cea36ca`，仍在本地待推送）；
+python=3.12.11（`/Users/monster/.local/share/selfmodelswitch/venv312`）；
+`pytest tests/test_storage.py tests/test_asset_store.py -q` = 35 passed（实现前 `model_scheduler.asset_store` 不存在，
+两文件收集失败）；`pytest tests -m 'not thor' -q` = 359 passed, 1 deselected（P04 基线 331）；
+`ruff check .` exit 0；`run.py --check-config` 仍输出 `schema_version=1` 与旧四 ID。
+新增 `model_scheduler/asset_store.py`：`AssetStore.verify()` 为启动/恢复/发布的全量通过——单次 `verify_timeout_seconds`
+全程截止，逐个资产以 directory fd 逐级 `O_DIRECTORY|O_NOFOLLOW` 打开父目录、`O_NOFOLLOW` 打开文件，
+hash 前后两次 fstat（并与打开前 lstat）必须一致，否则判 `asset_replaced`；尺寸/hash 与登记不符分别判
+`asset_size_mismatch`/`asset_hash_mismatch`；缺失文件 `asset_unavailable`，symlink 文件 `asset_symlink`，
+父级 symlink 与 `..`/绝对路径/控制字符一律 `asset_path_unsafe`；findmnt 的 target 不等于挂载点（含根盘同名目录）
+判 `mount_not_found`，UUID/fstype 错配判 `mount_identity_mismatch`，模型目录为 symlink 判 `model_directory_unsafe`。
+`AssetStore.observe()` 只核对挂载身份与每个文件的 inode/size/mtime_ns，**不重新 hash**（测试用计数 hasher 证明第二次
+观察不再读盘），漂移即 `asset_changed` 并使基线失效，下一次进入入口必须重新全量hash。
+`StorageMonitor` 改为把逐-file 工作交给 store：`check()` 首次或登记变化时全量hash、其后回到 metadata 观察，
+`verify_all()` 供启动/恢复/发布强制全量；新增 `verify_timeout_seconds`（默认 900=P04 的 `storage.verify_timeout_seconds`）、
+`clock`、`hasher` 注入参数，v1 的 `StorageSnapshot`/`ModelFile`/错误名“model_file_changed”等契约仅把“内容变化”的
+reason 统一改为 `asset_changed`，其余快照结构、`StorageAdmissionGuard` 与既有 preflight 路径保持不变。
+结果不再是布尔：normalize 阶段之外的一切均落到 `AssetState.VERIFIED|FAULT|UNKNOWN`——超时
+（含读取卡住时每 chunk 检查一次 deadline）判 **UNKNOWN**、reason `asset_verify_timeout`，
+并在打开下一个资产前先检查 deadline，因此超时后不会再打开任何新资产，也不会把旧基线当作可信。
+**Files touched:** `model_scheduler/asset_store.py`（新增）、`model_scheduler/storage_monitor.py`、
+`tests/test_asset_store.py`（新增）、`tests/test_storage.py`。
+未在本机（macOS，Python 3.12）执行的部分：真正的 mount namespace/bind mount 隔离、ext4 上的挂载身份复算，
+以及与 P06 起的真实 llama-swap/lab 布置联调——这些按计划在目标 Orin 上以临时挂载和临时文件验证，
+本轮不动实际模型盘，也没有任何设备侧证据。另：`verify_timeout_seconds` 目前只在 Monitor 构造参数处生效，
+尚未由运行时组合处从配置注入（属 P08/P17 范围）。
 
 ### P06 — 受控runtime启动与动态后端路由（M02）
 
