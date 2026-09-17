@@ -1,0 +1,732 @@
+{
+  "$defs": {
+    "BlobRef": {
+      "additionalProperties": false,
+      "properties": {
+        "blob_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "media_type": {
+          "pattern": "^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$",
+          "type": "string"
+        },
+        "owner": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "size_bytes": {
+          "maximum": 1073741824,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blob_id",
+        "owner",
+        "sha256",
+        "size_bytes",
+        "media_type"
+      ],
+      "type": "object"
+    },
+    "ErrorDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "backend_failed",
+            "blob_in_use",
+            "busy",
+            "capability_mismatch",
+            "contract_violation",
+            "envelope_exceeded",
+            "execution_timeout",
+            "idempotency_conflict",
+            "instance_unknown",
+            "malformed_json",
+            "not_found",
+            "payload_too_large",
+            "peer_forbidden",
+            "queue_full",
+            "queue_timeout",
+            "quota_exceeded",
+            "reference_expired",
+            "resource_unavailable",
+            "session_expired",
+            "stale_token",
+            "storage_unavailable",
+            "temporarily_unavailable",
+            "unsupported_media_type",
+            "unsupported_protocol"
+          ]
+        },
+        "message": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "retryable": {
+          "description": "must match the documented retryable flag for the code",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ErrorDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ErrorDetail"
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "ExecutionCreateRequest": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "chat"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "$ref": "#/$defs/Parameters_chat"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "embeddings"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "$ref": "#/$defs/Parameters_embeddings"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "rerank"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "$ref": "#/$defs/Parameters_rerank"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "vision"
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "$ref": "#/$defs/Parameters_vision"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "idempotency_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "input": {
+          "$ref": "#/$defs/ExecutionInput"
+        },
+        "operation": {
+          "enum": [
+            "chat",
+            "embeddings",
+            "rerank",
+            "vision"
+          ]
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "session_token": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_token",
+        "operation",
+        "input",
+        "parameters",
+        "idempotency_key"
+      ],
+      "type": "object"
+    },
+    "ExecutionInput": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "inline"
+          ]
+        },
+        {
+          "required": [
+            "blob"
+          ]
+        }
+      ],
+      "properties": {
+        "blob": {
+          "$ref": "#/$defs/BlobRef"
+        },
+        "inline": {
+          "minProperties": 1,
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ExecutionView": {
+      "additionalProperties": false,
+      "properties": {
+        "compute_quiescent": {
+          "description": "true exactly for terminal states",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "dispatch_state": {
+          "enum": [
+            "dispatched",
+            "not_started"
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "fence": {
+          "$ref": "#/$defs/Fence"
+        },
+        "instance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BlobRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "enum": [
+            "cancelled",
+            "cancelling",
+            "failed",
+            "queued",
+            "running",
+            "succeeded"
+          ]
+        }
+      },
+      "required": [
+        "execution_id",
+        "state",
+        "dispatch_state",
+        "compute_quiescent",
+        "result",
+        "error",
+        "instance",
+        "fence"
+      ],
+      "type": "object"
+    },
+    "Fence": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "description": "null for non-execution operations; executions start at 1",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "boot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "execution_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "model_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "operation_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "boot_id",
+        "model_id",
+        "generation",
+        "operation_id",
+        "execution_id",
+        "attempt"
+      ],
+      "type": "object"
+    },
+    "InstanceIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "container_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deployment_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "image_digest": {
+          "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "model_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "runtime_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "started_at": {
+          "description": "ISO-8601 with a UTC offset",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "container_id",
+        "started_at",
+        "deployment_id",
+        "model_id",
+        "runtime_id",
+        "candidate_digest",
+        "image_digest"
+      ],
+      "type": "object"
+    },
+    "Parameters_chat": {
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {
+          "description": "requested output tokens; the effective value is min(4096, model max_output_tokens)",
+          "maximum": 2147483647,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "seed": {
+          "description": "deterministic sampling seed",
+          "maximum": 2147483647,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "temperature": {
+          "description": "sampling temperature",
+          "maximum": 2,
+          "minimum": 0,
+          "type": "number"
+        },
+        "top_p": {
+          "description": "nucleus sampling probability",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "Parameters_embeddings": {
+      "additionalProperties": false,
+      "properties": {
+        "encoding_format": {
+          "const": "float",
+          "description": "first release accepts only float"
+        }
+      },
+      "type": "object"
+    },
+    "Parameters_rerank": {
+      "additionalProperties": false,
+      "properties": {
+        "return_documents": {
+          "description": "include document text in the response",
+          "type": "boolean"
+        },
+        "top_n": {
+          "description": "number of ranked documents to return",
+          "maximum": 2147483647,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Parameters_vision": {
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {
+          "description": "requested output tokens; the effective value is min(4096, model max_output_tokens)",
+          "maximum": 2147483647,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "seed": {
+          "description": "deterministic sampling seed",
+          "maximum": 2147483647,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "temperature": {
+          "description": "sampling temperature",
+          "maximum": 2,
+          "minimum": 0,
+          "type": "number"
+        },
+        "text": {
+          "description": "user text paired with an image Blob input",
+          "minLength": 1,
+          "type": "string"
+        },
+        "top_p": {
+          "description": "nucleus sampling probability",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "SessionCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id",
+        "idempotency_key"
+      ],
+      "type": "object"
+    },
+    "SessionView": {
+      "additionalProperties": false,
+      "properties": {
+        "boot_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expires_in_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hard_remaining_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "owner_token": {
+          "description": "null exactly when the session is closed; only returned to the owner",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "description": "preparing phases from C04",
+          "enum": [
+            "draining_existing",
+            "loading",
+            "queued",
+            null
+          ]
+        },
+        "session_id": {
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "blocked",
+            "closed",
+            "draining",
+            "preparing"
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "state",
+        "phase",
+        "boot_id",
+        "model_id",
+        "expires_in_ms",
+        "hard_remaining_ms",
+        "owner_token",
+        "error"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "capabilities": {
+    "chat": [
+      "max_tokens",
+      "seed",
+      "temperature",
+      "top_p"
+    ],
+    "embeddings": [
+      "encoding_format"
+    ],
+    "rerank": [
+      "return_documents",
+      "top_n"
+    ],
+    "vision": [
+      "max_tokens",
+      "seed",
+      "temperature",
+      "text",
+      "top_p"
+    ]
+  },
+  "description": "Strict DTOs for the local control API. Cross-field rules (terminal evidence, dispatch/instance pairing, token/null pairing, per-operation parameters) are enforced by model_scheduler.control_protocol_v1 and only documented here.",
+  "errors": {
+    "backend_failed": {
+      "retryable": false,
+      "status": 502
+    },
+    "blob_in_use": {
+      "retryable": true,
+      "status": 409
+    },
+    "busy": {
+      "retryable": true,
+      "status": 409
+    },
+    "capability_mismatch": {
+      "retryable": false,
+      "status": 422
+    },
+    "contract_violation": {
+      "retryable": false,
+      "status": 422
+    },
+    "envelope_exceeded": {
+      "retryable": false,
+      "status": 422
+    },
+    "execution_timeout": {
+      "retryable": false,
+      "status": 504
+    },
+    "idempotency_conflict": {
+      "retryable": false,
+      "status": 409
+    },
+    "instance_unknown": {
+      "retryable": true,
+      "status": 503
+    },
+    "malformed_json": {
+      "retryable": false,
+      "status": 400
+    },
+    "not_found": {
+      "retryable": false,
+      "status": 404
+    },
+    "payload_too_large": {
+      "retryable": false,
+      "status": 413
+    },
+    "peer_forbidden": {
+      "retryable": false,
+      "status": 403
+    },
+    "queue_full": {
+      "retryable": true,
+      "status": 429
+    },
+    "queue_timeout": {
+      "retryable": true,
+      "status": 504
+    },
+    "quota_exceeded": {
+      "retryable": true,
+      "status": 429
+    },
+    "reference_expired": {
+      "retryable": false,
+      "status": 410
+    },
+    "resource_unavailable": {
+      "retryable": true,
+      "status": 503
+    },
+    "session_expired": {
+      "retryable": false,
+      "status": 409
+    },
+    "stale_token": {
+      "retryable": false,
+      "status": 409
+    },
+    "storage_unavailable": {
+      "retryable": true,
+      "status": 503
+    },
+    "temporarily_unavailable": {
+      "retryable": true,
+      "status": 503
+    },
+    "unsupported_media_type": {
+      "retryable": false,
+      "status": 415
+    },
+    "unsupported_protocol": {
+      "retryable": false,
+      "status": 400
+    }
+  },
+  "limits": {
+    "blob_result_retention_seconds": 86400,
+    "correlation_id_max_length": 128,
+    "idempotency_key_max_length": 128,
+    "max_blob_bytes": 1073741824,
+    "max_inline_input_bytes": 4194304,
+    "max_parameters_bytes": 8192,
+    "request_id_max_length": 128
+  },
+  "protocol_version": 1,
+  "protocol_version_header": "X-SMS-Protocol-Version",
+  "title": "SelfModelSwitch control protocol v1"
+}

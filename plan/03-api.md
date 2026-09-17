@@ -10,7 +10,7 @@ status 展示实际 boot_id、模型状态、execution 数、预留字节和 rea
 
 ## 2. 拟议通用控制接口
 
-以下均待 M01 定型及 M04 实施；不宣称现有代码已经支持。
+以下协议的 DTO、限制与错误表已由 P02 固定（见 §5），HTTP 路由、身份接线与 Blob 实现仍待 M04；本节不代表接口已可访问。
 本机 Unix socket `/run/self-model-switch/control.sock`，0660，服务账号所有，客户端组控制访问并检查 peer UID。
 接口语义与视频领域无关，其他本机客户端使用同一协议。
 
@@ -52,3 +52,26 @@ vision adapter 可扩展既有 chat data URL 输入；audio/embedding 等能力�
 429队列满、502后端失败、503资源/存储/实例未知、504排队或执行超时；错误响应不能伪造成功或 SSE DONE。
 上游不自动重试不确定执行；terminal 必须携带完整实例身份且 quiescent=true。
 日志记请求 ID、模型、hash、耗时和状态，不记原始媒体、完整台词或凭据。
+
+## 5. 控制协议 v1 已固定契约（M01/P02）
+
+`model_scheduler/control_protocol_v1.py` 是 DTO、限制、错误码表与 schema 的唯一来源；下列数字由该模块与
+`tests/test_control_protocol_v1.py` 共同锁定。HTTP 路由/身份/Blob 实现仍待 M04（P17/P18）。
+
+- 版本：`PROTOCOL_VERSION=1`；新增 control 请求须带 `X-SMS-Protocol-Version: 1`，缺失或不支持返回 400 `unsupported_protocol`。
+- 限制（按规范 JSON 字节计）：inline 输入 ≤4 MiB、parameters ≤8192 B、Blob 1 B–1 GiB、幂等键/关联 ID/请求 ID ≤128 字节、
+  结果引用保留 86400 s。
+- 会话视图字段：session_id、state（preparing/active/draining/blocked/closed）、phase（null/queued/loading/draining_existing）、
+  boot_id、model_id、expires_in_ms、hard_remaining_ms、owner_token、error；owner_token 恰在 closed 时为 null。
+- 执行视图字段：execution_id、state（queued/running/succeeded/failed/cancelling/cancelled）、dispatch_state
+  （not_started/dispatched）、compute_quiescent、result、error、instance、fence。terminal 必须 quiescent=true；
+  succeeded 必须带 result，failed/cancelled 必须带 error；dispatched 必须带完整实例身份，not_started 不得携带容器身份
+  （排队取消不需要伪造容器）。
+- fence：(boot_id, model_id, generation, operation_id, execution_id, attempt)；execution 的 attempt 从 1 起，
+  非 execution 的最后两项为 null；执行视图的 fence 必须指向该 execution。
+- 参数闭集：chat=`max_tokens`、`temperature`(0..2)、`top_p`((0,1])、`seed`(0..2^31-1)；vision 另加 `text`；
+  embeddings=`encoding_format`（首版仅 float）；rerank=`top_n`、`return_documents`。默认值与 envelope 截断由执行层应用。
+- 错误码：24 个固定码，HTTP 状态与 retryable 以模块 `ERROR_STATUS`/`RETRYABLE_ERROR_CODES` 为准；
+  错误体中的 retryable 必须与表一致，否则拒绝。
+- schema 导出：`python -m model_scheduler.control_protocol_v1 export-schema --output schemas/control-v1.json`；
+  文件只从 DTO 与常量生成，测试重导出并按字节比较。

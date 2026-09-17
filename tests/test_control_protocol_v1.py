@@ -1,6 +1,20 @@
+"""Control-protocol-v1 contract tests (M01/P02).
+
+The draft tracked in commit b3efb78 pinned part of the DTO surface. This file
+completes it to the full C03--C06 contract: session-view phase/boot/hard-deadline
+fields, terminal-evidence rules with a mandatory fence, dispatch/instance
+pairing (a queued cancellation stays legal without a container identity),
+per-capability parameter whitelists, byte limits, UTF-8/NUL rules and the
+reproducible schema export.
+
+Every rejection test supplies complete input and asserts the specific rule, so a
+passing suite cannot be explained by a required field that happened to be
+missing.
+"""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -36,13 +50,72 @@ def _instance() -> dict:
     }
 
 
+def _fence(**overrides) -> dict:
+    fence = {
+        "boot_id": "boot-0001",
+        "model_id": "qwen25vl-7b-q4",
+        "generation": 3,
+        "operation_id": "op-0001",
+        "execution_id": "e-1",
+        "attempt": 1,
+    }
+    fence.update(overrides)
+    return fence
+
+
+def _session_view(**overrides) -> dict:
+    view = {
+        "session_id": "s-1",
+        "state": "active",
+        "phase": None,
+        "boot_id": "boot-0001",
+        "model_id": "qwen25vl-7b-q4",
+        "expires_in_ms": 25000,
+        "hard_remaining_ms": 3550000,
+        "owner_token": "boot-0001.token",
+        "error": None,
+    }
+    view.update(overrides)
+    return view
+
+
+def _execution_view(**overrides) -> dict:
+    view = {
+        "execution_id": "e-1",
+        "state": "running",
+        "dispatch_state": "dispatched",
+        "compute_quiescent": None,
+        "result": None,
+        "error": None,
+        "instance": _instance(),
+        "fence": _fence(),
+    }
+    view.update(overrides)
+    return view
+
+
+def _execution_create(**overrides) -> dict:
+    request = {
+        "session_token": "boot-0001.token",
+        "operation": "chat",
+        "input": {"inline": {"messages": [{"role": "user", "content": "hi"}]}},
+        "parameters": {},
+        "idempotency_key": "key-2",
+    }
+    request.update(overrides)
+    return request
+
+
 def test_protocol_version_and_limits_are_locked():
     assert cp.PROTOCOL_VERSION == 1
+    assert cp.PROTOCOL_VERSION_HEADER == "X-SMS-Protocol-Version"
     assert cp.MAX_INLINE_INPUT_BYTES == 4 * 1024 * 1024
     assert cp.MAX_BLOB_BYTES == 1024**3
     assert cp.BLOB_RESULT_RETENTION_SECONDS == 86400
     assert cp.IDEMPOTENCY_KEY_MAX_LENGTH == 128
     assert cp.MAX_PARAMETERS_BYTES == 8192
+    assert cp.CORRELATION_ID_MAX_LENGTH == 128
+    assert cp.REQUEST_ID_MAX_LENGTH == 128
 
 
 def test_error_document_roundtrip_and_default_retryable():
@@ -79,6 +152,11 @@ def test_error_document_rejects_unknown_and_typed_fields():
     with pytest.raises(cp.ContractError):
         cp.parse_error_document(no_request)
 
+    contradictory = _error_document()
+    contradictory["error"]["retryable"] = False
+    with pytest.raises(cp.ContractError):
+        cp.parse_error_document(contradictory)
+
 
 def test_error_status_map_is_consistent():
     for code, status in cp.ERROR_STATUS.items():
@@ -93,6 +171,48 @@ def test_error_status_map_is_consistent():
     assert cp.ERROR_STATUS["queue_timeout"] == 504
     assert cp.is_retryable_error("queue_full") is True
     assert cp.is_retryable_error("contract_violation") is False
+    with pytest.raises(cp.ContractError):
+        cp.is_retryable_error("teapot")
+
+
+def test_error_table_matches_the_plan():
+    expected = {
+        "malformed_json": (400, False),
+        "unsupported_protocol": (400, False),
+        "peer_forbidden": (403, False),
+        "not_found": (404, False),
+        "stale_token": (409, False),
+        "session_expired": (409, False),
+        "idempotency_conflict": (409, False),
+        "busy": (409, True),
+        "blob_in_use": (409, True),
+        "reference_expired": (410, False),
+        "payload_too_large": (413, False),
+        "unsupported_media_type": (415, False),
+        "contract_violation": (422, False),
+        "envelope_exceeded": (422, False),
+        "capability_mismatch": (422, False),
+        "queue_full": (429, True),
+        "quota_exceeded": (429, True),
+        "backend_failed": (502, False),
+        "instance_unknown": (503, True),
+        "storage_unavailable": (503, True),
+        "resource_unavailable": (503, True),
+        "temporarily_unavailable": (503, True),
+        "queue_timeout": (504, True),
+        "execution_timeout": (504, False),
+    }
+    assert dict(cp.ERROR_STATUS) == {code: status for code, (status, _) in expected.items()}
+    assert cp.RETRYABLE_ERROR_CODES == frozenset(
+        code for code, (_, retryable) in expected.items() if retryable
+    )
+    for code, (_, retryable) in expected.items():
+        document = cp.error_document(code, "x", "req-1")
+        assert document["error"]["retryable"] is retryable
+        with pytest.raises(cp.ContractError):  # retryable must match the table
+            cp.parse_error_document(
+                {"error": {"code": code, "message": "x", "retryable": not retryable}, "request_id": "r"}
+            )
 
 
 def test_session_create_request_is_strict():
@@ -112,6 +232,7 @@ def test_session_create_request_is_strict():
         lambda d: d.update({"idempotency_key": "k" * 129}),
         lambda d: d.update({"correlation_id": "c" * 129}),
         lambda d: d.pop("idempotency_key"),
+        lambda d: d.update({"owner": "uid:1000"}),
     ):
         data = {"model_id": "qwen25vl-7b-q4", "idempotency_key": "key-1"}
         mutate(data)
@@ -120,31 +241,61 @@ def test_session_create_request_is_strict():
 
 
 def test_session_view_states_and_token_rules():
-    view = cp.parse_session_view({"session_id": "s-1", "state": "active", "expires_in_ms": 25000, "owner_token": "tok"})
+    view = cp.parse_session_view(_session_view())
     assert view.state == "active"
-    assert view.owner_token == "tok"
+    assert view.owner_token == "boot-0001.token"
 
-    closed = cp.parse_session_view({"session_id": "s-1", "state": "closed", "expires_in_ms": 0, "owner_token": None})
+    closed = cp.parse_session_view(_session_view(state="closed", owner_token=None))
     assert closed.owner_token is None
 
     for bad_state in ("ready", "unknown"):
         with pytest.raises(cp.ContractError):
-            cp.parse_session_view({"session_id": "s-1", "state": bad_state, "expires_in_ms": 1, "owner_token": None})
+            cp.parse_session_view(_session_view(state=bad_state))
+    with pytest.raises(cp.ContractError):  # a non-closed session must return a token
+        cp.parse_session_view(_session_view(owner_token=None))
+    with pytest.raises(cp.ContractError):  # a closed session must not return a token
+        cp.parse_session_view(_session_view(state="closed", owner_token="boot-0001.token"))
     with pytest.raises(cp.ContractError):
-        cp.parse_session_view({"session_id": "s-1", "state": "active", "expires_in_ms": 1})
+        cp.parse_session_view(_session_view(expires_in_ms=True))
     with pytest.raises(cp.ContractError):
-        cp.parse_session_view({"session_id": "s-1", "state": "active", "expires_in_ms": True, "owner_token": None})
+        cp.parse_session_view(_session_view(hard_remaining_ms=-1))
+
+
+def test_session_view_phase_and_error_fields():
+    preparing = cp.parse_session_view(_session_view(state="preparing", phase="queued", expires_in_ms=0))
+    assert preparing.phase == "queued"
+    assert preparing.expires_in_ms == 0
+
+    blocked = cp.parse_session_view(
+        _session_view(
+            state="blocked",
+            phase=None,
+            error={"code": "temporarily_unavailable", "message": "cleanup not proven", "retryable": True},
+        )
+    )
+    assert blocked.error is not None and blocked.error.retryable is True
+
+    with pytest.raises(cp.ContractError):  # "ready" is not a preparing phase
+        cp.parse_session_view(_session_view(phase="ready"))
+    with pytest.raises(cp.ContractError):  # unknown error code inside the view
+        cp.parse_session_view(_session_view(error={"code": "teapot", "message": "x", "retryable": False}))
+
+
+def test_session_view_requires_every_field():
+    for key in sorted(cp.SESSION_VIEW_KEYS):
+        data = _session_view()
+        del data[key]
+        with pytest.raises(cp.ContractError):
+            cp.parse_session_view(data)
 
 
 def test_execution_create_request_is_strict():
     request = cp.parse_execution_create_request(
-        {
-            "session_token": "tok",
-            "operation": "vision",
-            "input": {"inline": {"image": "data:image/png;base64,AAAA"}},
-            "parameters": {"max_tokens": 4096},
-            "idempotency_key": "key-2",
-        }
+        _execution_create(
+            operation="vision",
+            input={"inline": {"image": "data:image/png;base64,AAAA"}},
+            parameters={"max_tokens": 4096},
+        )
     )
     assert request.operation == "vision"
     assert request.parameters == {"max_tokens": 4096}
@@ -155,14 +306,10 @@ def test_execution_create_request_is_strict():
         lambda d: d.update({"parameters": {"bad key": 1}}),
         lambda d: d.pop("input"),
         lambda d: d.update({"input": {"inline": {}, "blob": _blob_ref()}}),
+        lambda d: d.pop("idempotency_key"),
+        lambda d: d.update({"deadline": 10}),
     ):
-        data = {
-            "session_token": "tok",
-            "operation": "chat",
-            "input": {"inline": {"prompt": "hi"}},
-            "parameters": {},
-            "idempotency_key": "key-2",
-        }
+        data = _execution_create()
         mutate(data)
         with pytest.raises(cp.ContractError):
             cp.parse_execution_create_request(data)
@@ -192,6 +339,7 @@ def test_blob_ref_is_strict():
         ("size_bytes", cp.MAX_BLOB_BYTES + 1),
         ("media_type", "png"),
         ("media_type", "IMAGE/PNG"),
+        ("media_type", "image/png; charset=utf-8"),
         ("owner", ""),
         ("blob_id", "UPPER"),
     ):
@@ -203,100 +351,150 @@ def test_blob_ref_is_strict():
 
 def test_execution_view_terminal_rules():
     succeeded = cp.parse_execution_view(
-        {
-            "execution_id": "e-1",
-            "state": "succeeded",
-            "compute_quiescent": True,
-            "result": _blob_ref(),
-            "error": None,
-            "instance": _instance(),
-        }
+        _execution_view(state="succeeded", compute_quiescent=True, result=_blob_ref())
     )
     assert succeeded.state == "succeeded"
     assert succeeded.result is not None
+    assert succeeded.compute_quiescent is True
 
-    with pytest.raises(cp.ContractError):
+    with pytest.raises(cp.ContractError):  # succeeded without result
+        cp.parse_execution_view(_execution_view(state="succeeded", compute_quiescent=True))
+    with pytest.raises(cp.ContractError):  # not quiescent
         cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "succeeded",
-                "compute_quiescent": True,
-                "result": None,
-                "error": None,
-                "instance": _instance(),
-            }
+            _execution_view(state="succeeded", compute_quiescent=False, result=_blob_ref())
         )
-    with pytest.raises(cp.ContractError):
+    with pytest.raises(cp.ContractError):  # missing quiescence proof
         cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "succeeded",
-                "compute_quiescent": False,
-                "result": _blob_ref(),
-                "error": None,
-                "instance": _instance(),
-            }
+            _execution_view(state="succeeded", compute_quiescent=None, result=_blob_ref())
         )
-    with pytest.raises(cp.ContractError):
+    with pytest.raises(cp.ContractError):  # succeeded with an error
         cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "failed",
-                "compute_quiescent": True,
-                "result": None,
-                "error": None,
-                "instance": _instance(),
-            }
+            _execution_view(
+                state="succeeded",
+                compute_quiescent=True,
+                result=_blob_ref(),
+                error={"code": "backend_failed", "message": "x", "retryable": False},
+            )
         )
+
+    failed = cp.parse_execution_view(
+        _execution_view(
+            state="failed",
+            compute_quiescent=True,
+            error={"code": "backend_failed", "message": "backend died", "retryable": False},
+        )
+    )
+    assert failed.error is not None and failed.result is None
+    with pytest.raises(cp.ContractError):  # failed without error
+        cp.parse_execution_view(_execution_view(state="failed", compute_quiescent=True))
+    with pytest.raises(cp.ContractError):  # failed with a result
+        cp.parse_execution_view(
+            _execution_view(
+                state="failed",
+                compute_quiescent=True,
+                result=_blob_ref(),
+                error={"code": "backend_failed", "message": "x", "retryable": False},
+            )
+        )
+
+    cancelled = cp.parse_execution_view(
+        _execution_view(
+            state="cancelled",
+            compute_quiescent=True,
+            error={"code": "execution_timeout", "message": "cancelled", "retryable": False},
+        )
+    )
+    assert cancelled.state == "cancelled"
+
+
+def test_execution_view_requires_a_fence_identifying_the_execution():
+    with pytest.raises(cp.ContractError):  # fence missing entirely
+        data = _execution_view()
+        del data["fence"]
+        cp.parse_execution_view(data)
+    with pytest.raises(cp.ContractError):  # a non-execution fence is not enough
+        cp.parse_execution_view(_execution_view(fence=_fence(execution_id=None, attempt=None)))
+    with pytest.raises(cp.ContractError):  # fence belongs to another execution
+        cp.parse_execution_view(_execution_view(fence=_fence(execution_id="e-2")))
 
 
 def test_execution_view_non_terminal_rejects_terminal_fields():
-    running = cp.parse_execution_view(
-        {
-            "execution_id": "e-1",
-            "state": "running",
-            "compute_quiescent": None,
-            "result": None,
-            "error": None,
-            "instance": None,
-        }
-    )
+    running = cp.parse_execution_view(_execution_view())
     assert running.state == "running"
+    assert running.compute_quiescent is None
+    assert running.result is None
+    assert running.error is None
 
-    with pytest.raises(cp.ContractError):
+    with pytest.raises(cp.ContractError):  # quiescent on a running execution
+        cp.parse_execution_view(_execution_view(compute_quiescent=True))
+    with pytest.raises(cp.ContractError):  # result on a cancelling execution
+        cp.parse_execution_view(_execution_view(state="cancelling", result=_blob_ref()))
+    with pytest.raises(cp.ContractError):  # error on a queued execution
         cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "running",
-                "compute_quiescent": True,
-                "result": None,
-                "error": None,
-                "instance": None,
-            }
+            _execution_view(
+                state="queued",
+                dispatch_state="not_started",
+                instance=None,
+                error={"code": "busy", "message": "x", "retryable": True},
+            )
         )
-    with pytest.raises(cp.ContractError):
-        cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "cancelling",
-                "compute_quiescent": None,
-                "result": _blob_ref(),
-                "error": None,
-                "instance": None,
-            }
+    with pytest.raises(cp.ContractError):  # unknown field
+        data = _execution_view()
+        data["extra"] = 1
+        cp.parse_execution_view(data)
+
+
+def test_execution_view_dispatch_state_pairs_with_instance():
+    queued = cp.parse_execution_view(
+        _execution_view(state="queued", dispatch_state="not_started", instance=None)
+    )
+    assert queued.instance is None
+
+    with pytest.raises(cp.ContractError):  # not_started must not invent a container
+        cp.parse_execution_view(_execution_view(state="queued", dispatch_state="not_started"))
+    with pytest.raises(cp.ContractError):  # dispatched requires a full identity
+        cp.parse_execution_view(_execution_view(dispatch_state="dispatched", instance=None))
+    with pytest.raises(cp.ContractError):  # unknown dispatch state
+        cp.parse_execution_view(_execution_view(dispatch_state="sent"))
+
+    # a queued cancellation is legal with not_started evidence and no container
+    cancelled = cp.parse_execution_view(
+        _execution_view(
+            state="cancelled",
+            dispatch_state="not_started",
+            instance=None,
+            compute_quiescent=True,
+            error={"code": "queue_timeout", "message": "cancelled before dispatch", "retryable": True},
         )
-    with pytest.raises(cp.ContractError):
-        cp.parse_execution_view(
-            {
-                "execution_id": "e-1",
-                "state": "queued",
-                "compute_quiescent": None,
-                "result": None,
-                "error": None,
-                "instance": None,
-                "extra": 1,
-            }
-        )
+    )
+    assert cancelled.instance is None
+    assert cancelled.error is not None
+
+
+def test_fence_requires_paired_execution_fields():
+    fence = cp.parse_fence(_fence())
+    assert fence.execution_id == "e-1"
+    assert fence.attempt == 1
+
+    operation = cp.parse_fence(_fence(execution_id=None, attempt=None))
+    assert operation.execution_id is None and operation.attempt is None
+
+    for pair in ({"execution_id": "e-1", "attempt": None}, {"execution_id": None, "attempt": 1}):
+        with pytest.raises(cp.ContractError):
+            cp.parse_fence(_fence(**pair))
+
+    for bad in (
+        {"generation": 0},
+        {"generation": True},
+        {"attempt": 0},
+        {"attempt": True},
+        {"model_id": "UPPER"},
+        {"operation_id": "op 1"},
+        {"boot_id": ""},
+        {"execution_id": "UPPER"},
+    ):
+        with pytest.raises(cp.ContractError):
+            cp.parse_fence(_fence(**bad))
 
 
 def test_instance_identity_is_strict():
@@ -309,11 +507,115 @@ def test_instance_identity_is_strict():
         ("model_id", "UPPER"),
         ("started_at", ""),
         ("container_id", ""),
+        ("started_at", "2026-09-17T05:00:00"),
+        ("started_at", "2026-09-17T05:00:00+08:00"),
     ):
         data = _instance()
         data[key] = value
         with pytest.raises(cp.ContractError):
             cp.parse_instance_identity(data)
+
+
+def test_parameters_follow_the_capability_whitelist():
+    chat = cp.parse_execution_create_request(
+        _execution_create(
+            parameters={"max_tokens": 512, "temperature": 0.7, "top_p": 0.9, "seed": 7}
+        )
+    )
+    assert chat.parameters == {"max_tokens": 512, "temperature": 0.7, "top_p": 0.9, "seed": 7}
+
+    with pytest.raises(cp.ContractError):  # not a chat parameter
+        cp.parse_execution_create_request(_execution_create(parameters={"repetition_penalty": 1.1}))
+    with pytest.raises(cp.ContractError):  # text belongs to vision only
+        cp.parse_execution_create_request(_execution_create(parameters={"text": "hello"}))
+    with pytest.raises(cp.ContractError):  # max_tokens is not an embeddings parameter
+        cp.parse_execution_create_request(_execution_create(operation="embeddings", parameters={"max_tokens": 1}))
+
+    vision = cp.parse_execution_create_request(
+        _execution_create(operation="vision", parameters={"max_tokens": 4096, "text": "describe"})
+    )
+    assert vision.parameters["text"] == "describe"
+
+    embeddings = cp.parse_execution_create_request(
+        _execution_create(operation="embeddings", parameters={"encoding_format": "float"})
+    )
+    assert embeddings.parameters == {"encoding_format": "float"}
+    with pytest.raises(cp.ContractError):  # first release accepts only float
+        cp.parse_execution_create_request(
+            _execution_create(operation="embeddings", parameters={"encoding_format": "base64"})
+        )
+
+    rerank = cp.parse_execution_create_request(
+        _execution_create(operation="rerank", parameters={"top_n": 3, "return_documents": True})
+    )
+    assert rerank.parameters == {"top_n": 3, "return_documents": True}
+    with pytest.raises(cp.ContractError):  # top_n must be a positive integer
+        cp.parse_execution_create_request(_execution_create(operation="rerank", parameters={"top_n": 0}))
+
+
+def test_parameter_ranges_are_locked():
+    for parameters in (
+        {"temperature": 2.5},
+        {"temperature": -0.1},
+        {"top_p": 0},
+        {"top_p": 1.5},
+        {"seed": -1},
+        {"seed": 2**31},
+        {"max_tokens": 0},
+    ):
+        with pytest.raises(cp.ContractError):
+            cp.parse_execution_create_request(_execution_create(parameters=parameters))
+
+    boundary = cp.parse_execution_create_request(
+        _execution_create(parameters={"temperature": 0, "top_p": 1, "seed": 0})
+    )
+    assert boundary.parameters["temperature"] == 0
+    assert boundary.parameters["top_p"] == 1
+
+
+def test_parameters_reject_non_finite_and_boolean_values():
+    for parameters in (
+        {"temperature": float("nan")},
+        {"temperature": float("inf")},
+        {"top_p": float("-inf")},
+        {"max_tokens": True},
+        {"seed": False},
+    ):
+        with pytest.raises(cp.ContractError):
+            cp.parse_execution_create_request(_execution_create(parameters=parameters))
+
+    with pytest.raises(cp.ContractError):  # boolean parameter must be a real bool
+        cp.parse_execution_create_request(
+            _execution_create(operation="rerank", parameters={"return_documents": 1})
+        )
+
+
+def test_inline_and_parameter_byte_limits():
+    huge_inline = {"payload": "x" * (cp.MAX_INLINE_INPUT_BYTES + 1)}
+    with pytest.raises(cp.ContractError):
+        cp.parse_execution_input({"inline": huge_inline})
+
+    ok_inline = {"payload": "x" * 1024}
+    assert cp.parse_execution_input({"inline": ok_inline}).inline is not None
+
+    huge_text = "y" * (cp.MAX_PARAMETERS_BYTES + 1)
+    with pytest.raises(cp.ContractError):
+        cp.parse_execution_create_request(
+            _execution_create(operation="vision", parameters={"text": huge_text})
+        )
+
+
+def test_strings_reject_nul_and_surrogates():
+    with pytest.raises(cp.ContractError):
+        cp.parse_session_create_request({"model_id": "m-1", "idempotency_key": "bad\x00key"})
+    with pytest.raises(cp.ContractError):
+        cp.parse_session_create_request({"model_id": "m-1", "idempotency_key": "bad\ud800"})
+    with pytest.raises(cp.ContractError):
+        cp.parse_execution_input({"inline": {"prompt": "bad\x00text"}})
+    with pytest.raises(cp.ContractError):
+        cp.parse_execution_input({"inline": {"nested": {"deep": ["ok", "bad\ud800"]}}})
+    with pytest.raises(cp.ContractError):  # nested non-finite number
+        cp.parse_execution_input({"inline": {"nested": [1, float("inf")]}})
 
 
 def test_idempotency_fingerprint_is_owner_key_and_payload_sensitive():
@@ -323,12 +625,15 @@ def test_idempotency_fingerprint_is_owner_key_and_payload_sensitive():
     assert first != cp.idempotency_fingerprint("client-b", "key-1", {"operation": "chat", "input": {"prompt": "hi"}})
     assert first != cp.idempotency_fingerprint("client-a", "key-2", {"operation": "chat", "input": {"prompt": "hi"}})
     assert first != cp.idempotency_fingerprint("client-a", "key-1", {"operation": "chat", "input": {"prompt": "ho"}})
+    with pytest.raises(cp.ContractError):  # non-finite payloads cannot be canonicalised
+        cp.idempotency_fingerprint("client-a", "key-1", {"temperature": float("nan")})
 
 
 def test_reference_expiry_helper():
     now = 1_000_000.0
     assert cp.reference_expired(now - cp.BLOB_RESULT_RETENTION_SECONDS - 1, now) is True
     assert cp.reference_expired(now - cp.BLOB_RESULT_RETENTION_SECONDS + 1, now) is False
+    assert cp.reference_expired(now - cp.BLOB_RESULT_RETENTION_SECONDS, now) is True
     with pytest.raises(cp.ContractError):
         cp.reference_expired(now, now, retention_seconds=0)
 
@@ -349,3 +654,42 @@ def test_correlation_and_request_id_lengths_are_bounded():
         )
     with pytest.raises(cp.ContractError):
         cp.parse_error_document({"error": {"code": "busy", "message": "x", "retryable": True}, "request_id": ""})
+    with pytest.raises(cp.ContractError):
+        cp.parse_error_document(
+            {"error": {"code": "busy", "message": "x", "retryable": True}, "request_id": "r" * 129}
+        )
+
+
+def test_strict_json_parsing_rejects_duplicates_and_non_finite():
+    with pytest.raises(cp.ContractError):
+        cp.parse_json_document('{"a": 1, "a": 2}')
+    with pytest.raises(cp.ContractError):
+        cp.parse_json_document('{"a": 1e999}')
+    with pytest.raises(cp.ContractError):
+        cp.parse_json_document('{"a": NaN}')
+
+    assert cp.parse_json_document('{"a": [1, 2], "b": "x"}') == {"a": [1, 2], "b": "x"}
+
+
+def test_schema_document_covers_every_capability_parameter():
+    schema = cp.schema_document()
+    assert schema["protocol_version"] == cp.PROTOCOL_VERSION
+    assert sorted(schema["errors"]) == sorted(cp.ERROR_STATUS)
+    for operation in sorted(cp.CAPABILITIES):
+        assert schema["capabilities"][operation] == sorted(cp.PARAMETER_RULES[operation])
+        parameters = schema["$defs"][f"Parameters_{operation}"]
+        assert sorted(parameters["properties"]) == sorted(cp.PARAMETER_RULES[operation])
+        assert parameters["additionalProperties"] is False
+
+
+def test_schema_export_is_reproducible(tmp_path):
+    output = tmp_path / "control-v1.json"
+    cp.write_schema(output)
+    committed = Path(__file__).resolve().parents[1] / "schemas" / "control-v1.json"
+    assert committed.read_bytes() == output.read_bytes()
+
+
+def test_export_schema_cli(tmp_path):
+    output = tmp_path / "schema.json"
+    assert cp.main(["export-schema", "--output", str(output)]) == 0
+    assert output.read_text(encoding="utf-8") == cp.render_schema_text()
