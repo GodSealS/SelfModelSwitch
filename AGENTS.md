@@ -34,11 +34,50 @@ ssh -i ~/.ssh/selfmodelswitch-target-agent -o IdentitiesOnly=yes \
 Stop and resolve a hardware mismatch before using device-specific CUDA
 architectures, memory envelopes, or release evidence.
 
+## Git management and synchronization ownership
+
+- Use the `cs-git-workflow` skill to execute Git management and synchronization
+  between the development and test machines. Read its `SKILL.md` before
+  performing this workflow; this guide's target-safety rules take precedence.
+- The delivery path is: development branch -> atomic local commit -> push to
+  the shared remote -> target fast-forward pull -> matching commit SHA -> test.
+  A local commit alone does not make code available to the target.
+- Only the development machine creates commits, resolves conflicts, merges,
+  and pushes. The target is a checkout for testing; do not commit or push there,
+  copy tracked files over SSH, or use uncommitted files as release evidence.
+- Before work, inspect `git status --short`, `git branch -vv`, and
+  `git remote -v`. Fetch with `git fetch origin`, then inspect the upstream
+  ahead/behind history. Preserve existing user changes and review unpublished
+  commits before including them in a push. Never use `git add .` indiscriminately.
+- Use short-lived `feature/`, `fix/`, `chore/`, or `refactor/` branches. Create
+  one with `git switch -c <branch>` from the intended base; use a separate
+  worktree when existing changes would interfere. Do not switch or stash away
+  unrelated user work automatically. Set upstream tracking on the first push.
+- Confirm the shared remote URL, delivery branch, and absolute target checkout
+  path before synchronization. `origin` currently points to
+  `https://github.com/GodSealS/SelfModelSwitch.git`; verify it on both machines.
+  Use configured Git authentication, never credentials embedded in URLs or
+  commands. The SSH key for reaching the target does not grant GitHub access.
+- For a first-time target checkout, clone the verified remote into an unused
+  directory with `git clone --branch <branch> --single-branch <remote-url>
+  <target-repository>`. Do not clone over an existing checkout. If Git access
+  fails, resolve remote authentication/connectivity before continuing.
+- Stop on dirty target state, divergent history, a rejected push, or a SHA
+  mismatch. Inspect `git status`, `git diff`, and `git log --oneline --graph
+  --decorate --all`; resolve code conflicts locally, rerun checks, and push a
+  new commit. Never force-push, reset, clean, or automatically stash target work.
+- Merge accepted changes on the development side using the repository's review
+  process, then push and synchronize the resulting commit again. Roll back via
+  a reviewed `git revert <commit>` locally, followed by checks, commit/push,
+  target synchronization, and retest; preserve the original failure evidence.
+
 ## Development and debug path
 
 1. Write and review code on the development machine only. Do not edit tracked
    project files directly on the target machine.
-2. Run local checks with the release Python version:
+2. Run local checks with the release Python version (Python 3.12). For a
+   documentation-only change, review the instructions and run `git diff --check`;
+   the runtime suite is required when code or configuration behavior changes.
 
    ```bash
    python -m pytest tests -m 'not thor' -q
@@ -52,32 +91,81 @@ architectures, memory envelopes, or release evidence.
 
    ```bash
    git diff --check
+   git status --short
+   git diff --cached
+   # If unrelated changes are already staged, isolate this work before proceeding.
+   git add -- <intended-files>
+   git diff --cached --check
+   git diff --cached
    if git diff --cached | grep -Ei 'password|secret|api[_-]?key|token'; then
      echo 'Possible secret in staged diff; inspect before committing.' >&2
      exit 1
    fi
-   git status --short
-   git add <intended-files>
    git commit -m 'type: concise reason for the change'
    ```
 
-4. On the target, update to the exact commit being tested. Verify the working
-   tree is clean before and after updating; never discard target changes with
-   `git reset --hard` or `git checkout --`.
+   The keyword scan is a review aid: inspect matches, distinguish documentation
+   from actual credentials, and remove any real secrets before committing.
+
+4. Push the reviewed delivery branch from the development machine. Review all
+   commits being published, including any that predate this task. Run the
+   following in Bash after local checks and commit review; stop on any failure:
+
+   ```bash
+   set -euo pipefail
+   sync_branch=$(git symbolic-ref --quiet --short HEAD)
+   expected_sha=$(git rev-parse HEAD)
+   git fetch origin
+   # For an existing remote branch, review origin/<branch>..HEAD before pushing.
+   # For a new branch, review the commits since its intended base.
+   git push --set-upstream origin "${sync_branch}:${sync_branch}"
+   remote_sha=$(git ls-remote --exit-code origin "refs/heads/${sync_branch}" | awk '{print $1}')
+   test "$remote_sha" = "$expected_sha"
+   printf 'branch=%s\nexpected_sha=%s\n' "$sync_branch" "$expected_sha"
+   ```
+
+5. On the target, synchronize the same branch and verify the exact commit before
+   testing. Replace the three placeholders below with the confirmed checkout
+   path, pushed branch, and full SHA from step 4. Check the remote URL before
+   running this block. Its clean-tree guards include untracked files; keep test
+   output outside the checkout. A changing remote branch may cause the final
+   SHA check to fail; do not test until the intended commit is resolved.
 
    ```bash
    ssh -i ~/.ssh/selfmodelswitch-target-agent -o IdentitiesOnly=yes \
-     jtzn@192.168.55.1 'cd <target-repository> && git status --short && git pull --ff-only && git rev-parse HEAD'
+     jtzn@192.168.55.1 'bash -se' <<'TARGET_SYNC'
+   set -euo pipefail
+   target_repository='<absolute-target-repository>'
+   sync_branch='<pushed-branch>'
+   expected_sha='<full-commit-sha>'
+   cd "$target_repository"
+   git status --short
+   test -z "$(git status --porcelain --untracked-files=all)"
+   git fetch origin "refs/heads/${sync_branch}:refs/remotes/origin/${sync_branch}"
+   git show-ref --verify "refs/remotes/origin/${sync_branch}"
+   if git show-ref --verify --quiet "refs/heads/${sync_branch}"; then
+     git switch "$sync_branch"
+   else
+     git switch --track -c "$sync_branch" "origin/$sync_branch"
+   fi
+   git branch --set-upstream-to="origin/$sync_branch" "$sync_branch"
+   git pull --ff-only origin "$sync_branch"
+   actual_sha=$(git rev-parse HEAD)
+   test "$actual_sha" = "$expected_sha"
+   test -z "$(git status --porcelain --untracked-files=all)"
+   printf 'verified_target_sha=%s\n' "$actual_sha"
+   TARGET_SYNC
    ```
 
-5. From the development machine, control the target over SSH to run the
+6. From the development machine, control the target over SSH to run the
    hardware test. Record the commit SHA, model path and SHA-256, CUDA/runtime
    version, command, exit code, elapsed time, peak memory, and stop/quiescence
-   evidence with the test result.
-6. Diagnose failures without modifying the target checkout by default: collect
+   evidence with the test result. Also record the remote URL, branch, local SHA,
+   verified target SHA, and target clean-tree status before and after testing.
+7. Diagnose failures without modifying the target checkout by default: collect
    service logs, process state, GPU/thermal telemetry, mount state, and disk
-   space first. Make the fix locally, commit it, update the target with a
-   fast-forward-only pull, and retest the same scenario.
+   space first. Make the fix locally, check and commit it, push the branch, repeat
+   step 5's guarded fast-forward synchronization, and retest the same scenario.
 
 ## Target safety and debugging
 
@@ -98,7 +186,10 @@ architectures, memory envelopes, or release evidence.
 ## Completion criteria
 
 For a code change, completion requires: local checks appropriate to the change,
-a clean intended diff, an atomic local commit, target checkout at that commit,
-and recorded target-test evidence when hardware behavior is in scope. A plan
+a clean intended diff, an atomic local commit, a verified push to the shared
+remote, target checkout at that same commit, and recorded target-test evidence
+when hardware behavior is in scope. For documentation-only tasks, local review
+and an atomic commit suffice unless publishing or target synchronization was
+requested; explicitly report whether push and target synchronization occurred. A plan
 document is not an acceptance result; follow the relevant M00--M07 acceptance
 criteria in `plan/`.
