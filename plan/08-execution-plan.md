@@ -600,10 +600,10 @@ Device not configured`；`git ls-remote origin refs/heads/main` 仍为 `8d4edcd4
 **Verification:** `python -m pytest tests/test_llama_swap_fixture.py tests/test_llama_swap_client.py tests/test_capture_control_fixture.py -q`；目标受控探测并记录停止证据。
 **本轮执行记录（2026-09-18）:** status=blocked（未开始实现，先做只读材料核对）；起点 commit `2a9ec8b`（P06 记录提交）。
 已核实事实（本机 + 目标只读 SSH，未改动目标）：
-- 本机：`origin` = `https://github.com/GodSealS/SelfModelSwitch.git`；匿名读可用（`git fetch origin` exit 0），写不可用——
-  `git push` 报 `fatal: could not read Username for 'https://github.com': Device not configured`（`credential.helper=osxkeychain` 处无 github.com 条目，
-  登录 shell 内同样失败）；`git ls-remote` 显示远端 main 仍为 `8d4edcd496423cbeaefe2e94d2f5cd75080d7823`，本地领先 5 个提交
-  （`cea36ca`、`dbdab2a`、`218e7c0`、`41656cc`、`2a9ec8b`；本记录提交后为 6 个）。
+- 本机：`origin` 取回仍为 `https://github.com/GodSealS/SelfModelSwitch.git`；HTTPS 写通道不可用（`git push` 报
+  `could not read Username ... Device not configured`），但 GitHub **SSH 认证已配置且可用**（`ssh -T git@github.com` → `Hi GodSealS!`）。
+  已按用户决定把 `remote.origin.pushurl` 设为 `git@github.com:GodSealS/SelfModelSwitch.git`（取回 URL 不变），推送成功：
+  `8d4edcd..6ad8b89`，并以 `git ls-remote` 核对远端 main = 本地 HEAD = `6ad8b8912c479dbb57ff3bd3776c8cbce9543d41`。
 - 目标 `jtzn@192.168.55.1`：`jtzn-desktop`，L4T R36.4.7，aarch64；`/home/jtzn/SelfModelSwitch` 干净且 HEAD=`8d4edcd4…`（与远端一致，无法 fast-forward）；
   `python3`=3.10.12（`/opt/self-model-switch/toolchains/` 另有 cpython-3.12.14）；docker CLI/Server 29.2.1 可用但 **`docker images` 为空**；
   `/opt/self-model-switch` 下只有 `probes/llama.cpp-4bc272fd729bd094c0422e4b8353da8d2fec91f8` 与 `toolchains/`，**全盘未安装 llama-swap**
@@ -625,6 +625,26 @@ Device not configured`；`git ls-remote origin refs/heads/main` 仍为 `8d4edcd4
 失败保留材料、不下载资产、不写系统安装目录），推送并同步目标；② 目标受控维护环境执行探测，保存 running 空/非空、真实模型 load、
 unload 的 request/status/content-type/body 与实例证据；③ 按原始材料回填 fixture 与 `model_scheduler/llama_swap_contract.py`，
 并把"fixture 必须不完整"的测试改为真实协议正反例。
+**材料核对更新（2026-09-18，第二次只读核对 + 交付链恢复）:**
+- **交付链已恢复并验证**：SSH 推送后远端 main = `6ad8b89…`。目标 `origin` 实为其本机裸仓库镜像
+  `/home/jtzn/git/SelfModelSwitch.git`（无上游、此前停在 `8d4edcd4…`，与 AGENTS.md 的"两端确认远端 URL"不一致）；本轮把**已发布**的
+  同一提交以 git 传输推入该镜像（不复制 tracked 文件），目标 checkout 再 `git fetch` + `git pull --ff-only`，
+  `actual_sha=6ad8b891…`、工作区干净（`TARGET_SYNC_VERIFIED`），并可看到 P06 新模块文件。该镜像的更新时间点/责任方需在 M02 检查点复核。
+- **目标环境事实**（只读）：docker CLI/Server 29.2.1，`/etc/docker/daemon.json` 已注册 `nvidia` runtime（`nvidia-container-cli` 1.16.2）；
+  根盘余 21G、模型盘余 385G；**无外网**（`https://github.com` 与 `registry-1.docker.io` 均超时，无 proxy env）；无 Go 工具链；
+  `/opt/self-model-switch` 仅 `probes/llama.cpp-4bc272…` 与 `toolchains/cpython-3.12.14`。
+- **首候选镜像（按 §6，用户已选择构建固定镜像）**：因两机均无外网、目标无任何基础镜像，唯一可行路径是**在目标本地离线构建**
+  `FROM scratch` 镜像：内容 = 已核验 M00 runtime 的 `RUNTIME-SHA256` 十项文件（逐项 `sha256sum -c` 通过，未列出的常规文件为零）
+  \+ 宿主 glibc/libstdc++/openssl/libgomp（路径按 `ldd` 的 NEEDED 布局 `/lib/aarch64-linux-gnu/…`，含 `/lib/ld-linux-aarch64.so.1`），
+  `ENTRYPOINT ["/opt/llama-cpp/llama-server"]`，`--network=none` 构建；冒烟项为 `--version`、`--gpus all --list-devices`、
+  只读挂载 `/media/jtzn/sandisk-ext4/models` 后被指向 `/models/<缺失文件>` 的报错。构建上下文与命令已定稿，
+  但目标侧构建命令本轮两次因**交互审批超时被取消**（`Execution Cancelled: permission request timed out`），因此
+  **image digest 尚未产生**，P06a 探测 manifest 与 P06b lab 仍缺该输入；恢复动作 = 用户批准目标侧 `docker build` 命令（或改为
+  在受控维护窗口内由用户执行同一命令）。
+- **llama-swap 发行物：本环境无法取得**。开发机与目标均无 HTTPS 出口（`curl https://github.com` / release 下载均超时；
+  GitHub 不通过 SSH 提供 release 资产），两机本地与 Spotlight 缓存内均无 `llama-swap_217_linux_arm64.tar.gz`，目标无 Go 无法自建。
+  恢复动作：由仓库所有者提供该固定发行物（例如放至开发机 `~/Downloads/llama-swap_217_linux_arm64.tar.gz`），
+  我将按 fixture 记录的 sha256 `36c58c…` 核对后再带入目标安装与探测；在它到位前 P06a 保持 `blocked`，P06b—P31 按 §3 硬前置不动。
 
 ### P06b — 动态lab渲染与runner入口接线（M02）
 
