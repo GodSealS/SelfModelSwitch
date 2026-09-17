@@ -528,6 +528,9 @@ reason 统一改为 `asset_changed`，其余快照结构、`StorageAdmissionGuar
 以及与 P06 起的真实 llama-swap/lab 布置联调——这些按计划在目标 Orin 上以临时挂载和临时文件验证，
 本轮不动实际模型盘，也没有任何设备侧证据。另：`verify_timeout_seconds` 目前只在 Monitor 构造参数处生效，
 尚未由运行时组合处从配置注入（属 P08/P17 范围）。
+**同步状态:** 与 P04 相同——本环境无法向 `origin` 推送（首次 `could not read Username ... Device not configured`，
+重试为 `Failed to connect to github.com port 443`），P04/P05 提交 `cea36ca`、`dbdab2a` 仅存在于本地 main，
+远端与目标 clean checkout 均未同步，因此本任务结论仍为 `software_only`，不是设备侧通过。
 
 ### P06 — 受控runtime启动与动态后端路由（M02）
 
