@@ -52,7 +52,8 @@ M00/V00仍待真实环境；新增控制/表格schema仍待M01/V01，不声称�
 | task_id | P00 |
 | status | complete |
 | source_commit | `63f7d8e13319d57e946e46d5766703e55d75c9a3` |
-| target_commit | `63f7d8e13319d57e946e46d5766703e55d75c9a3`（`/home/jtzn/SelfModelSwitch`，`git status --short` 为空） |
+| target_commit | `63f7d8e13319d57e946e46d5766703e55d75c9a3`（只读核对时的 `/home/jtzn/SelfModelSwitch`，`git status --short` 为空） |
+| target_sync | 记录提交后按 AGENTS 流程 `git pull --ff-only` 同步到本记录所在提交；同步前后 `git status --short` 均为空，未 reset、未复制目标 tracked 文件 |
 | python_version | 3.12.11（`/Users/monster/.local/share/selfmodelswitch/venv312/bin/python`） |
 | candidate_sha256 | null（本任务不产出候选） |
 | evidence_directory | 目标只读复核 `/home/jtzn/self-model-switch-evidence/`；未新建、未删除任何材料 |
@@ -159,14 +160,15 @@ macOS 无法按哈希安装，故本轮以 `--no-verify-hashes` 安装同版本�
 
 ### 6. 目标机只读核对
 
-按 [AGENTS.md](../AGENTS.md) 使用 `-i ~/.ssh/selfmodelswitch-target-agent -o IdentitiesOnly=yes` 只读 SSH；
-本轮未在目标机执行任何写操作，未加载模型，未重启服务。
+按 [AGENTS.md](../AGENTS.md) 使用 `-i ~/.ssh/selfmodelswitch-target-agent -o IdentitiesOnly=yes` SSH。下表核对全部只读，
+未加载模型、未重启服务；本轮唯一的目标机写操作是本记录提交后的 `git pull --ff-only` 同步（第 1 节 `target_sync`），
+它只推进 checkout，不改变任何目标 tracked 文件内容。
 
 | 项 | 实测 |
 |---|---|
 | 设备 | `jtzn-desktop`；`Linux 5.15.148-tegra` aarch64；L4T `R36.4.7`（与 m00-envelope §2 一致，未换机） |
 | 目标解释器 | `python3` 3.10.12（probe harness 口径；本任务不在目标机运行发布解释器） |
-| 仓库 | `/home/jtzn/SelfModelSwitch`，branch `main`，`origin` = `/home/jtzn/git/SelfModelSwitch.git`，HEAD `63f7d8e…`，工作区干净 |
+| 仓库 | `/home/jtzn/SelfModelSwitch`，branch `main`，`origin` = `/home/jtzn/git/SelfModelSwitch.git`；只读核对时 HEAD `63f7d8e…`、工作区干净；本轮结束时已 fast-forward 到本记录所在提交，工作区仍干净 |
 | 运行状态 | 无 llama/模型相关进程；监听仅 22/111/53；`/etc/systemd/system` 无 `model-scheduler`/`llama-swap` 单元（仅 `nvpmodel.service`） |
 | 模型资产 | `Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` 4683072320 B，sha256 `3f4513330aa7f109922bd701d773575484ae2b4a4090d6511260a2a4f8e3d069`；`mmproj-Qwen_Qwen2.5-VL-7B-Instruct-bf16.gguf` 1354162912 B，sha256 `d1c7588c0bdf6e7889737c01cfd54309240d54042e102275880a514ae979aea3`；均与 m00-envelope §2 一致 |
 | 模型盘 | `/dev/sda1` UUID `16d53274-d9f5-4282-9b44-7fdd43cba9ca`，ext4，挂载 `/media/jtzn/sandisk-ext4` |
@@ -183,8 +185,9 @@ M00 材料完整、hash 与 3 轮停止记录均可复核，本轮**没有**缺�
 3. `plan/README.md` 索引缺 `08-execution-plan.md`，源码基线仍是 `c32dd1a8…`（第 5 节 #2、#4）。
 4. 本机 `.venv` 为 Python 3.13.5，不满足 `pyproject.toml` 的 `requires-python = ">=3.12,<3.13"`；
    本轮新建 3.12.11 环境并记录路径，未删除原 `.venv`。发布锁按 Linux ARM64 生成，macOS 侧无法复现锁门禁。
-5. 本地 GitHub `origin` 落后 3 个提交；本地到目标机当前无 GitHub 推送通路。目标 checkout 已精确在同一 SHA，
-   按 08-execution-plan §7 记“待同步”，未 reset、未复制修改目标 tracked 文件。
+5. 本地 GitHub `origin` 落后 3 个提交，本轮未推送 GitHub，按 08-execution-plan §7 记“待同步”（待同步项仅限于 GitHub，
+   不影响目标 checkout 的精确提交要求）。目标同步通路为本地 → `jtzn@192.168.55.1:/home/jtzn/git/SelfModelSwitch.git`
+   普通 push → 目标 `git pull --ff-only`，本轮已按此同步并在前后核对工作区为空；未 reset、未复制修改目标 tracked 文件。
 6. `tests/test_control_protocol_v1.py` 草稿使 `pytest tests` 收集失败（P02 接续）；本轮不覆盖、不删除、不代为提交。
 
 ### 8. 任务执行记录
@@ -205,13 +208,14 @@ M00 材料完整、hash 与 3 轮停止记录均可复核，本轮**没有**缺�
     {"argv": ["git", "status", "--short"], "exit_code": 0}
   ],
   "target_commit": "63f7d8e13319d57e946e46d5766703e55d75c9a3",
+  "target_sync": "read-only verification at 63f7d8e; after this record was committed the target checkout was fast-forwarded by git pull --ff-only to the commit holding this record, with git status --short empty before and after",
   "evidence_directory": "/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T055502Z",
   "unresolved": [
     "m00-envelope.md 第5节的 stop.json/顶层 run.json 命名与目标材料不符",
     "证据根有3个未登记目录与4个 console log",
     "plan/README.md 索引缺 08-execution-plan.md 且源码基线过旧",
     "本地 .venv 为 3.13.5，不满足 requires-python；发布锁为 Linux ARM64，macOS 无法复现",
-    "本地 GitHub origin 落后3个提交，本地到目标无推送通路（待同步）",
+    "本地 GitHub origin 落后3个提交，本轮未推送 GitHub（待同步）",
     "tests/test_control_protocol_v1.py 草稿收集失败，由 P02 接续"
   ]
 }
