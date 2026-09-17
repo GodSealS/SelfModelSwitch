@@ -598,6 +598,33 @@ Device not configured`；`git ls-remote origin refs/heads/main` 仍为 `8d4edcd4
 - [ ] CONTROL_CONTRACT的load路径/响应解析来自真实fixture，现有load_probe=404不能充当成功；未停止不标通过。
 - [ ] 更新当前“fixture必须不完整”的测试为真实协议正反例；推理流量仍绕过llama-swap自动路由。
 **Verification:** `python -m pytest tests/test_llama_swap_fixture.py tests/test_llama_swap_client.py tests/test_capture_control_fixture.py -q`；目标受控探测并记录停止证据。
+**本轮执行记录（2026-09-18）:** status=blocked（未开始实现，先做只读材料核对）；起点 commit `2a9ec8b`（P06 记录提交）。
+已核实事实（本机 + 目标只读 SSH，未改动目标）：
+- 本机：`origin` = `https://github.com/GodSealS/SelfModelSwitch.git`；匿名读可用（`git fetch origin` exit 0），写不可用——
+  `git push` 报 `fatal: could not read Username for 'https://github.com': Device not configured`（`credential.helper=osxkeychain` 处无 github.com 条目，
+  登录 shell 内同样失败）；`git ls-remote` 显示远端 main 仍为 `8d4edcd496423cbeaefe2e94d2f5cd75080d7823`，本地领先 5 个提交
+  （`cea36ca`、`dbdab2a`、`218e7c0`、`41656cc`、`2a9ec8b`；本记录提交后为 6 个）。
+- 目标 `jtzn@192.168.55.1`：`jtzn-desktop`，L4T R36.4.7，aarch64；`/home/jtzn/SelfModelSwitch` 干净且 HEAD=`8d4edcd4…`（与远端一致，无法 fast-forward）；
+  `python3`=3.10.12（`/opt/self-model-switch/toolchains/` 另有 cpython-3.12.14）；docker CLI/Server 29.2.1 可用但 **`docker images` 为空**；
+  `/opt/self-model-switch` 下只有 `probes/llama.cpp-4bc272fd729bd094c0422e4b8353da8d2fec91f8` 与 `toolchains/`，**全盘未安装 llama-swap**
+  （无二进制、无 `llama-swap_217_linux_arm64.tar.gz` 归档、无 systemd unit、无 `/etc/llama-swap`、无 `/etc/self-model-switch`）；
+  模型盘 `/media/jtzn/sandisk-ext4`（`/dev/sda1`，ext4）已挂载；根盘余量 21G；`/home/jtzn/self-model-switch-evidence/` 保留 M00 各轮材料。
+缺少的具体材料与恢复动作：
+1. **共享远端写权限**（阻塞所有任务的"已发布提交 → 目标 fast-forward → 同 SHA 证据"要求）：由仓库所有者在开发机完成一次 GitHub 认证
+   （例如在其自身终端执行一次 `git push` 让 keychain 记录，或配置 token/credential helper）。禁止把凭据写入 URL、脚本或命令历史。
+2. **固定 ARM64 llama-swap 发行物**（验收第 1 项）：fixture 记录的 `llama-swap_217_linux_arm64.tar.gz`（sha256 `36c58c…`）在目标上不存在。
+   需由维护方按受控流程在目标安装该固定版本，记录版本字符串与二进制 sha256；工具只核对、不自动下载资产。
+3. **首候选容器镜像 digest**（本任务探测 manifest 与 P06b lab 渲染的输入；§6 表列为"P06/P15受控runtime构建产物"）：目标无任何镜像。
+   需先决定承载上游的固定镜像并构建（含依赖 lock/adapter hash）；若改以已核验的原生 `/opt/self-model-switch/probes/llama.cpp-4bc272…/llama-server`
+   作为受控 lab 上游，必须同步修订本任务与 P06b 的 manifest/身份约定，不能两套并存。
+4. **独占维护窗口**（探测需真实 load/unload 与停止证据）与后续 P29 切换验收所需的第二个真实模型。
+未开始实现的原因：本任务核心交付（`CONTROL_CONTRACT` 的 load 路径与响应解析）必须来自真实 fixture，计划已固定
+"现有 `load_probe=404` 不能充当成功"且"不得延后补实现"；在材料 1—3 缺失时编写 contract 或回填 fixture 等于伪造证据，
+因此本轮只记录阻塞与恢复动作，不产出任何 contract/fixture 变更。
+解除阻塞后的立即动作：① 实现 `scripts/capture_control_fixture.py` 与 `tests/test_capture_control_fixture.py`（仅访问配置内 loopback 端点、
+失败保留材料、不下载资产、不写系统安装目录），推送并同步目标；② 目标受控维护环境执行探测，保存 running 空/非空、真实模型 load、
+unload 的 request/status/content-type/body 与实例证据；③ 按原始材料回填 fixture 与 `model_scheduler/llama_swap_contract.py`，
+并把"fixture 必须不完整"的测试改为真实协议正反例。
 
 ### P06b — 动态lab渲染与runner入口接线（M02）
 
