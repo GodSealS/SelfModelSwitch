@@ -543,6 +543,21 @@ reason 统一改为 `asset_changed`，其余快照结构、`StorageAdmissionGuar
 - [x] P06/P15真实执行只在隔离lab维护环境；生产profile必须绑定同镜像/参数/envelope的P21测量和最终B证据。
 - [x] 启动操作具有PID/process group、Fence、开始/终结状态；timeout后启动者未退出仍不报告STOPPED。
 **Verification:** `python -m pytest tests/test_model_runner.py tests/test_backend_router.py -q`；目标使用无权重测试镜像检查只读挂载、信号转发和身份标签。
+**目标核验补记（2026-09-18，目标 `jtzn-desktop`）:** 按验收第 1、2 项在目标上用无权重镜像核验，发现并修复一个真实缺陷。
+- 缺陷：本目标 Docker 29 + NVIDIA hook runtime **直接拒绝 `--gpus all`**
+  （`invoking the NVIDIA Container Runtime Hook directly (e.g. specifying the docker --gpus flag) is not supported;
+  please use ... --runtime=nvidia`），而 P06 渲染器沿用了旧的 `--gpus all`。
+- 修复（提交 `9f52ad1`）：`render_container_launch` 新增必填部署输入 `container_runtime`（全串校验 `[a-z0-9][a-z0-9_.-]{0,63}`），
+  渲染为 `--runtime=<name>`；结构性复核显式拒绝任何 `--gpus`/`--gpus=`；测试新增 `--gpus all` 作为 runtime 名被拒、
+  `--gpus` 不得出现、runtime 名缺失/非法被拒等用例。`pytest tests -m 'not thor' -q` = 380 passed；`ruff check .` exit 0；
+  `run.py --check-config` 仍为 v1 四 ID。
+- 目标身份核验证据（镜像 `sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8`，即 P06a 首候选 lab 镜像）：
+  用渲染出的 argv `docker create`（container `4fa3253c59348a4caa610bb6082ad8f0aea554fe65cbc92e2b1e4e6708f88dc8`）后 `docker inspect`：
+  `runtime=nvidia`；六个身份标签（deployment/runtime/profile/model/mode/config-sha256）与渲染值完全一致；
+  `Mounts=[{Type:"bind",Source:"/media/jtzn/sandisk-ext4/models",Target:"/models",ReadOnly:true}]` 无其它挂载；
+  `PortBindings 127.0.0.1:18081→8080`；`RestartPolicy=no`；`Privileged=false`；`Cmd` 与 profile 渲染的 server 参数逐项一致；
+  随后 `docker rm`，**未启动容器、未加载模型**。证据目录 `/home/jtzn/self-model-switch-evidence/image-build-20260917T234436Z/`。
+- 尚未核验：信号转发（需 P06b 把 `SupervisedLaunch` 接入 runner 入口）与 `stopped_is_proven` 的目标侧闭环，属 P06b/P07。
 **本轮执行记录（2026-09-18）:** status=software_only；起点 commit `41656cc`（P05 记录提交，本地 main 仍领先 origin/main 4 个提交）；
 python=3.12.11（`/Users/monster/.local/share/selfmodelswitch/venv312`）；
 `pytest tests/test_model_runner.py tests/test_backend_router.py -q` = 28 passed（实现前 `model_scheduler.runtime_profiles`、
@@ -671,6 +686,25 @@ unload 的 request/status/content-type/body 与实例证据；③ 按原始材�
   GitHub 不通过 SSH 提供 release 资产），两机本地与 Spotlight 缓存内均无 `llama-swap_217_linux_arm64.tar.gz`，目标无 Go 无法自建。
   恢复动作：由仓库所有者提供该固定发行物（例如放至开发机 `~/Downloads/llama-swap_217_linux_arm64.tar.gz`），
   我将按 fixture 记录的 sha256 `36c58c…` 核对后再带入目标安装与探测；在它到位前 P06a 保持 `blocked`，P06b—P31 按 §3 硬前置不动。
+**材料到位与探测前置条件（2026-09-18，用户在目标机授权下载与配置）:**
+- **固定 llama-swap v217 已核实并安装**：目标机直接下载官方发行物 `llama-swap_217_linux_arm64.tar.gz`（6,805,577 B），
+  sha256 = `36c58cf69f1422e999acba0b7bff0d47d5b955cb95e8d3875c461d814a74cc29`，**与 fixture 记录逐位一致**；
+  二进制为静态链接 aarch64，`--version` = `217 (636b53e70ff7c834e92a97ef2bb556ee60ca2f85)`，sha256 `0f86f5869d167b406c9e81bdc4b268f23dd96a4983ea57b8f2b561ac8bb82e80`，
+  已安装到 `/opt/self-model-switch/bin/llama-swap`（root:root 0755）。证据：
+  `/home/jtzn/self-model-switch-evidence/llama-swap-217-<UTC>/`（发行物副本、sha256sums、version.txt、material.json）。
+  注：此前"两机无外网"的判断**不成立**——实测目标机 DNS 正常且 443 可达（失败源于 curl 走 IPv6/中间盒），
+  开发机的 HTTPS 出口仍不稳定，故下载在目标机执行。
+- **首候选 lab 镜像已在目标本地离线构建**（`FROM scratch`、`docker build --network=none`）：
+  `image_id=sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8`，197,663,169 B，rootfs 27 个文件，
+  rootfs manifest sha256 `008c2ef5a0016da4d3d429247b7f87b881abbbc0c3dab01aafe6553f887b8887`；
+  内容 = M00 `RUNTIME-SHA256` 十项已核验文件（无未列入清单的常规文件）+ 宿主 glibc/openssl/libgomp
+  + `/sbin/ldconfig.real`（NVIDIA CSV hook 的注入前提）+ CUDA 用户态 12.6（`libcudart`/`libcublas`/`libcublasLt`，与 L4T R36.4.7 同源）。
+  GPU 通路目标实测结论：`--gpus all` 不被支持、必须 `--runtime=nvidia`；`docker run --rm --runtime=nvidia sms-llama-cpp:4bc272f
+  --list-devices` → `CUDA0: Orin (62840 MiB, 57700 MiB free)`；`--runtime=nvidia` 下只读模型挂载与 `--model` 解析正常。
+  证据：`/home/jtzn/self-model-switch-evidence/image-build-20260917T234436Z/`（image.json、image-inspect.json、rootfs-files.txt）。
+- **仍待办**：`scripts/capture_control_fixture.py` 与 `tests/test_capture_control_fixture.py`（本轮尚未实现），
+  随后在目标受控维护环境执行探测并回填 fixture 与 `model_scheduler/llama_swap_contract.py`。因此 P06a 仍为 `blocked`（未完成），
+  但已不再是"缺材料"，而是"未实施 + 未探测"。
 
 ### P06b — 动态lab渲染与runner入口接线（M02）
 
