@@ -1,6 +1,6 @@
 # M00 首个候选最大输入与并发规格 v0.1
 
-状态：探测规格草案，未执行最大 envelope 测量，不构成 M00 通过。
+状态：规格已执行 3 轮探测并通过（见第 9 节实测回填）；M00 整体裁定见第 9 节遗留项。
 日期：2026-09-17。配套工具：`scripts/m00_envelope_probe.py`（见第 6 节）。
 
 ## 1. 范围
@@ -96,3 +96,29 @@ python3 scripts/m00_envelope_probe.py run --runs 3
 
 探测通过后，本文件第 3 节数字加上实测 `measured_peak`、R、加载/推理耗时成为
 M01/M02 模型登记 envelope 与 `reserved_bytes` 的输入；未通过前不得用于配置或验收声明。
+
+## 9. 实测回填（2026-09-17，探测 2）
+
+证据：`/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T052121Z`
+（commit `1b87d35`，3 轮独立冷启动，result=passed，3/3 quiescent）。
+
+| 项目 | 实测 | 备注 |
+|---|---|---|
+| E1 文本最大 | prompt 28672 精确、输出 4096 满额 | prompt 约 821 t/s、生成约 20.8 t/s、单请求 232 s |
+| E2 图像 | 视觉 1227 token（≤1280） | 1024×1024 输入，`--image-max-tokens 1280` 生效 |
+| E3 并发组合 | 2×（28672 prompt + 4096 输出），发送偏差 ≤0.9 ms | prompt 657–715 t/s、生成 15.0–17.1 t/s |
+| 内存 | delta 4.87–4.90 GiB（gaps=0，前后基线差 ≤18 MB） | measured_peak=5263122432 B；R=ceil(peak×1.15)=6052590797 B |
+| 停止 | 3/3 quiescent | exit 0、端口释放、内存回收、无残留 PID |
+| 执行设备 | CUDA0 | CUDA 库映射 + GR3D 峰值 99% + `--n-gpu-layers 99` |
+| 加载 | 5.02 s（页缓存热） | 见遗留项 |
+
+遗留与裁定项（M00 完成前处理）：
+
+- runtime 记录不一致：现场 llama-server 实际 hash 与 `RUNTIME-SHA256` 一致（`65a23c6e…`），
+  `BUILD-METADATA` 记 `2a7131bb…`（llama-cli 同理）。建议以 `RUNTIME-SHA256` 与现场为准，
+  M01 定契约前确认。
+- 5.02 s 加载为页缓存热读数；真冷介质启动基线未测（需 `drop_caches` 或重启后复测），不阻塞 envelope 结论。
+- 内存 delta 主要反映 2×32768 KV（f16）与计算缓冲；mmap 权重页进入可回收缓存、不计入 delta。
+  M01/M02 登记 `reserved_bytes` 时按 R=5.64 GiB，或按非 mmap 模式复测后调整。
+- 首轮 not_passed 证据（前次 harness 缺陷）保留于
+  `/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T045919Z`，不计入结论。
