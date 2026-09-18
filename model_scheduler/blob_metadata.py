@@ -45,7 +45,24 @@ CREATE TABLE IF NOT EXISTS leases (
     holder TEXT NOT NULL,
     PRIMARY KEY (blob_id, holder)
 );
+CREATE TABLE IF NOT EXISTS recovery (
+    blob_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    step TEXT NOT NULL,
+    sha256 TEXT,
+    size_bytes INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
 """
+
+# The publish sequence is journalled so every crash point has one deterministic
+# outcome: `staging` (bytes are being received), `publish_pending` (the file is
+# about to be renamed), `published` (the metadata transaction committed).
+STEP_STAGING = "staging"
+STEP_PENDING = "publish_pending"
+STEP_PUBLISHED = "published"
+JOURNAL_STEPS = frozenset({STEP_STAGING, STEP_PENDING, STEP_PUBLISHED})
+RESTART_HOLDER_PREFIX = "restart:"
 
 
 class QuotaExceeded(RuntimeError):
@@ -174,14 +191,19 @@ class BlobMetadata:
                 raise
             return self._require(blob_id)
 
-    def publish(self, blob_id: str, sha256: str, size_bytes: int, *, now: float) -> BlobRecord:
-        """One transaction turns a staging row into a published one."""
+    def publish(self, blob_id: str, sha256: str, size_bytes: int, *, now: float, retention_seconds: float | None = None) -> BlobRecord:
+        """One transaction turns a staging row into a published one.
+
+        `now` is the instant retention starts from: the upload success for an
+        input blob, the execution terminal for an output blob.
+        """
         with self._lock:
+            retention = self.retention_seconds if retention_seconds is None else retention_seconds
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 self._connection.execute(
                     "UPDATE blobs SET state = ?, sha256 = ?, size_bytes = ?, expires_at = ? WHERE blob_id = ? AND state IN (?, ?)",
-                    (PUBLISHED, sha256, size_bytes, now + self.retention_seconds, blob_id, RESERVED, STAGING),
+                    (PUBLISHED, sha256, size_bytes, now + retention, blob_id, RESERVED, STAGING),
                 )
                 self._connection.execute("COMMIT")
             except BaseException:
@@ -284,6 +306,83 @@ class BlobMetadata:
         with self._lock:
             rows = self._connection.execute("SELECT * FROM blobs WHERE state = ?", (PUBLISHED,)).fetchall()
             return tuple(_record(row).blob_id for row in rows)
+
+    # -- recovery journal ----------------------------------------------------
+
+    def journal(self, blob_id: str, owner: str, step: str, *, sha256: str | None, size_bytes: int, now: float) -> None:
+        with self._lock:
+            if step not in JOURNAL_STEPS:
+                raise ValueError(f"unknown journal step {step!r}")
+            self._connection.execute(
+                "INSERT INTO recovery (blob_id, owner, step, sha256, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(blob_id) DO UPDATE SET step = excluded.step, sha256 = excluded.sha256, "
+                "size_bytes = excluded.size_bytes, created_at = excluded.created_at",
+                (blob_id, owner, step, sha256, size_bytes, now),
+            )
+
+    def journal_entry(self, blob_id: str) -> dict[str, object] | None:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM recovery WHERE blob_id = ?", (blob_id,)).fetchone()
+            return None if row is None else {
+                "blob_id": row["blob_id"],
+                "owner": row["owner"],
+                "step": row["step"],
+                "sha256": row["sha256"],
+                "size_bytes": int(row["size_bytes"]),
+                "created_at": float(row["created_at"]),
+            }
+
+    def clear_journal(self, blob_id: str) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM recovery WHERE blob_id = ?", (blob_id,))
+
+    def journal_entries(self) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            rows = self._connection.execute("SELECT * FROM recovery ORDER BY created_at").fetchall()
+            return tuple(
+                {
+                    "blob_id": row["blob_id"],
+                    "owner": row["owner"],
+                    "step": row["step"],
+                    "sha256": row["sha256"],
+                    "size_bytes": int(row["size_bytes"]),
+                    "created_at": float(row["created_at"]),
+                }
+                for row in rows
+            )
+
+    def unfinished_rows(self) -> tuple[BlobRecord, ...]:
+        """Rows that never reached `published`: their reservations are reclaimable."""
+        with self._lock:
+            rows = self._connection.execute("SELECT * FROM blobs WHERE state IN (?, ?)", (RESERVED, STAGING)).fetchall()
+            return tuple(_record(row) for row in rows)
+
+    def release_missing(self, blob_id: str, *, now: float, keep_tombstone: bool) -> None:
+        """A published row whose file is gone or wrong: unreadable, and reclaimable.
+
+        The bytes are not on disk any more, so the reservation is dropped while a
+        tombstone keeps answering 410 to the owner.
+        """
+        with self._lock:
+            state = DELETED if keep_tombstone else CORRUPT
+            self._connection.execute(
+                "UPDATE blobs SET state = ?, size_bytes = 0, expires_at = ? WHERE blob_id = ?",
+                (state, now + self.tombstone_seconds, blob_id),
+            )
+
+    def protect_all_published(self, holder: str) -> tuple[str, ...]:
+        """Hold a restart lease on every published blob (old boot may still read)."""
+        with self._lock:
+            rows = self._connection.execute("SELECT blob_id FROM blobs WHERE state = ?", (PUBLISHED,)).fetchall()
+            for row in rows:
+                self._connection.execute("INSERT OR IGNORE INTO leases (blob_id, holder) VALUES (?, ?)", (row["blob_id"], holder))
+            return tuple(row["blob_id"] for row in rows)
+
+    def release_protection(self, holder: str) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute("SELECT blob_id FROM leases WHERE holder = ?", (holder,)).fetchall()
+            self._connection.execute("DELETE FROM leases WHERE holder = ?", (holder,))
+            return tuple(row["blob_id"] for row in rows)
 
     def _require(self, blob_id: str) -> BlobRecord:
         with self._lock:

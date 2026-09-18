@@ -20,10 +20,22 @@ import re
 import stat
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Callable, Iterable
 
-from .blob_metadata import DELETED, PUBLISHED, BlobMetadata, BlobRecord, QuotaExceeded
+from .blob_metadata import (
+    DELETED,
+    PUBLISHED,
+    RESTART_HOLDER_PREFIX,
+    STEP_PENDING,
+    STEP_PUBLISHED,
+    STEP_STAGING,
+    BlobMetadata,
+    BlobRecord,
+    QuotaExceeded,
+)
+from .control_protocol_v1 import Fence, fence_document, writeback_decision
 
 MEDIA_TYPES = frozenset({"application/json", "image/png", "image/jpeg"})
 MAX_BLOB_BYTES = 1024**3
@@ -37,6 +49,40 @@ class BlobStoreError(RuntimeError):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(message or code)
         self.code = code
+
+
+@dataclass
+class OutputReservation:
+    """A reserved output slot: the ceiling is on the books before dispatch."""
+
+    blob_id: str
+    owner: str
+    media_type: str
+    limit_bytes: int
+    fence: Fence
+    reserved_at: float
+    cancelled_fence: Fence | None = None
+
+    def cancelled_by(self, fence: Fence) -> bool:
+        return self.cancelled_fence is not None and writeback_decision(self.fence, fence).accepted
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """The deterministic outcome of one restart recovery pass."""
+
+    verified: tuple[str, ...]
+    unreadable: tuple[str, ...]
+    purged: tuple[str, ...]
+    protected: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "verified": list(self.verified),
+            "unreadable": list(self.unreadable),
+            "purged": list(self.purged),
+            "protected": list(self.protected),
+        }
 
 
 class BlobReader:
@@ -193,6 +239,29 @@ class BlobStore:
             await self._call(self.metadata.reserve, blob_id, owner, limit, media_type, now=now, path=f"{owner}/{blob_id}")
         except QuotaExceeded as exc:
             raise BlobStoreError("quota_exceeded", str(exc)) from exc
+        return await self._receive_and_publish(
+            blob_id=blob_id, owner=owner, media_type=media_type, chunks=chunks,
+            expected_sha256=expected_sha256, limit=limit, declared_size=declared_size,
+        )
+
+    async def _receive_and_publish(
+        self,
+        *,
+        blob_id: str,
+        owner: str,
+        media_type: str,
+        chunks: AsyncIterator[bytes],
+        expected_sha256: str | None,
+        limit: int,
+        declared_size: int | None,
+        retention_seconds: float | None = None,
+        retention_now: float | None = None,
+    ) -> BlobRecord:
+        """The one staging/publish path, journalled so every crash point resolves."""
+        await self._call(
+            self.metadata.journal, blob_id, owner, STEP_STAGING,
+            sha256=expected_sha256, size_bytes=limit, now=self.clock(),
+        )
         fd = await asyncio.to_thread(self._open_staging, blob_id)
         digest, received = hashlib.sha256(), 0
         try:
@@ -216,18 +285,200 @@ class BlobStore:
             await self._call(self.metadata.abort, blob_id)
             raise
         await asyncio.to_thread(os.close, fd)
+        await self._call(
+            self.metadata.journal, blob_id, owner, STEP_PENDING,
+            sha256=digest.hexdigest(), size_bytes=received, now=self.clock(),
+        )
         try:
             await asyncio.to_thread(self._publish_file, owner, blob_id)
         except BaseException:
             await asyncio.to_thread(self._remove_staging, blob_id)
             await self._call(self.metadata.abort, blob_id)
+            await self._call(self.metadata.clear_journal, blob_id)
             raise
+        moment = retention_now if retention_now is not None else self.clock()
         try:
-            return await self._call(self.metadata.publish, blob_id, digest.hexdigest(), received, now=self.clock())
+            record = await self._call(
+                self.metadata.publish, blob_id, digest.hexdigest(), received,
+                now=moment, retention_seconds=retention_seconds,
+            )
         except BaseException:
             await asyncio.to_thread(self._remove_published, owner, blob_id)
             await self._call(self.metadata.abort, blob_id)
+            await self._call(self.metadata.clear_journal, blob_id)
             raise
+        await self._call(
+            self.metadata.journal, blob_id, owner, STEP_PUBLISHED,
+            sha256=digest.hexdigest(), size_bytes=received, now=self.clock(),
+        )
+        await self._call(self.metadata.clear_journal, blob_id)
+        return record
+
+    # -- execution outputs ---------------------------------------------------
+
+    async def reserve_output(
+        self,
+        *,
+        blob_id: str,
+        owner: str,
+        media_type: str,
+        limit_bytes: int,
+        fence: Fence,
+    ) -> "OutputReservation":
+        """Reserve the profile output ceiling before an execution is dispatched."""
+        self._checked_id(blob_id, "blob_id")
+        self._checked_id(owner, "owner")
+        if media_type not in self.media_types:
+            raise BlobStoreError("unsupported_media_type")
+        if limit_bytes <= 0 or limit_bytes > MAX_BLOB_BYTES:
+            raise BlobStoreError("too_large")
+        try:
+            await self._call(
+                self.metadata.reserve, blob_id, owner, limit_bytes, media_type,
+                now=self.clock(), path=f"{owner}/{blob_id}",
+            )
+        except QuotaExceeded as exc:
+            raise BlobStoreError("quota_exceeded", str(exc)) from exc
+        return OutputReservation(
+            blob_id=blob_id, owner=owner, media_type=media_type, limit_bytes=limit_bytes,
+            fence=fence, reserved_at=self.clock(),
+        )
+
+    async def cancel_output(self, reservation: "OutputReservation", *, fence: Fence) -> bool:
+        """Mark the output unsubmittable; the same fence rule decides who may cancel."""
+        if not writeback_decision(reservation.fence, fence).accepted:
+            return False
+        reservation.cancelled_fence = fence
+        return True
+
+    async def write_output(self, reservation: "OutputReservation", *, chunks: AsyncIterator[bytes], expected_sha256: str | None, now: float | None = None) -> BlobRecord:
+        """Publish an output; a cancelled or late result only cleans its staging up."""
+        if reservation.cancelled_fence is not None:
+            await self.abandon_output(reservation)
+            raise BlobStoreError("cancelled", "the execution was cancelled: a late result is never published")
+        return await self._receive_and_publish(
+            blob_id=reservation.blob_id,
+            owner=reservation.owner,
+            media_type=reservation.media_type,
+            chunks=chunks,
+            expected_sha256=expected_sha256,
+            limit=reservation.limit_bytes,
+            declared_size=None,
+            retention_now=now if now is not None else self.clock(),
+        )
+
+    async def abandon_output(self, reservation: "OutputReservation") -> None:
+        """Return the reservation without publishing anything."""
+        await asyncio.to_thread(self._remove_staging, reservation.blob_id)
+        await asyncio.to_thread(self._remove_published, reservation.owner, reservation.blob_id)
+        await self._call(self.metadata.abort, reservation.blob_id)
+        await self._call(self.metadata.clear_journal, reservation.blob_id)
+
+    # -- restart recovery ----------------------------------------------------
+
+    async def recover(self, *, instances_running: bool, boot_id: str = "boot", now: float | None = None) -> "RecoveryReport":
+        """Resolve every crash point and re-open reads only for verified files.
+
+        With `instances_running` the old boot may still be reading, so every
+        published blob keeps a restart lease until the caller observes STOPPED.
+        """
+        moment = self.clock() if now is None else now
+        verified: list[str] = []
+        unreadable: list[str] = []
+        purged: list[str] = []
+        for blob_id in await self._call(self.metadata.verify_all):
+            record = await self._call(self.metadata.get, blob_id)
+            if record is None:
+                continue
+            try:
+                fd = await asyncio.to_thread(self._open_verified, record)
+            except BlobStoreError:
+                await self._call(self.metadata.release_missing, blob_id, now=moment, keep_tombstone=True)
+                await self._call(self.metadata.clear_journal, blob_id)
+                unreadable.append(blob_id)
+                continue
+            await asyncio.to_thread(os.close, fd)
+            await self._call(self.metadata.clear_journal, blob_id)
+            verified.append(blob_id)
+        for record in await self._call(self.metadata.unfinished_rows):
+            entry = await self._call(self.metadata.journal_entry, record.blob_id)
+            if entry is not None and entry["step"] == STEP_PENDING and entry["sha256"]:
+                completed = await self._complete_pending_publish(record, entry, now=moment)
+                if completed is not None:
+                    await self._call(self.metadata.clear_journal, record.blob_id)
+                    verified.append(completed)
+                    continue
+            await asyncio.to_thread(self._remove_staging, record.blob_id)
+            await asyncio.to_thread(self._remove_published, record.owner, record.blob_id)
+            await self._call(self.metadata.abort, record.blob_id)
+            await self._call(self.metadata.clear_journal, record.blob_id)
+            purged.append(record.blob_id)
+        purged.extend(await self._sweep_orphan_staging())
+        protected: tuple[str, ...] = ()
+        if instances_running:
+            protected = await self._call(self.metadata.protect_all_published, f"{RESTART_HOLDER_PREFIX}{boot_id}")
+        return RecoveryReport(
+            verified=tuple(verified), unreadable=tuple(unreadable), purged=tuple(purged), protected=protected,
+        )
+
+    async def release_restart_protection(self, boot_id: str) -> tuple[str, ...]:
+        """Called only after the old instance is observed STOPPED."""
+        return await self._call(self.metadata.release_protection, f"{RESTART_HOLDER_PREFIX}{boot_id}")
+
+    async def _complete_pending_publish(self, record: BlobRecord, entry: dict, *, now: float) -> str | None:
+        """A rename happened before the crash: finish the transaction if bytes match."""
+        try:
+            fd, size, digest = await asyncio.to_thread(self._stat_published, record.owner, record.blob_id)
+        except (OSError, BlobStoreError):
+            return None
+        try:
+            if digest != entry["sha256"] or size != entry["size_bytes"]:
+                return None
+            await self._call(self.metadata.publish, record.blob_id, digest, size, now=now)
+        finally:
+            await asyncio.to_thread(os.close, fd)
+        await asyncio.to_thread(self._remove_staging, record.blob_id)
+        return record.blob_id
+
+    def _stat_published(self, owner: str, blob_id: str) -> tuple[int, int, str]:
+        owner_fd = self._owner_dir_fd(owner)
+        try:
+            fd = os.open(blob_id, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=owner_fd)
+        except OSError as exc:
+            raise BlobStoreError("unreadable", f"the published file is not readable: {exc}") from exc
+        finally:
+            os.close(owner_fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            raise BlobStoreError("unreadable", "not a regular file")
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as handle:
+            for block in iter(lambda: handle.read(self.chunk_size), b""):
+                digest.update(block)
+        return fd, int(info.st_size), digest.hexdigest()
+
+    async def _sweep_orphan_staging(self) -> list[str]:
+        removed = await asyncio.to_thread(self._orphan_staging_names)
+        for name in removed:
+            blob_id = name[: -len(".part")]
+            await asyncio.to_thread(self._remove_staging, blob_id)
+        return [name[: -len(".part")] for name in removed]
+
+    def _orphan_staging_names(self) -> list[str]:
+        root_fd = self._open_root_fd()
+        try:
+            staging_fd = os.open(
+                ".staging", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        try:
+            with os.scandir(staging_fd) as entries:
+                names = [entry.name for entry in entries]
+        finally:
+            os.close(staging_fd)
+        return [name for name in names if name.endswith(".part")]
 
     # -- reads, leases and deletion -----------------------------------------
 
