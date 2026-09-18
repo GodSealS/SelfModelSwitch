@@ -1,31 +1,102 @@
 {
-  "schema_version": 1,
-  "acceptance_status": "incomplete_no_llama_cpp_load_fixture",
-  "provenance": {
-    "captured_on": "2026-09-16",
-    "platform": "linux/arm64 Docker",
-    "isolation": "temporary --rm container; no model, SSD, GPU, workspace mount, or existing container",
-    "note": "This is real llama-swap v217 control-plane evidence only. It cannot authorize a production contract because no real llama.cpp successful load was exercised."
-  },
+  "schema_version": 2,
+  "acceptance_status": "measured_on_target",
   "release": {
     "version": "v217",
     "asset": "llama-swap_217_linux_arm64.tar.gz",
     "sha256": "36c58cf69f1422e999acba0b7bff0d47d5b955cb95e8d3875c461d814a74cc29"
   },
-  "running": {
-    "status": 200,
-    "content_type": "application/json",
-    "body": {
-      "running": []
+  "binary": {
+    "path": "/opt/self-model-switch/bin/llama-swap",
+    "sha256": "0f86f5869d167b406c9e81bdc4b268f23dd96a4983ea57b8f2b561ac8bb82e80",
+    "version_string": "217 (636b53e70ff7c834e92a97ef2bb556ee60ca2f85)",
+    "static_aarch64": true,
+    "listen_address_source": "command-line --listen (the config port key is ignored)"
+  },
+  "captured": {
+    "evidence_directory": "/home/jtzn/self-model-switch-evidence/llama-swap-control-20260918T002718Z",
+    "captured_utc": "2026-09-18T00:27:25Z",
+    "host": "jtzn-desktop",
+    "kernel": "5.15.148-tegra",
+    "model_id": "qwen25vl-7b-q4",
+    "image": "sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8",
+    "container_runtime": "nvidia",
+    "tool": "scripts/capture_control_fixture.py",
+    "stop": {
+      "exit_code": 0,
+      "port_in_use": false
     }
   },
-  "unload": {
-    "status": 200,
-    "content_type": "text/plain",
-    "body_utf8": "OK"
+  "control": {
+    "health": {
+      "request": {"method": "GET", "path": "/health"},
+      "status": 200,
+      "content_type": "text/plain; charset=utf-8",
+      "body_utf8": "OK",
+      "body_sha256": "565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3"
+    },
+    "running_empty": {
+      "request": {"method": "GET", "path": "/running"},
+      "status": 200,
+      "content_type": "application/json",
+      "body_utf8": "{\"running\":[]}",
+      "body_sha256": "3e67ad7ee1531f752862b655bc257b2ec735ada56855432c6d248e9b0d139eac"
+    },
+    "load_trigger": {
+      "request": {"method": "GET", "path": "/upstream/{model_id}/health"},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "body_utf8": "{\"status\":\"ok\"}",
+      "body_sha256": "a29ee2b15c494311c52521766e44af56a3ad2248e7a8ab465e5206463c13d288",
+      "elapsed_seconds": 5.259819509
+    },
+    "running_loaded": {
+      "request": {"method": "GET", "path": "/running"},
+      "status": 200,
+      "content_type": "application/json",
+      "entry_keys": ["cmd", "description", "model", "name", "proxy", "state", "ttl"],
+      "entry_example": {
+        "model": "qwen25vl-7b-q4",
+        "name": "",
+        "proxy": "http://localhost:5800",
+        "state": "ready",
+        "ttl": 0,
+        "description": ""
+      },
+      "body_byte_length": 1093,
+      "body_sha256": "not_recorded_in_this_fixture_revision"
+    },
+    "unload": {
+      "request": {"method": "POST", "path": "/api/models/unload/{model_id}"},
+      "status": 200,
+      "content_type": "text/plain; charset=utf-8",
+      "body_utf8": "OK",
+      "body_sha256": "565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3",
+      "elapsed_seconds": 0.926029173
+    },
+    "running_empty_after_unload": {
+      "request": {"method": "GET", "path": "/running"},
+      "status": 200,
+      "content_type": "application/json",
+      "body_utf8": "{\"running\":[]}",
+      "body_sha256": "3e67ad7ee1531f752862b655bc257b2ec735ada56855432c6d248e9b0d139eac"
+    }
   },
-  "load_probe": {
-    "path": "/props?model=fixture",
-    "status": 404
-  }
+  "negative_samples": [
+    {
+      "name": "rejected_load_probe",
+      "request": {"method": "GET", "path": "/props?model={model_id}"},
+      "status": 404,
+      "content_type": null,
+      "body_utf8": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "counts_as_success": false
+    }
+  ],
+  "notes": [
+    "The load path is the /upstream/{model_id}/... proxy: the first request starts the upstream and blocks until it is healthy.",
+    "v217 /running lists upstream objects (model/name/proxy/state/ttl/cmd/description); the earlier string-list assumption was wrong.",
+    "The deprecated logRequests key must not be written into a v217 configuration.",
+    "llama-swap substitutes ${PORT} in the model command and proxies to the port it assigned."
+  ]
 }

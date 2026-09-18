@@ -103,15 +103,30 @@ def test_runtime_backend_refuses_manifest_config_or_container_identity_mismatche
         build_backend(config, manifest, digest, _control_contract())
 
 
-def test_process_entrypoint_refuses_to_start_without_the_t00_control_contract(monkeypatch, capsys) -> None:
+def test_process_entrypoint_refuses_to_start_without_the_pinned_control_contract(monkeypatch, capsys) -> None:
+    """P06a pins the contract, so the fail-closed case is a contract that cannot be imported."""
     config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def refusing_import(name, *args, **kwargs):
+        if name == "model_scheduler.llama_swap_contract":
+            raise ImportError("no pinned contract in this deployment")
+        return real_import(name, *args, **kwargs)
 
     def should_not_run(*_args, **_kwargs):
         raise AssertionError("uvicorn must not start without the control contract")
 
+    monkeypatch.setattr("builtins.__import__", refusing_import)
     monkeypatch.setattr("run.uvicorn.run", should_not_run)
     assert main(["--config", str(config_path)]) == 78
     assert "fixed llama-swap control contract" in capsys.readouterr().err
+
+
+def test_pinned_control_contract_matches_the_shipped_fixture() -> None:
+    from model_scheduler.llama_swap_contract import CONTROL_CONTRACT
+
+    assert CONTROL_CONTRACT.load_request("qwen25vl-7b-q4").path == "/upstream/qwen25vl-7b-q4/health"
+    assert CONTROL_CONTRACT.unload_path == "/api/models/unload/{model_id}"
 
 
 def test_process_entrypoint_rejects_a_configuration_changed_while_loading(monkeypatch, tmp_path, capsys) -> None:
