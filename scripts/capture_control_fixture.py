@@ -192,11 +192,11 @@ def build_probe_files(
     if not any("${PORT}" in token for token in probe_argv):
         raise CaptureInputError("the rendered argv must publish the model port llama-swap assigns")
     command = " ".join(shlex.quote(token) for token in probe_argv)
+    # v217 takes its listen address from the command line, not from a config key,
+    # and rejects the deprecated logRequests setting (measured 2026-09-18).
     llama_swap_config = {
         "healthCheckTimeout": 900,
         "logLevel": "info",
-        "logRequests": True,
-        "port": llama_swap_port,
         "models": {model.model_id: {"cmd": command}},
     }
     manifest = {
@@ -229,6 +229,7 @@ def build_probe_files(
     return {
         "model_id": model.model_id,
         "base_url": base_url,
+        "listen": f"{listen_host}:{llama_swap_port}",
         "llama_swap_config": llama_swap_config,
         "manifest": manifest,
     }
@@ -354,7 +355,9 @@ def capture(
         return models
 
     try:
-        start_process([llama_swap_path, "--config", str(probe_config_path)], output)
+        start_process(
+            [llama_swap_path, "--listen", files["listen"], "--config", str(probe_config_path)], output
+        )
         health = exchange("health", "GET", HEALTH_PATH)
         if not health["counts_as_control_response"]:
             raise CaptureError(f"llama-swap is not healthy on its loopback port: status={health['status']}")

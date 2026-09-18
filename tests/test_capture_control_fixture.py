@@ -164,7 +164,11 @@ def test_probe_files_bind_the_registered_model_to_the_rendered_argv() -> None:
     )
 
     assert files["model_id"] == "qwen25vl-7b-q4"
-    assert files["llama_swap_config"]["port"] == 18080
+    # v217 takes the listen address from the command line, not from a config key,
+    # and the deprecated logRequests setting must not be written (measured 2026-09-18).
+    assert "port" not in files["llama_swap_config"]
+    assert "logRequests" not in files["llama_swap_config"]
+    assert files["listen"] == "127.0.0.1:18080"
     cmd = files["llama_swap_config"]["models"]["qwen25vl-7b-q4"]["cmd"]
     assert "--runtime=nvidia" in cmd
     assert "--model /models/qwen25vl-7b-q4/model.gguf" in cmd
