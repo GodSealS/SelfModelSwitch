@@ -1205,11 +1205,11 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Files likely touched:** `model_scheduler/acceptance/collect.py`、`model_scheduler/acceptance/calibrate.py`、`model_scheduler/acceptance/__main__.py`、`tests/test_calibration.py`（均新增）、`plan/m00-envelope.md`（追加，不抹失败）。
 **Acceptance criteria:**
 - [x] collect记录C09设备/栈/盘事实；calibrate关闭生产准入、独占、显式临时budget，所有出口均记录停止或UNKNOWN。
-- [ ] 3轮采样间隔<=100ms、gap<=500ms、前后10s、基线中位数、delta>0、基线差<=256MiB；swap/OOM不通过。
-  *判据已实现并单测（含 501ms 缺口、300MiB 移位、swap、稀疏采样各例）；目标保存材料只保留 MemAvailable 且无单调窗口，因此基线/delta/前后窗**无法从原始样本重算**——该项待 fresh 校准（见下）才能全勾。*
-- [ ] 按C02 `system_nonfree_upper_bound_v1` 原始MemTotal/MemFree重算物理上界，并确认目标GPU统一内存纳入口径；
+- [x] 3轮采样间隔<=100ms、gap<=500ms、前后10s、基线中位数、delta>0、基线差<=256MiB；swap/OOM不通过。
+  目标 fresh 校准（2026-09-19）由原始行证明：3/3 轮各 298 样本、cadence 0.101 s（≤100 ms 协议）、>500 ms 缺口 0、无 swap、前后 10 s 窗、delta 1.95—2.25 GiB、基线差 4.8—10.6 MB（≤256 MiB），`verdict=passed`；证据 `…/p21-calibration/fresh/calibration-2/`。
+- [x] 按C02 `system_nonfree_upper_bound_v1` 原始MemTotal/MemFree重算物理上界，并确认目标GPU统一内存纳入口径；
   不扣估计背景、不与CUDA字节重复相加；不能证明则阻塞生产、保留软件任务结果。
-  *后半句已在目标实测：材料缺 MemFree → 工具保持 null、exit 3、生产保持关闭且逐轮原因落盘；前半句的重算路径已实现并单测（合成材料 + 精确 MemTotal−MemFree），待新采集复核。*
+  Fresh 校准已证明：`physical_resident_peak_bytes = 29,675,012,096 B`（逐轮原始 MemTotal−MemFree 的窗口最大值 29357883392/29521555456/29675012096，三轮再取最大），采样器同步记录含 MemFree 的 7 列原始材料；目标 Orin 为统一内存（无独立显存），该上界取自 `/proc/meminfo` 故天然包含 GPU 侧占用，**未用 CUDA 计数重复相加**、未扣任何估计背景。"缺 MemFree 即阻塞"的语义也已实测（exit 3、结果保留）。
 - [x] 当前probe image-token允许1.05误差不沿用为正式验收放宽；正式fixture须证明不超过登记envelope。
 **Verification:** `python -m pytest tests/test_calibration.py tests/test_m00_envelope_probe.py -q`；目标calibrate按第5节，保存全部原始材料。
 
@@ -1219,6 +1219,11 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 开发机：P21 Verification（test_calibration + test_m00_envelope_probe）= 43 passed；全量 `pytest tests -m 'not thor' -q` = 664 passed, 1 skipped, 1 deselected（P20 基线 642）；`ruff check .` exit 0。
 目标机（Linux aarch64，`d925a150190dcc6a648f09f670cbfa7473934480`）：`collect` 成功（exit 0，真实 Orin facts）；`calibrate --from-evidence m00-…055502Z` = **exit 3 / blocked**（3 轮各 6087—6091 原始样本；cadence 0.101 s、0 缺口、无 swap、三轮 stop quiescent、图像 token 1227 ≤ 1280 精确通过；物理上界 null、§5 窗口判据不可重算）；材料与逐轮理由见 `…/p21-calibration/calibration-final/measurements.json`，`plan/m00-envelope.md` 第 11 节已追加（不抹失败）。
 未解决：①**fresh 校准未执行**——需要 §6 的受控 runtime 镜像/runner 接线（当前 `calibrate` 在新采集路径显式 exit 3，不假装已校准）；②目标统一内存纳入口径的确认（AC3 前半）随 fresh 校准一并完成；③probe 保存材料缺 MemFree 与单调窗口属 M00 harness 的材料口径问题，已由 P21 采样器修正，不回改既有证据；④p95/p99/冷加载等 policy 阈值属 P22 的显式 policy 输入，本任务只产出可追溯观测。
+
+**补记（2026-09-19，fresh 校准完成）**：起点 commit `cdcb662`（P29 记录）；实现提交 `8ab7a38`（live 路径：官方 lab 启动 + ≤100 ms 采样 + 图像事实 + 带证明的停止）、`e783ae1`（目标首跑抓到并修掉"Protocol 不可实例化"的真实缺陷）。
+目标机 `e783ae15d962b3407aef2a6a6b0ff27e149bce1e`：`calibrate`（无 `--from-evidence`）走真实路径——镜像 `sms-llama-cpp@sha256:8e572bb9…`（容器内 llama-server `0.4.1-dev`/commit `4bc272f`，与 M00 运行时身份一致）、profile `llama-cpp-gguf-v1`、真实资产（`3f451333…` 4,683,072,320 B + `d1c7588c…` 1,354,162,912 B，与 M00 §9.2 逐位一致）、临时 budget 12e9（来源：M00 §9.2 实测常驻 ≈10.5 GiB + 余量）、`nvidia` runtime。3 轮结果：cadence 0.101 s、0 缺口、无 swap、3/3 `stop_quiescent`、图像 token 实测 1247 ≤ 1280（**精确**）、`measured_peak=2253750272`、`reserved=2591812813`、`physical_resident_peak_bytes=29675012096`、`budget_exceeds_physical_bound=false`、`verdict=passed`、`model_id=qwen-small`；结束后 `docker ps` 为空。
+开发机：P21 Verification = test_calibration 27 passed + test_m00_envelope_probe 17 passed；全量 `pytest tests -m 'not thor' -q` = 764 passed, 1 skipped, 1 deselected；`ruff check .` exit 0。
+新增未解决：⑤本结果只覆盖 qwen-small；其他登记模型各自需要一次 fresh 校准；⑥本 live 路径不替代 P29 的 S/B/O 层执行（`run --layers` 仍显式 exit 3）。
 
 ### P22 — 候选构建和原始事件采集（M06）
 

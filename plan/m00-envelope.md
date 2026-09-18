@@ -195,3 +195,19 @@ P21 交付 `model_scheduler.acceptance collect|calibrate`（M06 校准工具，�
 
 **本轮未做**：未重跑 E0—E3 推理矩阵（避免与本文件第 9 节已保留的原始材料重复消耗设备时间）；`calibrate` 的 fresh-run 模式在
 受控 runner 就位前保持显式 exit 3（不假装已校准）。
+
+### 11.1 fresh 校准完成（2026-09-19）
+
+第 11 节的阻塞已解除：`calibrate` 的 fresh 路径按官方 lab 启动实现（`render_container_launch`；镜像 `sms-llama-cpp@sha256:8e572bb99c19…`，容器内 llama-server `0.4.1-dev`/`4bc272f`；profile `llama-cpp-gguf-v1`；M00 契约 flag `--parallel/--kv-unified-per-slot/--image-max-tokens`）并在目标 Orin 执行 **3 轮真实测量**（每轮：10 s 前窗 → 启动 → 图像用例 → 停止证明 → 10 s 后窗）：
+
+| 轮 | 原始样本 | cadence | >500ms 缺口 | swap | 基线差 | delta | 图像 token | 停止 | C02 物理上界 |
+|---|---|---|---|---|---|---|---|---|---|
+| run1 | 298 | 0.101 s | 0 | 无 | 5.9 MB | 1,945,182,208 B | 1247 | quiescent | 29,357,883,392 B |
+| run2 | 298 | 0.101 s | 0 | 无 | 10.6 MB | 2,106,605,568 B | 1247 | quiescent | 29,521,555,456 B |
+| run3 | 298 | 0.101 s | 0 | 无 | 4.8 MB | 2,253,750,272 B | 1247 | quiescent | 29,675,012,096 B |
+
+`verdict=passed`：`measured_peak=2,253,750,272 B`、`reserved=2,591,812,813 B`、**`physical_resident_peak_bytes=29,675,012,096 B`**、临时 budget 12e9 低于物理上界、3/3 停止证明、结束后无残留容器；图像 1247 ≤ 1280 为**精确**判据（未沿用 probe 的 1.05）。
+
+该上界大于第 9.2 节的常驻估计（≈10.5 GiB），原因是 C02 的定义即 `MemTotal − MemFree`（含 OS/page cache/其他进程、不减基线）：mmap 的权重与 mmproj 计入 page cache 而非 MemFree，符合"不得把可回收内存当已用、也不得与 CUDA 计数重复相加"的口径；统一内存使 GPU 侧占用天然含在其中。
+
+证据：`/home/jtzn/self-model-switch-evidence/p21-calibration/fresh/calibration-2/`（`measurements.json` + 逐轮 `raw/runN/{sampling/meminfo.csv, round.json, container.log}`）；commit `e783ae1`。第 11 节保留的材料口径结论仍然有效：**既有 probe 证据不回改**。

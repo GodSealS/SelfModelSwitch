@@ -915,7 +915,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | 项 | 值 |
 |---|---|
 | task_id | P21 |
-| status | partial（工具完成；AC2/AC3 的 fresh 重算待受控 runner/镜像；AC3 的阻塞语义与 AC1/AC4 已在目标实测） |
+| status | complete（fresh 校准 2026-09-19 在目标完成：3/3 轮判据与 C02 物理上界均由原始行证明；此前 partial 项全部闭合） |
 | source_commit | `557baf5`（P20 记录提交，起点） |
 | implementation_commits | `152c1e8`（collect + CLI）、`92d6c07`（calibrate 核心）、`6e58313`（blocked 退出码/facts 归一化）、`d925a15`（§5 缺口判据 + ≤100 ms 采样器） |
 | target_commit | `d925a150190dcc6a648f09f670cbfa7473934480`（经裸仓 origin fast-forward，目标树前后为空） |
@@ -923,7 +923,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
 | evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/`（facts.json、scheduler-v2.yaml、maintenance.json、calibration-final/{measurements.json, raw/run1..3/}） |
 
-判定 `partial`：AC1 与 AC4 已由目标真实运行证明；AC2/AC3 的判据实现与拒绝路径已测试并在目标材料上演示（blocked + exit 3 + 材料保留），但"从原始样本重算窗口判据与物理上界"这一步因保存材料缺 MemFree/单调窗口而**未能证明**，需 fresh 校准（受控 runner/镜像）后复验。
+判定 `complete`（2026-09-19 更新）：AC1、AC4 早已由目标真实运行证明；AC2 与 AC3 的"从原始样本重算"在 fresh 校准中闭合——目标机以官方 lab 启动路径执行 3 轮，3/3 verified、stops proven、`verdict=passed`，物理上界 `29,675,012,096 B` 由原始 `MemTotal−MemFree` 重算得出（不再依赖被阻塞的保存材料）。
 
 ### 2. 本轮命令与结果
 
@@ -947,8 +947,8 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 ### 4. 未执行 / 未解决
 
-- **fresh 校准未执行**：`calibrate` 的新采集路径需要受控 runtime runner/镜像（计划 §6）；当前该路径显式 exit 3，不产出"看似完成"的校准。
-- AC3 前半（目标统一内存纳入 `system_nonfree_upper_bound_v1` 口径的确认）随 fresh 校准一并完成；在此之前该模型的 `physical_resident_peak_bytes` 保持 null、生产候选不含它。
+- **fresh 校准已完成（2026-09-19）**：目标机用官方 lab 启动路径（镜像 `sms-llama-cpp@sha256:8e572bb9…`，容器内 llama-server `4bc272f`；profile `llama-cpp-gguf-v1`）执行 3 轮，全部 verified、stops proven、`verdict=passed`；证据 `…/p21-calibration/fresh/calibration-2/`；实现提交 `8ab7a38`、`e783ae1`（修掉目标首跑暴露的"Protocol 不可实例化"缺陷）。
+- AC3 前半（目标统一内存纳入 `system_nonfree_upper_bound_v1` 口径的确认）已随 fresh 校准完成：Orin 为统一内存（无独立显存），上界取自 `/proc/meminfo` 故天然包含 GPU 侧占用，未用 CUDA 计数重复相加。
 - p95/p99/冷加载/最大输入等 policy 阈值属 P22 的显式 `--policy` 输入；P21 只产出可追溯观测，不发明阈值。
 - probe 材料口径（缺 MemFree/窗口）已在 `plan/m00-envelope.md` 第 11 节追加说明，未修改既有失败/证据材料。
 
@@ -1303,7 +1303,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 ### 4. 恢复路径（依赖顺序，任何一步都不许拼接历史通过）
 
 1. 按 §6 构建并固定 ARM64 runtime 镜像（P06a 的 fixture 与 `CONTROL_CONTRACT` 已在包内，缺镜像 digest 入库）；
-2. 用 P21 的 `MemorySampler` 做 **fresh** 3 轮校准（含 MemFree 与单调窗口的原始材料；`physical_resident_peak_bytes` 由 null 升级为实测值）；
+2. ~~用 P21 的 `MemorySampler` 做 **fresh** 3 轮校准~~ **已完成（2026-09-19）**：`physical_resident_peak_bytes` 已由 null 升级为实测 `29,675,012,096 B`；镜像 digest 已写入登记（`registration.runtimes[0].image_digest`）；
 3. 接线真实 `CaseDriver` 与 `run --layers` 编排（层编排 + 材料落盘）；
 4. 重建候选（新 `candidate_sha256`）并重跑完整 S/B/O；P25 的离线 verify 与 P28 的发布门禁复验新候选；
 5. 三条 AC 方可勾选；P30/P31 同样依赖此链。
