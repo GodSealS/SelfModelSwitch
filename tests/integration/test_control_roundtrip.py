@@ -6,6 +6,7 @@ here; P17 proved identity delivery, this file proves the routes that ride it.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -21,9 +22,12 @@ from model_scheduler.blob_store import BlobStore
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Presence
 from model_scheduler.control_api import ControlAPI
 from model_scheduler.control_identity import TokenAuthority
+from model_scheduler.control_protocol_v1 import InstanceIdentity
 from model_scheduler.control_server import ControlServer, build_control_app
+from model_scheduler.execution_service import ExecutionService
 from model_scheduler.idempotency import IdempotencyStore
 from model_scheduler.model_registry import Book
+from model_scheduler.ports_v3 import CancelAck, ExecutionHandle, ExecutionRequest
 from model_scheduler.scheduler import ModelScheduler
 from model_scheduler.session_manager import SessionManager
 
@@ -95,20 +99,62 @@ def _chat_book() -> Book:
     return book
 
 
-async def _serve_api(sdir: Path, tmp_path: Path):
-    """The real session stack behind a real control socket."""
+_INSTANCE = InstanceIdentity(
+    container_id="c-exec", started_at="2026-09-18T05:00:00Z", deployment_id="orin-local", model_id="chat",
+    runtime_id="llama-cpp", candidate_digest="b" * 64, image_digest="repo/llama@sha256:" + "c" * 64,
+)
+
+
+class _FakeExec:
+    """A BackendPort fake: a gate holds one execution open, so the queue behind it stays queued."""
+
+    def __init__(self, *, gate: asyncio.Event | None = None) -> None:
+        self.gate = gate
+        self.requests: list[ExecutionRequest] = []
+
+    async def execute(self, request: ExecutionRequest, fence, deadline) -> ExecutionHandle:
+        self.requests.append(request)
+        if self.gate is not None:
+            await self.gate.wait()
+        return ExecutionHandle(execution_id=request.execution_id, instance=_INSTANCE)
+
+    async def cancel(self, handle: ExecutionHandle, deadline: float) -> CancelAck:
+        return CancelAck(execution_id=handle.execution_id, accepted=True)
+
+    async def load(self, spec, fence, deadline):  # pragma: no cover - P16 territory
+        raise AssertionError("the execution service must not load models")
+
+    async def stop(self, identity, fence, deadline):  # pragma: no cover - P16 territory
+        raise AssertionError("the execution service must not stop models")
+
+
+@dataclass
+class _ApiStack:
+    scheduler: ModelScheduler
+    service: ExecutionService
+    backend: _FakeExec
+    server: ControlServer
+
+
+async def _serve_api(sdir: Path, tmp_path: Path, *, backend: _FakeExec | None = None) -> _ApiStack:
+    """The real session/execution stack behind a real control socket."""
     clock = _Clock()
     sessions = SessionManager(wait_seconds=100.0, hard_deadline_seconds=3600.0, heartbeat_seconds=10.0,
                               ttl_seconds=30.0, prepare_seconds=100.0, drain_seconds=30.0, retry_seconds=30.0,
                               cleanup_seconds=60.0, cancel_seconds=10.0, stop_grace_seconds=30.0, reconcile_seconds=5.0)
     scheduler = ModelScheduler(_chat_book(), _Resources(clock), _Control(), sessions=sessions, clock=clock,
                                poll_interval_seconds=0.01)
-    api = ControlAPI(boot_id="boot-18", blobs=BlobStore(tmp_path / "blobs", clock=clock), scheduler=scheduler,
-                     tokens=TokenAuthority(boot_key=b"t" * 32, boot_id="boot-18", clock=clock),
-                     idempotency=IdempotencyStore(boot_key=b"i" * 32, clock=clock), clock=clock)
+    blobs = BlobStore(tmp_path / "blobs", clock=clock)
+    tokens = TokenAuthority(boot_key=b"t" * 32, boot_id="boot-18", clock=clock)
+    idempotency = IdempotencyStore(boot_key=b"i" * 32, clock=clock)
+    exec_backend = backend if backend is not None else _FakeExec()
+    service = ExecutionService(scheduler, blobs=blobs, backend_for=lambda model_id: exec_backend, boot_id="boot-18",
+                               clock=clock, poll_seconds=0.01, tokens=tokens, idempotency=idempotency)
+    api = ControlAPI(boot_id="boot-18", blobs=blobs, scheduler=scheduler, service=service, tokens=tokens,
+                     idempotency=idempotency, clock=clock)
     server = ControlServer(build_control_app(boot_id="boot-18", api=api),
                            socket_path=sdir / "control.sock", allowed_uids=(os.getuid(),))
-    return scheduler, server
+    return _ApiStack(scheduler=scheduler, service=service, backend=exec_backend, server=server)
 
 
 async def _eventually(condition, *, attempts: int = 300) -> bool:
@@ -186,7 +232,7 @@ async def test_the_version_gate_and_the_error_document_ride_the_socket(sdir, tmp
 
 @pytest.mark.asyncio
 async def test_a_real_client_drives_a_session_from_create_to_close(sdir, tmp_path) -> None:
-    _, server = await _serve_api(sdir, tmp_path)
+    server = (await _serve_api(sdir, tmp_path)).server
     await server.start()
 
     def body(document: dict) -> bytes:
@@ -229,3 +275,86 @@ async def test_a_real_client_drives_a_session_from_create_to_close(sdir, tmp_pat
         assert replay.status_code == 202 and replay.json()["session_id"] == view.session_id
     finally:
         await server.stop()
+
+
+async def _activate_session(socket_path: Path, *, key: str = "s-exec") -> dict:
+    created = await _request(str(socket_path), "POST", "/internal/sessions", headers=_json_headers(),
+                             content=json.dumps({"model_id": "chat", "idempotency_key": key}).encode("utf-8"))
+    assert created.status_code == 202, created.text
+    view = cp.parse_session_view(created.json())
+
+    async def active() -> bool:
+        read = await _request(str(socket_path), "GET", f"/internal/sessions/{view.session_id}", headers=_versioned())
+        return read.status_code == 200 and read.json()["state"] == "active"
+
+    assert await _eventually(active), "the session never reached ACTIVE"
+    return view
+
+
+def _execution_body(token: str, *, key: str, content: str = "hi") -> bytes:
+    return json.dumps({
+        "session_token": token, "operation": "chat",
+        "input": {"inline": {"messages": [{"role": "user", "content": content}]}},
+        "parameters": {"max_tokens": 8}, "idempotency_key": key,
+    }).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_a_queued_execution_cancels_with_not_started_evidence(sdir, tmp_path) -> None:
+    gate = asyncio.Event()
+    stack = await _serve_api(sdir, tmp_path, backend=_FakeExec(gate=gate))
+    await stack.server.start()
+    socket_path = stack.server.socket_path
+    token_body = lambda token: json.dumps({"session_token": token}).encode("utf-8")  # noqa: E731
+    try:
+        view = await _activate_session(socket_path)
+
+        first = await _request(str(socket_path), "POST", "/internal/executions", headers=_json_headers(),
+                               content=_execution_body(view.owner_token, key="e-1", content="hold the slot"))
+        assert first.status_code == 202, first.text
+        running_id = cp.parse_execution_view(first.json()).execution_id
+
+        async def dispatched() -> bool:
+            read = await _request(str(socket_path), "GET", f"/internal/executions/{running_id}", headers=_versioned())
+            return read.status_code == 200 and read.json()["state"] == "running"
+
+        assert await _eventually(dispatched), "the first execution never dispatched"
+
+        second = await _request(str(socket_path), "POST", "/internal/executions", headers=_json_headers(),
+                                content=_execution_body(view.owner_token, key="e-2", content="wait in the queue"))
+        assert second.status_code == 202
+        queued_id = cp.parse_execution_view(second.json()).execution_id
+
+        cancelled = await _request(str(socket_path), "POST", f"/internal/executions/{queued_id}/cancel",
+                                   headers=_json_headers(), content=token_body(view.owner_token))
+
+        assert cancelled.status_code == 200, cancelled.text
+        final = cp.parse_execution_view(cancelled.json())
+        assert final.state == "cancelled" and final.dispatch_state == "not_started"
+        assert final.compute_quiescent is True and final.instance is None  # a queued cancel invents no container
+
+        again = await _request(str(socket_path), "POST", f"/internal/executions/{queued_id}/cancel",
+                               headers=_json_headers(), content=token_body(view.owner_token))
+        assert again.status_code == 200  # a terminal execution answers its current state
+    finally:
+        gate.set()
+        await stack.server.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_same_key_never_dispatches_a_second_inference(sdir, tmp_path) -> None:
+    stack = await _serve_api(sdir, tmp_path)
+    await stack.server.start()
+    socket_path = stack.server.socket_path
+    try:
+        view = await _activate_session(socket_path)
+        body = _execution_body(view.owner_token, key="e-dup")
+
+        first = await _request(str(socket_path), "POST", "/internal/executions", headers=_json_headers(), content=body)
+        replay = await _request(str(socket_path), "POST", "/internal/executions", headers=_json_headers(), content=body)
+
+        assert first.status_code == 202 and replay.status_code == 202
+        assert replay.json()["execution_id"] == first.json()["execution_id"]
+        assert len(stack.backend.requests) == 1  # one inference, never two
+    finally:
+        await stack.server.stop()

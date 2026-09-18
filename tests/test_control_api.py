@@ -18,7 +18,7 @@ from model_scheduler import control_protocol_v1 as cp
 from model_scheduler.blob_store import MAX_BLOB_BYTES, BlobStore
 from model_scheduler.control_api import ControlAPI
 from model_scheduler.control_identity import PeerIdentity, TokenAuthority
-from model_scheduler.execution_service import blob_owner_for
+from model_scheduler.execution_service import ExecutionError, blob_owner_for
 from model_scheduler.idempotency import IdempotencyStore
 from model_scheduler.session_manager import SessionNotFound
 
@@ -261,6 +261,130 @@ async def test_malformed_and_duplicate_key_bodies_are_rejected(sessions) -> None
     assert broken.status == 400 and _error(broken).code == "malformed_json"
     assert duplicated.status == 422 and _error(duplicated).code == "contract_violation"
     assert unknown.status == 422  # "not accepted: owner/priority/deadline" (C05)
+
+
+def _execution_view(execution_id: str = "e-0001", *, state: str = "queued") -> dict:
+    terminal = state in cp.EXECUTION_TERMINAL_STATES
+    error = None
+    if state == "cancelled":
+        error = {"code": "queue_timeout", "message": "cancelled before dispatch", "retryable": True}
+    elif state == "failed":
+        error = {"code": "backend_failed", "message": "the backend failed", "retryable": False}
+    return {
+        "execution_id": execution_id, "state": state, "dispatch_state": "not_started",
+        "compute_quiescent": True if terminal else None, "result": None, "error": error, "instance": None,
+        "fence": {"boot_id": "boot-18", "model_id": "chat", "generation": 1, "operation_id": "op-1",
+                  "execution_id": execution_id, "attempt": 1},
+    }
+
+
+class _StubService:
+    """A scripted ExecutionService; the route layer is what is under test."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[str, str, dict]] = []
+        self.cancels: list[tuple[str, str, str | None]] = []
+        self.views: dict[str, dict] = {}
+        self.owners: dict[str, str] = {}
+        self.cancel_state = "cancelled"
+        self.refuse: Exception | None = None
+
+    async def submit(self, *, session_id, owner, document):
+        if self.refuse is not None:
+            raise self.refuse
+        self.submitted.append((session_id, owner, document))
+        self.owners["e-0001"] = owner
+        self.views["e-0001"] = _execution_view("e-0001", state="queued")
+        return dict(self.views["e-0001"])
+
+    async def view(self, execution_id, *, owner):
+        if self.owners.get(execution_id) != owner:
+            raise ExecutionError("not_found", "the execution does not belong to this owner")
+        return dict(self.views[execution_id])
+
+    async def cancel(self, execution_id, *, owner, session_token=None):
+        self.cancels.append((execution_id, owner, session_token))
+        self.views[execution_id] = _execution_view(execution_id, state=self.cancel_state)
+        return dict(self.views[execution_id])
+
+
+@pytest.fixture
+def executions(tmp_path: Path):
+    clock = lambda: 1_000.0  # noqa: E731 - one frozen clock for the whole surface
+    tokens = TokenAuthority(boot_key=b"k" * 32, boot_id="boot-18", clock=clock)
+    scheduler = _StubScheduler()
+    service = _StubService()
+    api = ControlAPI(boot_id="boot-18", blobs=BlobStore(tmp_path / "blobs", clock=clock), scheduler=scheduler,
+                     service=service, tokens=tokens,
+                     idempotency=IdempotencyStore(boot_key=b"i" * 32, clock=clock), clock=clock)
+    return api, scheduler, service, tokens
+
+
+def _execution_document(token: str, *, key: str = "e-1") -> bytes:
+    return json.dumps({
+        "session_token": token, "operation": "chat",
+        "input": {"inline": {"messages": [{"role": "user", "content": "hi"}]}},
+        "parameters": {"max_tokens": 8}, "idempotency_key": key,
+    }).encode("utf-8")
+
+
+async def test_an_execution_create_maps_the_token_to_its_session(executions) -> None:
+    api, _, service, _ = executions
+    view = cp.parse_session_view((await _create_session(api)).document)
+
+    created = await _call(api, "POST", "/internal/executions", headers=(VERSION,),
+                          body=_execution_document(view.owner_token))
+
+    assert created.status == 202
+    assert cp.parse_execution_view(created.document).state == "queued"
+    session_id, owner, document = service.submitted[0]
+    assert session_id == view.session_id and owner == f"uid:{os.getuid()}"
+    assert document["operation"] == "chat"
+
+
+async def test_an_execution_with_a_token_from_another_boot_is_409(executions) -> None:
+    api, _, _, _ = executions
+    await _create_session(api)  # a real session with a real token exists
+    foreign = TokenAuthority(boot_key=b"z" * 32, boot_id="boot-18", clock=lambda: 1_000.0)
+    token = foreign.issue(owner=f"uid:{os.getuid()}", model_id="chat", session_id="elsewhere",
+                          ttl_seconds=60.0, now=1_000.0)
+
+    refused = await _call(api, "POST", "/internal/executions", headers=(VERSION,), body=_execution_document(token))
+
+    assert refused.status == 409 and _error(refused).code == "stale_token"
+
+
+async def test_execution_read_and_cancel_use_the_service_and_terminal_answers_200(executions) -> None:
+    api, _, service, _ = executions
+    view = cp.parse_session_view((await _create_session(api)).document)
+    created = await _call(api, "POST", "/internal/executions", headers=(VERSION,),
+                          body=_execution_document(view.owner_token))
+    execution_id = cp.parse_execution_view(created.document).execution_id
+    payload = json.dumps({"session_token": view.owner_token}).encode("utf-8")
+
+    read = await _call(api, "GET", f"/internal/executions/{execution_id}", headers=(VERSION,))
+    assert read.status == 200 and cp.parse_execution_view(read.document).state == "queued"
+
+    service.cancel_state = "queued"
+    pending = await _call(api, "POST", f"/internal/executions/{execution_id}/cancel", headers=(VERSION,), body=payload)
+    assert pending.status == 202
+
+    service.cancel_state = "cancelled"
+    done = await _call(api, "POST", f"/internal/executions/{execution_id}/cancel", headers=(VERSION,), body=payload)
+
+    assert done.status == 200 and cp.parse_execution_view(done.document).state == "cancelled"
+    assert service.cancels[-1] == (execution_id, f"uid:{os.getuid()}", view.owner_token)
+
+
+async def test_a_foreign_owner_gets_404_for_an_execution(executions) -> None:
+    api, _, _, _ = executions
+    view = cp.parse_session_view((await _create_session(api)).document)
+    await _call(api, "POST", "/internal/executions", headers=(VERSION,), body=_execution_document(view.owner_token))
+    other = os.getuid() + 1 if os.getuid() < 65534 else os.getuid() - 1
+
+    read = await _call(api, "GET", "/internal/executions/e-0001", headers=(VERSION,), peer=PeerIdentity(other))
+
+    assert read.status == 404 and _error(read).code == "not_found"
 
 
 async def _upload(api, *, media_type: str = "application/json", payload: bytes = b'{"messages": []}',

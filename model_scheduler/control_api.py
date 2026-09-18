@@ -41,6 +41,7 @@ from .session_manager import BLOCKED, CLOSED, DRAINING, PREPARING, SessionConfli
 _BLOB_ID_PATTERN = r"[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?"
 _BLOB_ROUTE = re.compile(rf"^/internal/blobs/({_BLOB_ID_PATTERN})$")
 _SESSION_ROUTE = re.compile(rf"^/internal/sessions/({_BLOB_ID_PATTERN})(/heartbeat|/close)?$")
+_EXECUTION_ROUTE = re.compile(rf"^/internal/executions/({_BLOB_ID_PATTERN})(/cancel)?$")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_ERROR_TEXT = 512
 
@@ -116,6 +117,7 @@ class ControlAPI:
         self._routes: dict[tuple[str, str], Callable[..., Awaitable[None]]] = {
             ("POST", "/internal/blobs"): self._blob_upload,
             ("POST", "/internal/sessions"): self._session_create,
+            ("POST", "/internal/executions"): self._execution_create,
         }
 
     async def __call__(
@@ -181,6 +183,11 @@ class ControlAPI:
             if method != "POST":
                 return None
             return self._session_heartbeat if suffix == "/heartbeat" else self._session_close
+        execution = _EXECUTION_ROUTE.fullmatch(path)
+        if execution is not None:
+            if execution.group(2) is None:
+                return self._execution_read if method == "GET" else None
+            return self._execution_cancel if method == "POST" else None
         return None
 
     async def _refuse(self, send, code: str, message: str, request_id: str, started: Mapping[str, bool]) -> None:
@@ -361,6 +368,33 @@ class ControlAPI:
         cp.parse_session_view(document)  # the response is the contract, not a hope
         return document
 
+    # -- C05: executions -------------------------------------------------------------
+
+    async def _execution_create(self, owner, scope, receive, send, request_id) -> None:
+        service, tokens = self._require_service()
+        document = await _json_body(receive, limit=cp.MAX_INLINE_INPUT_BYTES)
+        parsed = cp.parse_execution_create_request(document)
+        session_id = self._session_tokens.get(tokens.fingerprint(parsed.session_token))
+        if session_id is None:
+            raise ExecutionError("stale_token", "the session token does not belong to this boot")
+        view = await service.submit(session_id=session_id, owner=owner, document=document)
+        await send_json(send, 202, view)  # a replayed key returns the object's current state
+
+    async def _execution_read(self, owner, scope, receive, send, request_id) -> None:
+        service, _ = self._require_service()
+        await send_json(send, 200, await service.view(_execution_id_of(scope), owner=owner))
+
+    async def _execution_cancel(self, owner, scope, receive, send, request_id) -> None:
+        service, _ = self._require_service()
+        token = _session_token_of(await _json_body(receive, limit=cp.MAX_INLINE_INPUT_BYTES))
+        view = await service.cancel(_execution_id_of(scope), owner=owner, session_token=token)
+        await send_json(send, 200 if str(view.get("state")) in cp.EXECUTION_TERMINAL_STATES else 202, view)
+
+    def _require_service(self):
+        if self.service is None or self.tokens is None:
+            raise _Refused("temporarily_unavailable", "the execution service is not wired into this process")
+        return self.service, self.tokens
+
 
 def _header(scope: Mapping[str, Any], name: str) -> str | None:
     wanted = name.lower().encode("latin-1")
@@ -382,6 +416,13 @@ def _declared_size(scope: Mapping[str, Any]) -> int | None:
 
 def _blob_id_of(scope: Mapping[str, Any]) -> str:
     match = _BLOB_ROUTE.fullmatch(str(scope.get("path") or ""))
+    if match is None:
+        raise _Refused("not_found", "the route is not served here")
+    return match.group(1)
+
+
+def _execution_id_of(scope: Mapping[str, Any]) -> str:
+    match = _EXECUTION_ROUTE.fullmatch(str(scope.get("path") or ""))
     if match is None:
         raise _Refused("not_found", "the route is not served here")
     return match.group(1)
