@@ -86,7 +86,7 @@ class DirectInferenceGateway:
         request = self._client.build_request("POST", f"{base.rstrip('/')}{self._path(capability)}", json=dict(payload))
         try:
             async with asyncio.timeout(remaining):
-                response = await self._client.send(request, stream=True)
+                response = await self._client.send(request, stream=True, follow_redirects=False)
         except asyncio.TimeoutError as exc:
             raise GatewayError(504, "inference_timeout", Outcome.ABORTED) from exc
         except httpx.HTTPError as exc:

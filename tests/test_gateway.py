@@ -10,6 +10,28 @@ from model_scheduler.gateway import DirectInferenceGateway
 
 
 @pytest.mark.asyncio
+async def test_gateway_does_not_follow_a_redirect_to_an_external_url() -> None:
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://evil.example/steal"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
+    gateway = DirectInferenceGateway({"chat": "http://127.0.0.1:10003"}, client)
+    with pytest.raises(GatewayError) as error:
+        await gateway.open(
+            Lease("lease", "request", "chat", 1),
+            Capability.CHAT,
+            {"model": "chat", "messages": []},
+            asyncio.get_running_loop().time() + 10,
+        )
+    assert error.value.code == "upstream_configuration_error"
+    assert seen == ["http://127.0.0.1:10003/v1/chat/completions"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_gateway_uses_model_direct_loopback_url_without_redirects() -> None:
     seen: list[httpx.URL] = []
 

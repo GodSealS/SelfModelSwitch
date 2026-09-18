@@ -59,6 +59,11 @@ class BackendRouter:
             raise BackendRouterError(
                 f"adapter declares runtime identity {declared!r}, not {runtime_id!r}"
             )
+        declared_profile = getattr(adapter, "profile_id", None)
+        if declared_profile is not None and declared_profile != runtime.profile_id:
+            raise BackendRouterError(
+                f"adapter declares profile {declared_profile!r}, not {runtime.profile_id!r}"
+            )
         for bound_id, binding in self._bindings.items():
             if binding.adapter is adapter:
                 raise BackendRouterError(f"adapter is already bound to runtime {bound_id!r}")

@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "profile_id": "llama-cpp-gguf-v1",
+  "runtime_commit": "4bc272fd729bd094c0422e4b8353da8d2fec91f8",
+  "acceptance_status": "protocol_pinned_from_m00",
+  "source": {
+    "m00_evidence_directory": "/home/jtzn/self-model-switch-evidence/m00-qwen25vl-envelope-20260917T055502Z",
+    "probe": "scripts/m00_envelope_probe.py",
+    "note": "HTTP paths and health/slots/tokenize/chat shapes were observed on the Orin probe runtime. This fixture does not claim device compute_quiescent. A later target capture may replace bodies with hashed samples; hashes here are of the documented protocol facts, not of a live adapter run."
+  },
+  "lifecycle_boundary": {
+    "llama_swap": "load and unload only",
+    "inference": "direct llama-server loopback; never llama-swap auto-routing"
+  },
+  "http": {
+    "follow_redirects": false,
+    "allowed_origin": "loopback"
+  },
+  "endpoints": {
+    "health": {
+      "method": "GET",
+      "path": "/health",
+      "success_body": {"status": "ok"}
+    },
+    "slots": {
+      "method": "GET",
+      "path": "/slots"
+    },
+    "tokenize": {
+      "method": "POST",
+      "path": "/tokenize",
+      "request_content_key": "content"
+    },
+    "apply_template": {
+      "method": "POST",
+      "path": "/apply-template",
+      "request_messages_key": "messages",
+      "required_for_chat_counting": true
+    },
+    "chat": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "protocol": "openai-chat",
+      "operations": ["chat", "vision"]
+    },
+    "embeddings": {
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "protocol": "openai-embeddings"
+    },
+    "rerank": {
+      "method": "POST",
+      "path": "/reranking",
+      "protocol": "llama-rerank"
+    }
+  },
+  "slot_protocol": {
+    "path": "/slots",
+    "trusted_for_device_quiescence": false,
+    "trusted_for_request_slot_idle": true,
+    "idle_when": {"is_processing": false},
+    "fallback_termination": "independent_STOPPED",
+    "stop_reload_cost": {
+      "reason": "An HTTP 200 or an idle slot is not GPU-idle evidence. Claiming compute_quiescent=true requires independently proven STOPPED, then a reload that pays the measured cold-load cost.",
+      "measured_cold_load_seconds": 18.07,
+      "stop_grace_seconds": 30
+    }
+  },
+  "counting": {
+    "text": "apply-template then tokenize the resulting prompt; never character length",
+    "undetermined_image_tokens": "charge envelope.max_image_tokens once per image",
+    "remote_url": "rejected",
+    "allowed_image_media": ["image/png", "image/jpeg"]
+  }
+}
