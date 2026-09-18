@@ -125,6 +125,8 @@ class ExecutionRecord:
     input_closed: bool = False
     cancel_pending: bool = False
     settled: bool = False
+    awaiting_quiescence: bool = False
+    expected_instance: InstanceIdentity | None = None
     idempotency: IdempotencyRecord | None = None
     execute_task: Any = None
 
@@ -173,8 +175,10 @@ class ExecutionService:
         tokens: TokenAuthority | None = None,
         idempotency: IdempotencyStore | None = None,
         event_sink: Callable[[str, Mapping[str, object]], None] | None = None,
+        managed_termination: bool = False,
+        stop_grace_seconds: float = 30.0,
     ) -> None:
-        if queue_capacity < 1 or wait_seconds <= 0 or poll_seconds <= 0 or output_limit_bytes <= 0:
+        if queue_capacity < 1 or wait_seconds <= 0 or poll_seconds <= 0 or output_limit_bytes <= 0 or stop_grace_seconds <= 0:
             raise ValueError("execution policy values must be positive")
         self._scheduler = scheduler
         self._sessions = scheduler.sessions
@@ -195,6 +199,13 @@ class ExecutionService:
         self._records: dict[str, ExecutionRecord] = {}
         self._dispatchers: dict[str, asyncio.Task[None]] = {}
         self._pending_cleanup: set[str] = set()
+        # P16 managed termination: dispatched executions settle through a proven instance
+        # stop unless the adapter itself claims a trusted per-request sync protocol.
+        self._managed = bool(managed_termination)
+        self._stop_grace_seconds = stop_grace_seconds
+        self._quiescing: set[str] = set()
+        self._quiescers: dict[str, asyncio.Task[None]] = {}
+        self._publish_inflight: set[str] = set()
         if getattr(scheduler, "execution_hook", None) is not None:
             raise RuntimeError("the scheduler already owns an execution hook")
         scheduler.execution_hook = self._on_session_draining
@@ -375,7 +386,8 @@ class ExecutionService:
                 record.error = _error("backend_failed", "a result cannot publish without dispatch")
                 self._mark_settled(record, FAILED)
                 return True
-            record.publishing = True  # the caller publishes outside the lock via _advance
+            if not record.publishing:  # exactly one publish in flight, even if the handle lands mid-publish
+                record.publishing = True  # the caller publishes outside the lock via _advance
             return False
         return False  # terminal without a result: never a fake success; keep waiting
 
@@ -400,8 +412,12 @@ class ExecutionService:
         self._mark_settled(record, CANCELLED if code in _CANCEL_CODES else FAILED)
 
     async def _advance(self, record: ExecutionRecord, settled: bool) -> None:
-        if record.publishing:
-            await self._publish_and_settle(record)
+        if record.publishing and record.execution_id not in self._publish_inflight:
+            self._publish_inflight.add(record.execution_id)
+            try:
+                await self._publish_and_settle(record)
+            finally:
+                self._publish_inflight.discard(record.execution_id)
             settled = record.settled
         if settled:
             await self._teardown(record)
@@ -492,6 +508,8 @@ class ExecutionService:
                             continue
                         if entry.state != QUEUED:
                             continue
+                        if entry.model_id in self._quiescing:
+                            continue  # AC2: a fallback stop is owed; new dispatches freeze (heartbeats and expiry do not)
                         (expired if now >= entry.deadline else heads).append(entry)
                     for entry in expired:
                         self._terminate_local(entry, "queue_timeout", "queue deadline elapsed")
@@ -674,16 +692,48 @@ class ExecutionService:
         except Exception:
             await self._terminate_uncertain(record, "the backend raised without a trusted terminal")
             return
+        backend = self._backend_for(record.model_id)
+        body: bytes | None = None
+        take = getattr(backend, "take_result", None)
+        if take is not None:  # the managed adapter validated the whole answer; the service publishes it
+            try:
+                body = take(record.execution_id)
+            except Exception:
+                body = None
+        need_quiesce = False
         async with self._lock:
             if record.settled:
                 return  # a terminal was already published from trusted evidence; facts stay facts
             record.instance = handle.instance
             record.dispatch_state = "dispatched"
-            cancel_pending = record.cancel_pending
-            settled = record.settled
-        if cancel_pending and not settled:
+            if body is not None:
+                if record.cancel_pending:
+                    record.output_pending = None
+                    await self._cancel_reservation(record)
+                    self._emit("output_dropped", {"execution_id": record.execution_id, "reason": "cancelled"})
+                elif record.publishing:
+                    self._emit("output_dropped", {"execution_id": record.execution_id, "reason": "publish in flight"})
+                else:
+                    record.output_pending = bytes(body)
+            if self._managed:
+                claims = getattr(backend, "claims_device_quiescence", None)
+                if claims is not None and claims():
+                    if record.evidence is None:
+                        record.evidence = TerminationEvidence(
+                            fence=record.fence, dispatch_state="dispatched", compute_quiescent=True,
+                            device_synchronized=True, reason="request_protocol_terminated", instance=handle.instance)
+                else:
+                    # HTTP done != device idle (P15): the request waits for a proven instance stop.
+                    record.awaiting_quiescence = True
+                    need_quiesce = True
+            teardown = self._evaluate(record)
+            cancel_pending = record.cancel_pending and not record.settled
+        await self._advance(record, teardown)
+        if need_quiesce:
+            self._ensure_quiescer(record.model_id)
+        if cancel_pending:
             try:
-                await self._backend_for(record.model_id).cancel(handle, self._clock() + self._sessions.cancel_seconds)
+                await backend.cancel(handle, self._clock() + self._sessions.cancel_seconds)
             except Exception:
                 pass  # the cancel ack is not proof; the terminal evidence stays the arbiter
 
@@ -702,16 +752,98 @@ class ExecutionService:
 
     async def _terminate_uncertain(self, record: ExecutionRecord, message: str) -> None:
         """Dispatch happened but the outcome is unproven: no terminal is invented; lease and budget stay."""
+        need_quiesce = False
         async with self._lock:
             if record.settled:
                 return
             self._mark_reason(record, "backend_failed", message)  # not a client cancel: an unproven backend failure
             if not record.terminal:
                 record.state = CANCELLING
+            if self._managed and record.dispatch_started:
+                # a broken stream is protocol-finished on our side: an instance stop may proceed
+                # once the other requests finish; until its proof lands nothing settles.
+                record.awaiting_quiescence = True
+                if record.instance is None:
+                    record.expected_instance = getattr(self._backend_for(record.model_id), "current_identity", None)
+                need_quiesce = True
             await self._cancel_side_effects(record)
             settled_now = self._evaluate(record)
         if settled_now:
             await self._teardown(record)
+        if need_quiesce:
+            self._ensure_quiescer(record.model_id)
+
+    # -- managed termination: one shared stop settles the quiescing batch ------
+
+    def _ensure_quiescer(self, model_id: str) -> None:
+        task = self._quiescers.get(model_id)
+        if task is None or task.done():
+            self._quiescers[model_id] = asyncio.create_task(self._quiesce_model(model_id))
+
+    async def _quiesce_model(self, model_id: str) -> None:
+        """P16 AC2/AC3: after every in-flight request finishes per protocol, one proven STOPPED
+        terminates the awaiting batch; an unprovable stop keeps everything fail-closed."""
+        loop = asyncio.get_event_loop()
+        grace_until = loop.time() + self._stop_grace_seconds
+        while True:
+            async with self._lock:
+                # "in flight" counts everything that may still touch the instance: a claimed admission,
+                # a held lease, or a dispatched computation whose response has not ended per protocol.
+                inflight = [entry for entry in self._records.values()
+                            if entry.model_id == model_id and not entry.settled and not entry.awaiting_quiescence
+                            and (entry.dispatch_started or entry.dispatch_claimed or entry.lease is not None)]
+                batch = [entry for entry in self._records.values()
+                         if entry.model_id == model_id and not entry.settled and entry.dispatch_started
+                         and entry.awaiting_quiescence]
+                if not batch and not inflight:
+                    self._quiescing.discard(model_id)  # every terminal is proven: dispatch resumes
+                    return
+                self._quiescing.add(model_id)
+                todo = [] if inflight else list(batch)
+            for entry in todo:
+                # an awaiting request's response already ended per protocol: its lease is not a
+                # waiting object any more (AC2), while the budget stays until the stop is proven.
+                await self._release_quiescence_lease(entry)
+            if todo:
+                unproven = False
+                try:
+                    # the shared stop goes through the single book path: ManagedLifecycle.stop
+                    # asks llama-swap, the observer's four facts decide, `Book.stopped` clears the budget.
+                    await self._scheduler.unload(model_id, self._clock() + self._stop_grace_seconds)
+                except Exception as exc:
+                    unproven = True
+                    self._emit("termination_unproven", {"model_id": model_id, "reason": type(exc).__name__})
+                if not unproven:
+                    for entry in todo:
+                        await self._settle_with_stopped_proof(entry)
+            if loop.time() >= grace_until:
+                return  # never invent a terminal: the records stay, the session will go BLOCKED (P10)
+            await asyncio.sleep(self._poll_seconds)
+
+    async def _release_quiescence_lease(self, record: ExecutionRecord) -> None:
+        async with self._lock:
+            if record.lease is None or record.lease_released:
+                return
+            record.lease_released = True
+            lease = record.lease
+            outcome = Outcome.SUCCESS if (record.error is None and not record.cancel_pending) else Outcome.REJECTED
+        await self._scheduler.release(lease, outcome)
+
+    async def _settle_with_stopped_proof(self, record: ExecutionRecord) -> None:
+        async with self._lock:
+            if record.settled or record.evidence is not None:
+                return
+            instance = record.instance or record.expected_instance
+            if instance is None:
+                return  # a dispatched terminal needs the full identity: stay unproven, never fake
+            record.evidence = TerminationEvidence(fence=record.fence, dispatch_state="dispatched",
+                                                  compute_quiescent=True, device_synchronized=True,
+                                                  reason="independent_STOPPED", instance=instance)
+            if record.dispatch_state != "dispatched":
+                record.dispatch_state = "dispatched"
+                record.instance = instance
+            teardown = self._evaluate(record)
+        await self._advance(record, teardown)
 
     # -- session drain (the scheduler's hook) -----------------------------------
 
