@@ -588,15 +588,16 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | 项 | 值 |
 |---|---|
 | task_id | P14 |
-| status | software_only |
+| status | complete |
 | source_commit | `f149d37`（P15 目标结果记录提交，起点） |
 | implementation_commit | `c512fcde6c47c9eab03dd6df1e64e29f78c26752` |
-| target_commit | 未复验：开发机与目标机对 github.com:443 连接超时，`c512fcd` 未推送，目标机未同步（AGENTS 禁止 SSH 拷贝绕过共享远端） |
+| target_commit | `282a6a3d8b1ad198fdfa1c4b0c15ba43318b565f`（显式从 GitHub fast-forward，目标树为空） |
 | candidate_sha256 | null（本任务不产出候选） |
-| python_version | 3.13.5（开发机 `.venv`，本轮开发机无 3.12 解释器）/ 3.12.14（目标 lab venv，待复验） |
-| evidence_directory | 无新目录；目标机未运行本轮测试 |
+| python_version | 3.13.5（开发机 `.venv`，本轮开发机无 3.12 解释器）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
 
-判定 `software_only`：三条验收由开发机 20 项新测试与全量回归支撑；真机复验因网络中断挂起，不宣称设备/远端证据。
+判定 `complete`：三条验收由开发机与目标机测试共同支撑（软件层 S）；推送远端与目标 SHA 一致。
+首次推送时两机对 github.com:443 短暂超时，重试成功；目标机 `origin` 指向本地裸仓（与指南的 GitHub 远端不符，未改目标机配置），本轮显式从共享远端 URL fetch 后 fast-forward。
 
 ### 2. 本轮命令与结果
 
@@ -607,7 +608,8 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | `pytest tests -m 'not thor' -q`（开发机） | 0 | `556 passed, 1 deselected`（P15 基线 536） |
 | `ruff check .`（开发机） | 0 | 通过 |
 | `python run.py --check-config` | 0 | 仍为 v1 四 ID，运行行为未变 |
-| `git push origin main` | 128 | `Failed to connect to github.com port 443`；目标机同测亦超时 |
+| `git push origin main` | 0/128 | 首次两机 443 超时（exit 128）；重试成功 `f149d37..282a6a3`，`ls-remote` SHA 校验一致 |
+| 同上（目标机 `282a6a3d`，python 3.12.14） | 0 | 计划验证命令 `35 passed`；全量 `553 passed, 1 deselected` + 3 项既有 `test_release` 环境失败（P28 范围，P10/P13/P15 同款） |
 
 ### 3. 关键事实
 
@@ -621,7 +623,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 ### 4. 未执行 / 未解决
 
-- 推送与目标机复验：网络恢复后按 AGENTS 步骤 4/5 补做（当前两机 443 均超时）。
+- 目标机 `origin` 指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`，与指南"远端为 GitHub、两台一致"不符；本轮未改目标机配置，用显式共享远端 URL fetch 完成复验。拓扑需用户确认（裸仓是否要配置为 GitHub 的 mirror，或改回 origin=GitHub）。
 - HTTP 路由、`SO_PEERCRED`→owner 注入、`ExecutionError.code`→状态码映射（P17/P18）；`NotDispatched`/晚到 handle 与真实 adapter、observer、账本的完整接线及 StopAck 后不释放（P16）。
 - `book.specs` v1 字段 → v2 登记迁移（P14/P16 遗留说明随 v2 接线处理）。
 - `storage_lost`/重启下的在途执行结算语义由 P16 重放场景确认（当前 fail-closed 预留与 lease 不提前清账）。

@@ -1010,8 +1010,8 @@ claims 固定为 `boot_id/owner/model_id/session_id/execution_id/expires_at` 的
 - [x] succeeded须结果发布和可信terminal同时具备；cancel/超时后晚到输出不发布，失败保留清理跟踪。
 **Verification:** `python -m pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q`；fake BackendPort做乱序/重复回调测试。
 
-**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `f149d37`（P15 目标结果记录提交）；实现提交 `c512fcde6c47c9eab03dd6df1e64e29f78c26752`；
-python=3.13.5（开发机 `.venv`，本轮开发机上无 3.12 解释器，如实记录）/3.12.14（目标 lab venv，待复验）。
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `f149d37`（P15 目标结果记录提交）；实现提交 `c512fcde6c47c9eab03dd6df1e64e29f78c26752`；
+python=3.13.5（开发机 `.venv`，本轮开发机上无 3.12 解释器，如实记录）/3.12.14（目标 lab venv，已复验）。
 `pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q` = 35 passed（实现前新模块不存在，收集 ImportError，即 RED）；
 `pytest tests/test_executions.py -q` = 20 passed；`pytest tests -m 'not thor' -q` = 556 passed, 1 deselected（P15 基线 536）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
 新增 `model_scheduler/execution_service.py`：`ExecutionService` 把 P10 会话授权、P11/P12 Blob 端口、P13 身份与幂等接成通用执行纵向切片。
@@ -1023,7 +1023,11 @@ succeeded 必须"发布成功 + `writeback_decision` 接受的 `TerminationEvide
 `NotDispatched` 为 adapter"证明未送达后端"的显式断言；P02 规则"非 terminal 视图不得带 error"由 `terminal_code/terminal_message` 延迟物化实现。
 `scheduler.py` 新增 `execution_hook`：`close_session`/到期/`shutdown` 在锁外通知服务，排队执行原地取消、已派发执行走取消-等证据路径（会话清理不再被饿死）；`session_manager.py` 未改（授权判据已足够）。
 **Files touched:** `model_scheduler/execution_service.py`（新增）、`model_scheduler/scheduler.py`、`tests/test_executions.py`（新增），共 3 个（计划 4 个，`session_manager.py` 无需改）。
-**推送/目标复验：** 本轮开发机与目标机对 github.com:443 均连接超时，`c512fcd` 未能推送、目标机未能 fast-forward 复验；不做 SSH 拷贝绕过共享远端。网络恢复后补推并按 AGENTS 步骤 5 同步复验。
+**推送/目标复验：** 首次推送时两机对 github.com:443 短暂超时；稍后重试成功，`f149d37..282a6a3` 已推 origin/main。
+目标机 `origin` 实际指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`（无 remote，与指南"两台机器都指向 GitHub"不符，未改目标机配置），
+改为显式从共享远端 URL fetch：干净树守卫下 fast-forward 到 `282a6a3d8b1ad198fdfa1c4b0c15ba43318b565f`，前后工作区均为空。
+目标机（python 3.12.14，lab venv）：`pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q` = 35 passed；
+全量 `pytest tests -m 'not thor' -q` = 553 passed + 3 项既有 `tests/test_release.py` 环境失败（`.venv/bin/python` 依赖，P10/P13/P15 同款，P28 范围），无回归。
 未解决：①HTTP 路由、peer UID 注入与错误码映射（P17/P18）；②真实 adapter/observer 走同一账本的完整接线与 StopAck 后容器仍活不释放（P16，`NotDispatched`/晚到 handle 在此接线）；
 ③`scheduler/eviction_policy` 读 v1 `book.specs` 字段的 v2 迁移（P14/P16 遗留，随 v2 登记接线处理）；④`storage_lost`/重启下在途执行的结算由 P16 重放语义确认（当前 fail-closed：预留与 lease 不提前清账）。
 
