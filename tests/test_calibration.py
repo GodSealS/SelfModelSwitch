@@ -459,6 +459,206 @@ def test_the_cli_keeps_preserved_material_but_exits_3_when_the_bound_is_unproven
     assert "MemFree" in measurement["rounds"][0]["bound_note"]  # the software result is kept and explains why
 
 
+# ---------------------------------------------------------------------------
+# calibrate, fresh path: the official lab launch, one accounting for both paths
+
+
+from model_scheduler.acceptance import live as live_module  # noqa: E402
+
+
+class _FakeLaunch:
+    """Only the identity a round reads; the argv itself is rendered by the profiles."""
+
+    argv = ("docker", "run", "--name", "sms-lab-qwen-small", "x")
+    labels = {"io.self-model-switch.model": "qwen-small"}
+    container_name = "sms-lab-qwen-small"
+    deployment_id = "lab"
+    model_id = "qwen-small"
+    runtime_id = "llama-cpp-1"
+    profile_id = "llama-cpp-gguf-v1"
+    image_digest = "registry.example/sms-runtime@sha256:" + "a" * 64
+    port = 18001
+    mode = "lab"
+    config_sha256 = "b" * 64
+    model_directory = "/models"
+    container_runtime = "nvidia"
+
+
+class _FakeSampler:
+    """Writes the whole series up front: the round logic never invents a sample."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(_csv(_rows()), encoding="utf-8")
+
+    def stop(self, post_seconds: float = 0.0) -> None:
+        return None
+
+
+class _Clock:
+    def __init__(self, value: float = LAUNCH - cal.WINDOW_SECONDS) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value = round(self.value + seconds, 3)
+
+
+class _FakeDriver:
+    def __init__(self, *, present: bool = True, tokens: int | None = 1227, residual: list[str] | None = None,
+                 ready: bool = True, quiescent: bool = True) -> None:
+        self.present, self.tokens, self.residual, self.ready, self.quiescent = present, tokens, residual or [], ready, quiescent
+        self.clock: _Clock | None = None
+        self.stopped = False
+
+    def image_present(self, launch) -> bool:
+        return self.present
+
+    def running(self, launch) -> list[str]:
+        return self.residual
+
+    def start(self, launch, *, log_path):
+        return object()
+
+    def wait_ready(self, launch, *, timeout, process=None) -> bool:
+        if self.ready and self.clock is not None:
+            self.clock.advance(END - LAUNCH)  # the measured run window, not wall clock
+        return self.ready
+
+    def image_tokens(self, launch, *, edge) -> int | None:
+        return self.tokens
+
+    def stop(self, launch, *, process=None) -> dict:
+        self.stopped = True
+        return live_module.classify_stop(0, port_free=True, reclaimed=self.quiescent, kill_used=False)
+
+
+def test_a_live_round_measures_the_window_and_records_a_proven_stop(tmp_path) -> None:
+    clock = _Clock()
+    driver = _FakeDriver()
+    driver.clock = clock
+
+    directory = live_module.run_live_round(_FakeLaunch(), output=tmp_path / "run1", driver=driver, edge=1024,
+                                           sampler_factory=_FakeSampler, clock=clock, sleep=clock.advance)
+
+    document = json.loads((directory / "round.json").read_text(encoding="utf-8"))
+    assert (document["launch_ts"], document["end_ts"]) == (LAUNCH, END)
+    assert document["stop"]["quiescent"] is True and document["image_digest"] == _FakeLaunch.image_digest
+    assert document["cases"]["image_max"]["image_tokens_measured"] == 1227
+    # The live round lands in the *same* accounting: §5 windows and the C02 bound.
+    metrics = cal.evaluate_round(cal.load_round_material(directory))
+    assert metrics["measurement_valid"] is True
+    assert metrics["physical_upper_bound_bytes"] == TOTAL - RUN_MIN_FREE
+
+
+def test_a_live_round_refuses_a_missing_image_or_a_busy_site(tmp_path) -> None:
+    clock = _Clock()
+    absent = _FakeDriver(present=False)
+    absent.clock = clock
+
+    with pytest.raises(live_module.LiveError, match="never pulls"):
+        live_module.run_live_round(_FakeLaunch(), output=tmp_path / "a", driver=absent,
+                                   sampler_factory=_FakeSampler, clock=clock, sleep=clock.advance)
+
+    busy = _FakeDriver(residual=["sms-lab-qwen-small"])
+    busy.clock = clock
+    with pytest.raises(live_module.LiveError, match="already running"):
+        live_module.run_live_round(_FakeLaunch(), output=tmp_path / "b", driver=busy,
+                                   sampler_factory=_FakeSampler, clock=clock, sleep=clock.advance)
+
+
+def _live_site(tmp_path, monkeypatch, *, rounds: int = 2):
+    """A fresh-calibration site: v2 config, facts, maintenance, stubbed launch+rounds."""
+    from model_scheduler.acceptance import collect as collect_module
+
+    config_path, facts_path, maintenance = _site(tmp_path, rounds=rounds)
+
+    class _Reader:
+        def read_text(self, path: str) -> str:
+            assert path == "/etc/machine-id"
+            return "0123456789abcdef0123456789abcdef\n"
+
+    monkeypatch.setattr(collect_module, "FactsReader", _Reader)
+    monkeypatch.setattr(cal, "verify_maintenance",
+                        lambda *a, **k: {"live_verified_utc": "2026-09-18T00:00:00Z", "declared_by": "jtzn",
+                                         "containers": [], "lock_path": str(tmp_path / "scheduler.lock")})
+    monkeypatch.setattr("model_scheduler.runtime_profiles.render_container_launch",
+                        lambda *a, **k: _FakeLaunch())
+
+    def fake_round(launch, *, output, **kwargs):
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "sampling").mkdir(exist_ok=True)
+        (output / "sampling" / "meminfo.csv").write_text(_csv(_rows()), encoding="utf-8")
+        (output / "round.json").write_text(json.dumps({
+            "launch_ts": LAUNCH, "end_ts": END, "ready": True,
+            "cases": {"image_max": {"image_tokens_measured": 1227}},
+            "stop": {"quiescent": True, "exit_code": 0, "port_free": True, "reclaimed": True, "kill_used": False},
+        }), encoding="utf-8")
+        return output
+
+    monkeypatch.setattr(live_module, "run_live_round", fake_round)
+    return config_path, facts_path, maintenance
+
+
+def test_the_cli_runs_a_fresh_calibration_through_the_official_launch(tmp_path, monkeypatch) -> None:
+    config_path, facts_path, maintenance = _live_site(tmp_path, monkeypatch, rounds=2)
+    output = tmp_path / "calibration"
+
+    from model_scheduler.acceptance.__main__ import main
+
+    code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                 "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "2",
+                 "--deployment-id", "sms-orin-lab", "--output", str(output)])
+
+    assert code == EXIT_OK
+    document = json.loads((output / "measurements.json").read_text(encoding="utf-8"))
+    assert document["summary"]["verdict"] == "passed" and document["summary"]["model_id"] == "qwen-small"
+    assert document["launch"]["image_digest"] == _FakeLaunch.image_digest
+    assert document["launch"]["mode"] == "lab" and document["launch"]["temporary_budget_bytes"] == 16000000000
+    assert document["rounds"][0]["physical_upper_bound_bytes"] == TOTAL - RUN_MIN_FREE
+    assert (output / "raw" / "run1" / "sampling" / "meminfo.csv").is_file()
+
+
+def test_a_fresh_calibration_requires_an_explicit_launch_identity(tmp_path, monkeypatch, capsys) -> None:
+    config_path, facts_path, maintenance = _live_site(tmp_path, monkeypatch, rounds=1)
+
+    from model_scheduler.acceptance.__main__ import main
+
+    code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                 "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "1",
+                 "--output", str(tmp_path / "calibration")])
+
+    assert code == EXIT_INPUT
+    assert "--deployment-id" in capsys.readouterr().err
+    assert not (tmp_path / "calibration" / "measurements.json").exists()
+
+
+def test_a_fresh_calibration_refuses_another_machines_facts(tmp_path, monkeypatch, capsys) -> None:
+    from model_scheduler.acceptance import collect as collect_module
+
+    config_path, facts_path, maintenance = _live_site(tmp_path, monkeypatch, rounds=1)
+
+    class _OtherReader:
+        def read_text(self, path: str) -> str:
+            return "ffffffffffffffffffffffffffffffff\n"
+
+    monkeypatch.setattr(collect_module, "FactsReader", _OtherReader)
+
+    from model_scheduler.acceptance.__main__ import main
+
+    code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                 "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "1",
+                 "--deployment-id", "sms-orin-lab", "--output", str(tmp_path / "calibration")])
+
+    assert code == EXIT_FAILED  # identity before any model moves: a semantic refusal
+    assert "different machine" in capsys.readouterr().err
+
+
 def test_the_cli_recomputes_from_raw_material_and_writes_measurements(tmp_path) -> None:
     config_path, facts_path, maintenance = _site(tmp_path)
     evidence = tmp_path / "evidence"

@@ -519,6 +519,146 @@ def run_calibration(*, config_path: Path, facts_path: Path, maintenance_path: Pa
     return summary
 
 
+def run_live_calibration(*, config_path: Path, facts_path: Path, maintenance_path: Path, budget_bytes: int,
+                         runs: int, output: Path, model_id: str | None = None, deployment_id: str | None = None,
+                         container_runtime: str = "nvidia", driver=None,
+                         clock: Callable[[], float] = time.monotonic,
+                         sleep: Callable[[float], None] = time.sleep) -> dict:
+    """The fresh calibration: launch the registered model, sample, stop with proof.
+
+    The launch is the official lab path (`render_container_launch` with an explicit
+    temporary budget), so a later candidate runs exactly what was measured here.
+    The rounds land under `output/raw/runN/` and are evaluated by the same
+    raw-derived §5/C02 code as preserved material — one accounting, no shortcut.
+    """
+    from ..contracts_v2 import DeploymentSpec
+    from ..runtime_profiles import LaunchRenderError, render_container_launch
+    from .live import LiveError, run_live_round
+
+    if isinstance(budget_bytes, bool) or not isinstance(budget_bytes, int) or budget_bytes <= 0:
+        raise CalibrationError("--budget-bytes must be a positive integer (the temporary calibration budget)",
+                               semantic=False)
+    if runs < 1:
+        raise CalibrationError("--runs must be a positive integer", semantic=False)
+    if not isinstance(deployment_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", deployment_id):
+        raise CalibrationError("a fresh calibration requires --deployment-id ([a-z0-9][a-z0-9-]{0,63}): "
+                               "the launch identity must be explicit", semantic=False)
+
+    facts_document = _json_file(facts_path, label="facts")
+    try:
+        device = parse_device_fact(facts_document.get("device"))
+        parse_runtime_stack(facts_document.get("runtime_stack"))
+    except ContractError as exc:
+        raise CalibrationError(f"{facts_path}: {exc}", semantic=False) from exc
+    if budget_bytes > device.mem_total_bytes:
+        raise CalibrationError("--budget-bytes exceeds the recorded MemTotal: that budget cannot be honoured",
+                               semantic=False)
+
+    from ..config import AppConfigV2, ConfigError, config_digest, load_config
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise CalibrationError(f"cannot load {config_path}: {exc}", semantic=False) from exc
+    if not isinstance(config, AppConfigV2):
+        raise CalibrationError("calibration requires a schema v2 configuration", semantic=False)
+    import model_scheduler.config as config_module
+
+    try:
+        config_sha = config_digest(config_module._yaml(Path(config_path)))
+    except (ConfigError, OSError, ValueError) as exc:
+        raise CalibrationError(f"cannot digest {config_path}: {exc}", semantic=False) from exc
+
+    # Identity first: the facts must describe this machine before any model moves.
+    from .collect import FactsReader
+
+    machine_id = hashlib.sha256(FactsReader().read_text("/etc/machine-id").strip().encode("utf-8")).hexdigest()
+    if device.machine_id_sha256 != machine_id:
+        raise CalibrationError("the facts were taken on a different machine: calibration refuses to measure here",
+                               semantic=True)
+
+    models = config.models
+    if model_id is None:
+        vision = [model for model in models.values() if "vision" in model.capabilities]
+        if len(vision) != 1:
+            raise CalibrationError("--model is required: the registration does not name exactly one vision model",
+                                   semantic=False)
+        model = vision[0]
+    else:
+        model = models.get(model_id)
+        if model is None:
+            raise CalibrationError(f"--model {model_id!r} is not registered", semantic=False)
+    if model.envelope.max_image_tokens <= 0 or model.envelope.max_image_edge_pixels <= 0:
+        raise CalibrationError(f"model {model.model_id!r} registers no image limits: its image fact cannot be proven",
+                               semantic=False)
+
+    deployment = DeploymentSpec(runtimes=tuple(config.runtimes.values()), models=tuple(models.values()))
+    try:
+        launch = render_container_launch(
+            deployment, model.model_id, deployment_id=deployment_id,
+            model_directory=config.storage.model_directory, config_sha256=config_sha, mode="lab",
+            container_runtime=container_runtime, temporary_budget_bytes=budget_bytes)
+    except LaunchRenderError as exc:
+        raise CalibrationError(f"cannot render the lab launch for {model.model_id!r}: {exc}", semantic=False) from exc
+
+    maintenance = verify_maintenance(
+        maintenance_path,
+        lock_path=Path(config.control.socket_path).parent / "scheduler.lock",
+        socket_path=Path(config.control.socket_path) if Path(config.control.socket_path).exists() else None,
+        containers=_docker_instances(config),
+        port_busy=_registered_ports_busy(config),
+    )
+
+    output.mkdir(parents=True, exist_ok=True)
+    raw_dir = output / "raw"
+    raw_dir.mkdir(exist_ok=True)
+    materials = []
+    for index in range(1, runs + 1):
+        try:
+            directory = run_live_round(launch, output=raw_dir / f"run{index}", driver=driver,
+                                       edge=model.envelope.max_image_edge_pixels, clock=clock, sleep=sleep)
+        except LiveError as exc:
+            raise CalibrationError(f"round {index}: {exc}", semantic=exc.semantic) from exc
+        materials.append(load_round_material(directory))
+
+    metrics = []
+    for material in materials:
+        round_metrics = evaluate_round(material)
+        if round_metrics["image_tokens_measured"] is not None:
+            verify_image_fact(round_metrics, envelope=model.envelope)
+        metrics.append(round_metrics)
+
+    summary = summarize_measurements(metrics, budget_bytes=budget_bytes)
+    summary["model_id"] = model.model_id
+    measurement = {
+        "schema_version": 1,
+        "tool": "model_scheduler.acceptance calibrate",
+        "config_sha256": _sha256_file(config_path),
+        "facts_sha256": _sha256_file(facts_path),
+        "maintenance_sha256": _sha256_file(maintenance_path),
+        "maintenance": maintenance,
+        "no_probe_tolerance": True,
+        "launch": {
+            "deployment_id": launch.deployment_id,
+            "model_id": launch.model_id,
+            "runtime_id": launch.runtime_id,
+            "profile_id": launch.profile_id,
+            "image_digest": launch.image_digest,
+            "mode": launch.mode,
+            "temporary_budget_bytes": budget_bytes,
+            "config_sha256": launch.config_sha256,
+            "container_name": launch.container_name,
+            "argv": list(launch.argv),
+            "labels": dict(launch.labels),
+        },
+        "rounds": metrics,
+        "summary": summary,
+    }
+    (output / "measurements.json").write_text(json.dumps(measurement, indent=2, sort_keys=True) + "\n",
+                                              encoding="utf-8")
+    return summary
+
+
 def _docker_instances(config) -> Callable[[], Sequence[str]]:
     """Live container names matching any registered model id of this deployment."""
     import subprocess

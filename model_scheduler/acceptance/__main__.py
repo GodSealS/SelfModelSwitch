@@ -71,13 +71,21 @@ def _collect(args) -> int:
 
 
 def _calibrate(args) -> int:
-    from .calibrate import CalibrationError, run_calibration
+    from .calibrate import CalibrationError, run_calibration, run_live_calibration
 
     require_fresh_output(args.output / "measurements.json")
     try:
-        summary = run_calibration(config_path=args.config, facts_path=args.facts,
-                                  maintenance_path=args.maintenance, budget_bytes=args.budget_bytes,
-                                  runs=args.runs, output=args.output, from_evidence=getattr(args, "from_evidence", None))
+        if getattr(args, "from_evidence", None) is None:
+            # The plan's canonical calibrate form: a fresh, controlled measurement.
+            summary = run_live_calibration(config_path=args.config, facts_path=args.facts,
+                                           maintenance_path=args.maintenance, budget_bytes=args.budget_bytes,
+                                           runs=args.runs, output=args.output, model_id=getattr(args, "model", None),
+                                           deployment_id=getattr(args, "deployment_id", None),
+                                           container_runtime=getattr(args, "container_runtime", "nvidia"))
+        else:
+            summary = run_calibration(config_path=args.config, facts_path=args.facts,
+                                      maintenance_path=args.maintenance, budget_bytes=args.budget_bytes,
+                                      runs=args.runs, output=args.output, from_evidence=args.from_evidence)
     except CalibrationError as exc:
         print(f"calibrate: {exc}", file=sys.stderr)
         return EXIT_FAILED if exc.semantic else EXIT_INPUT
@@ -173,6 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate_parser.add_argument("--budget-bytes", type=int, required=True)
     calibrate_parser.add_argument("--runs", type=int, default=3)
     calibrate_parser.add_argument("--output", type=Path, required=True)
+    calibrate_parser.add_argument("--model", help="fresh calibration: the registered model to launch")
+    calibrate_parser.add_argument("--deployment-id", help="fresh calibration: the launch identity ([a-z0-9][a-z0-9-]{0,63})")
+    calibrate_parser.add_argument("--container-runtime", default="nvidia",
+                                  help="fresh calibration: the Docker runtime the official image needs")
     calibrate_parser.add_argument("--from-evidence", type=Path,
                                   help="recompute from preserved raw sampling material instead of a fresh run")
 
