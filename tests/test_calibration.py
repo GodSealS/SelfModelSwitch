@@ -227,3 +227,255 @@ def test_a_command_without_an_implementation_refuses_with_exit_2(capsys) -> None
 
     assert main(["candidate"]) == EXIT_INPUT
     assert "not implemented yet" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# calibrate: the §5 accounting, C02 physical bound, maintenance and CLI
+
+
+from model_scheduler.acceptance import calibrate as cal  # noqa: E402
+
+TOTAL = 65_536_000_000
+BASELINE_AVAILABLE = 50_000_000_000
+RUN_MIN_AVAILABLE = 44_700_000_000
+BASELINE_FREE = 40_000_000_000
+RUN_MIN_FREE = 34_000_000_000
+SWAP_TOTAL = 4_000_000_000
+LAUNCH, END = 1_000.0, 1_020.0
+
+
+def _rows(*, interval: float = 0.1, gap: bool = False, shift: bool = False, swap: bool = False) -> list[tuple]:
+    rows: list[tuple] = []
+
+    def add(t: float, available: int, free: int, swap_free: int) -> None:
+        rows.append((round(t, 3), available, free, swap_free))
+
+    t = LAUNCH - cal.WINDOW_SECONDS
+    while t < LAUNCH - 1e-9:
+        add(t, BASELINE_AVAILABLE, BASELINE_FREE, SWAP_TOTAL)
+        t = round(t + interval, 3)
+    run_t = LAUNCH
+    while run_t <= END + 1e-9:
+        add(run_t, RUN_MIN_AVAILABLE, RUN_MIN_FREE, SWAP_TOTAL - 1 if swap else SWAP_TOTAL)
+        run_t = round(run_t + interval, 3)
+    post_t = round(END + interval, 3)
+    while post_t <= END + cal.WINDOW_SECONDS + 1e-9:
+        add(post_t, BASELINE_AVAILABLE - (300 * 1024**2 if shift else 0), BASELINE_FREE, SWAP_TOTAL)
+        post_t = round(post_t + interval, 3)
+    if gap:
+        # drop six consecutive 100ms rows: one >500ms sampling hole
+        rows = [row for row in rows if not (round(LAUNCH + 0.4, 3) - 1e-6 <= row[0] <= round(LAUNCH + 0.9, 3) + 1e-6)]
+    return rows
+
+
+def _csv(rows: list[tuple], *, with_free: bool = True) -> str:
+    lines = [cal.MEMINFO_HEADER if with_free else cal.PROBE_MEMINFO_HEADER]
+    for index, (t, available, free, swap_free) in enumerate(rows):
+        columns = [f"{t:.3f}", f"2026-09-18T00:00:{index:02d}Z", str(available), str(TOTAL)]
+        if with_free:
+            columns.append(str(free))
+        columns += [str(swap_free), "1000000"]
+        lines.append(",".join(columns))
+    return "\n".join(lines) + "\n"
+
+
+def _write_round(root: Path, label: str, *, rows=None, with_free: bool = True, window: bool = True,
+                 quiescent: bool = True, image_tokens: int = 1227, run_json: bool = False,
+                 stop: dict | None = None) -> Path:
+    directory = root / label
+    (directory / "sampling").mkdir(parents=True, exist_ok=True)
+    (directory / "sampling" / "meminfo.csv").write_text(_csv(rows if rows is not None else _rows(),
+                                                             with_free=with_free), encoding="utf-8")
+    document = {
+        "stop": stop if stop is not None else {"quiescent": quiescent, "exit_code": 0, "port_free": True,
+                                               "reclaimed": True, "kill_used": False},
+        "cases": {"image_max": {"image_tokens_measured": image_tokens}},
+    }
+    if window:
+        document |= {"launch_ts": LAUNCH, "end_ts": END}
+    (directory / ("run.json" if run_json else "round.json")).write_text(json.dumps(document), encoding="utf-8")
+    return directory
+
+
+def test_a_verified_round_derives_the_c02_measurement_from_raw_rows(tmp_path) -> None:
+    material = cal.load_round_material(_write_round(tmp_path, "round-1"))
+
+    metrics = cal.evaluate_round(material)
+
+    assert metrics["measurement_valid"] is True
+    assert metrics["baseline_bytes"] == BASELINE_AVAILABLE
+    assert metrics["delta_bytes"] == BASELINE_AVAILABLE - RUN_MIN_AVAILABLE
+    assert metrics["swap_used"] is False and metrics["gaps_over_500ms"] == 0
+    assert metrics["physical_upper_bound_bytes"] == TOTAL - RUN_MIN_FREE  # raw MemTotal - raw MemFree
+    assert metrics["physical_upper_bound_window"] == "run_window"
+
+    summary = cal.summarize_measurements([metrics], budget_bytes=16_000_000_000)
+    assert summary["verdict"] == "passed"
+    assert summary["measured_peak_bytes"] == BASELINE_AVAILABLE - RUN_MIN_AVAILABLE
+    assert summary["reserved_bytes"] == (summary["measured_peak_bytes"] * 115 + 99) // 100
+    assert summary["physical_resident_peak_bytes"] == TOTAL - RUN_MIN_FREE
+    assert summary["physical_bound_proven"] is True
+
+
+def test_a_sampling_gap_a_shift_and_swap_each_fail_the_round(tmp_path) -> None:
+    gap = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "gap", rows=_rows(gap=True)))))
+    shift = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "shift", rows=_rows(shift=True)))))
+    swap = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "swap", rows=_rows(swap=True)))))
+    slow = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "slow", rows=_rows(interval=0.15)))))
+
+    assert gap["gaps_over_500ms"] == 1 and gap["measurement_valid"] is False
+    assert shift["baseline_shift_bytes"] > cal.BASELINE_SHIFT_LIMIT_BYTES and shift["measurement_valid"] is False
+    assert swap["swap_used"] is True and swap["measurement_valid"] is False
+    assert slow["sampling_interval_seconds"] > cal.SAMPLING_INTERVAL_SECONDS and slow["measurement_valid"] is False
+    assert cal.summarize_measurements([gap], budget_bytes=1)["verdict"] == "blocked"
+
+
+def test_a_round_without_a_stop_or_unknown_record_is_refused(tmp_path) -> None:
+    directory = _write_round(tmp_path, "round-1")
+    document = json.loads((directory / "round.json").read_text())
+    del document["stop"]
+    (directory / "round.json").write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(cal.CalibrationError, match="stop or UNKNOWN") as refused:
+        cal.load_round_material(directory)
+    assert refused.value.semantic is True
+
+
+def test_preserved_probe_material_without_memfree_blocks_the_physical_bound(tmp_path) -> None:
+    directory = _write_round(tmp_path, "run-1", with_free=False, window=False, run_json=True)
+
+    metrics = cal.evaluate_round(cal.load_round_material(directory))
+
+    assert metrics["physical_upper_bound_bytes"] is None
+    assert "MemFree" in metrics["bound_note"]
+    assert metrics["measurement_valid"] is False and "no monotonic window" in metrics["criteria_note"]
+    summary = cal.summarize_measurements([metrics], budget_bytes=16_000_000_000)
+    assert summary["verdict"] == "blocked" and summary["physical_bound_proven"] is False
+
+
+def test_an_over_envelope_image_fact_is_refused_without_the_probe_tolerance() -> None:
+    class Envelope:
+        max_image_tokens = 1280
+
+    cal.verify_image_fact({"round": "round-1", "image_tokens_measured": 1280}, envelope=Envelope)  # exact boundary
+
+    with pytest.raises(cal.CalibrationError, match="exceed the registered envelope") as refused:
+        cal.verify_image_fact({"round": "round-1", "image_tokens_measured": 1281}, envelope=Envelope)
+    assert refused.value.semantic is True  # 1344 (the probe's 1.05) would have passed: it must not
+
+
+def test_maintenance_must_be_re_verified_live_not_only_declared(tmp_path) -> None:
+    record = tmp_path / "maintenance.json"
+    record.write_text(json.dumps({"production_admission_closed": True, "instances_stopped": True,
+                                  "checked_utc": "2026-09-18T00:00:00Z", "checked_by": "jtzn", "notes": []}),
+                      encoding="utf-8")
+    lock = tmp_path / "scheduler.lock"
+
+    report = cal.verify_maintenance(record, lock_path=lock, socket_path=None, containers=lambda: [],
+                                    port_busy=lambda: False)
+    assert report["declared_by"] == "jtzn"
+
+    with pytest.raises(cal.CalibrationError, match="still running") as busy:
+        cal.verify_maintenance(record, lock_path=lock, socket_path=None, containers=lambda: ["sms-qwen-small"],
+                               port_busy=lambda: False)
+    assert busy.value.semantic is True
+
+    with pytest.raises(cal.CalibrationError, match="port is busy"):
+        cal.verify_maintenance(record, lock_path=lock, socket_path=None, containers=lambda: [],
+                               port_busy=lambda: True)
+
+    closed = tmp_path / "not_closed.json"
+    closed.write_text(json.dumps({"production_admission_closed": False, "instances_stopped": True,
+                                  "checked_utc": "x", "checked_by": "jtzn", "notes": []}), encoding="utf-8")
+    with pytest.raises(cal.CalibrationError, match="not declared true") as refused:
+        cal.verify_maintenance(closed, lock_path=lock, socket_path=None, containers=lambda: [], port_busy=lambda: False)
+    assert refused.value.semantic is True
+
+
+def _site(tmp_path: Path, rounds: int = 3, *, vision: bool = True) -> tuple[Path, Path, Path]:
+    """A complete calibrate input set: v2 config (optionally vision), facts, maintenance."""
+    import importlib.util
+
+    import yaml
+
+    spec = importlib.util.spec_from_file_location("sms_v2_cal_fixture", Path(__file__).resolve().parent / "test_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    document = yaml.safe_load(module.V2)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    document["control"]["socket_path"] = str(run_dir / "control.sock")
+    if vision:
+        model = document["registration"]["models"][1]  # qwen-small
+        model["capabilities"] = ["vision"]
+        model["assets"].append({"role": "projector", "path": "mmproj.gguf", "sha256": "f" * 64, "size_bytes": 100})
+        model["envelope"].update({"max_image_tokens": 1280, "max_image_edge_pixels": 1024, "max_images": 1})
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    facts = _collect()
+    facts_path = tmp_path / "facts.json"
+    facts_path.write_text(json.dumps(facts.document()), encoding="utf-8")
+    maintenance = tmp_path / "maintenance.json"
+    maintenance.write_text(json.dumps({"production_admission_closed": True, "instances_stopped": True,
+                                       "checked_utc": "2026-09-18T00:00:00Z", "checked_by": "jtzn", "notes": []}),
+                           encoding="utf-8")
+    evidence = tmp_path / "evidence"
+    for index in range(1, rounds + 1):
+        _write_round(evidence, f"round-{index}")
+    return config_path, facts_path, maintenance
+
+
+def test_the_cli_recomputes_from_raw_material_and_writes_measurements(tmp_path) -> None:
+    config_path, facts_path, maintenance = _site(tmp_path)
+    evidence = tmp_path / "evidence"
+    output = tmp_path / "calibration"
+
+    from model_scheduler.acceptance.__main__ import main
+
+    result = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                   "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "3",
+                   "--output", str(output), "--from-evidence", str(evidence)])
+
+    assert result == EXIT_OK
+    measurement = json.loads((output / "measurements.json").read_text(encoding="utf-8"))
+    assert measurement["summary"]["verdict"] == "passed"
+    assert measurement["no_probe_tolerance"] is True
+    assert len(measurement["rounds"]) == 3
+    assert all(entry["physical_upper_bound_bytes"] == TOTAL - RUN_MIN_FREE for entry in measurement["rounds"])
+    assert (output / "raw" / "round-1" / "meminfo.csv").is_file()  # raw material is copied, never re-summarised
+
+
+def test_the_cli_refuses_an_evidence_count_that_disagrees_with_runs(tmp_path, capsys) -> None:
+    config_path, facts_path, maintenance = _site(tmp_path, rounds=2)
+
+    from model_scheduler.acceptance.__main__ import main
+
+    code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                 "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "3",
+                 "--output", str(tmp_path / "calibration"), "--from-evidence", str(tmp_path / "evidence")])
+
+    assert code == EXIT_INPUT
+    assert "--runs says 3" in capsys.readouterr().err
+
+
+def test_the_cli_blocks_when_the_site_is_not_really_closed(tmp_path, monkeypatch, capsys) -> None:
+    config_path, facts_path, maintenance = _site(tmp_path, rounds=1)
+
+    from model_scheduler.acceptance import calibrate as module
+
+    original = module.verify_maintenance
+    monkeypatch.setattr(module, "verify_maintenance",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            module.CalibrationError("managed instances are still running", semantic=True)))
+    try:
+        from model_scheduler.acceptance.__main__ import main
+
+        code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                     "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "1",
+                     "--output", str(tmp_path / "calibration"), "--from-evidence", str(tmp_path / "evidence")])
+    finally:
+        monkeypatch.setattr(module, "verify_maintenance", original)
+
+    assert code == EXIT_FAILED
+    assert "still running" in capsys.readouterr().err
