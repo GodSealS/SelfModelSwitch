@@ -393,3 +393,145 @@ models:
     assert "active_bonus" not in migrated["scheduler"]["heat"]
     assert migrated["models"]["embedding"]["lifecycle"]["preload"] is True
     assert "REQUIRED_REAL_UUID" in output.read_text()
+
+# ---------------------------------------------------------------------------
+# P26: the v3 production render (see plan/08-execution-plan.md)
+# ---------------------------------------------------------------------------
+
+
+import importlib.util  # noqa: E402
+from model_scheduler import deploy as deploy_module  # noqa: E402
+from model_scheduler.acceptance import EXIT_INPUT  # noqa: E402
+
+
+def _p26_helpers(name: str):
+    spec = importlib.util.spec_from_file_location(f"{name}_for_p26", Path(__file__).resolve().parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _p26_verified_site(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A production-renderable candidate (every model measured) plus verified evidence.
+
+    A production render requires *every* registration to be measured, so the
+    fixture keeps the measured vision model and drops the unmeasured one — the
+    render logic itself is per model.
+    """
+    import yaml
+
+    candidate_helpers = _p26_helpers("test_candidate")
+    site = candidate_helpers._site(tmp_path)
+    document = yaml.safe_load(site["config"].read_text(encoding="utf-8"))
+    document["registration"]["models"] = [model for model in document["registration"]["models"]
+                                          if model["model_id"] == "qwen-small"]
+    for key in ("pinned_models", "preload_models"):
+        document["scheduler"][key] = [model_id for model_id in document["scheduler"].get(key, [])
+                                      if model_id == "qwen-small"]
+    runtime = document["registration"]["runtimes"][0]
+    runtime["startup_args"] = [*runtime["startup_args"], "--parallel", "--kv-unified-per-slot",
+                               "--image-max-tokens"]
+    site["config"].write_text(yaml.safe_dump(document), encoding="utf-8")
+    policy = json.loads(site["policy"].read_text(encoding="utf-8"))
+    policy["performance"] = [entry for entry in policy["performance"] if entry["model_id"] == "qwen-small"]
+    site["policy"].write_text(json.dumps(policy), encoding="utf-8")
+    candidate_helpers._build(site)
+    candidate_path = site["output"]
+    evidence = _p26_helpers("test_verify")._build_evidence(tmp_path, candidate_path)
+    return candidate_path, evidence, tmp_path / "ssd" / "models"
+
+
+def test_a_production_render_freezes_the_verified_identity(tmp_path) -> None:
+    candidate_path, evidence, model_directory = _p26_verified_site(tmp_path)
+    output = tmp_path / "build" / "deploy"
+
+    result = deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=evidence, output=output,
+                              mode="production", model_directory=model_directory)
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert result["production"] is True and manifest["production"] is True
+    assert manifest["schema_version"] == 3 and manifest["identity_sha256"]
+    assert manifest["model_directory"] == str(model_directory)
+    assert manifest["evidence"]["run_id"] == "run-1"
+    assert not (output / "NOT-PRODUCTION").exists()
+    for model_id, entry in manifest["models"].items():
+        assert entry["container_name"] == f"sms-{manifest['deployment_id']}-{model_id}"
+        assert f"--mount=type=bind,src={model_directory}" in entry["argv"] or \
+               any(f"src={model_directory}" in token for token in entry["argv"])
+        assert entry["image_digest"].endswith("a" * 64)
+
+
+def test_a_production_render_refuses_unverified_material_and_writes_nothing(tmp_path) -> None:
+    import yaml
+
+    candidate_helpers = _p26_helpers("test_candidate")
+    site = candidate_helpers._site(tmp_path)
+    document = yaml.safe_load(site["config"].read_text(encoding="utf-8"))
+    document["registration"]["models"] = [model for model in document["registration"]["models"]
+                                          if model["model_id"] == "qwen-small"]
+    for key in ("pinned_models", "preload_models"):
+        document["scheduler"][key] = [model_id for model_id in document["scheduler"].get(key, [])
+                                      if model_id == "qwen-small"]
+    runtime = document["registration"]["runtimes"][0]
+    runtime["startup_args"] = [*runtime["startup_args"], "--parallel", "--kv-unified-per-slot",
+                               "--image-max-tokens"]
+    site["config"].write_text(yaml.safe_dump(document), encoding="utf-8")
+    policy = json.loads(site["policy"].read_text(encoding="utf-8"))
+    policy["performance"] = [entry for entry in policy["performance"] if entry["model_id"] == "qwen-small"]
+    site["policy"].write_text(json.dumps(policy), encoding="utf-8")
+    candidate_helpers._build(site)
+    candidate_path = site["output"]
+    broken = _p26_helpers("test_verify")._build_evidence(tmp_path / "broken", candidate_path, drop_final="S04")
+    output = tmp_path / "build" / "deploy"
+
+    with pytest.raises(deploy_module.DeployError, match="does not verify offline"):
+        deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=broken, output=output, mode="production",
+                         model_directory=tmp_path / "ssd" / "models")
+
+    assert not output.exists() or not any(output.iterdir())  # no launchable directory was produced
+
+    with pytest.raises(deploy_module.DeployError, match="requires --evidence"):
+        deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=None, output=output, mode="production",
+                         model_directory=tmp_path / "ssd" / "models")
+
+
+def test_a_non_empty_target_is_refused(tmp_path) -> None:
+    candidate_path, evidence, model_directory = _p26_verified_site(tmp_path)
+    output = tmp_path / "build"
+    output.mkdir()
+    (output / "keep.txt").write_text("occupant", encoding="utf-8")
+
+    with pytest.raises(deploy_module.DeployError, match="non-empty"):
+        deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=evidence, output=output, mode="production",
+                         model_directory=model_directory)
+
+
+def test_a_lab_render_is_marked_non_production(tmp_path) -> None:
+    candidate_path, _evidence, model_directory = _p26_verified_site(tmp_path)
+    output = tmp_path / "lab-deploy"
+
+    result = deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=None, output=output, mode="lab",
+                              model_directory=model_directory, temporary_budget_bytes=16_000_000_000)
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert result["production"] is False and manifest["mode"] == "lab" and manifest["evidence"] is None
+    assert (output / "NOT-PRODUCTION").is_file()
+
+    with pytest.raises(deploy_module.DeployError, match="temporary-budget-bytes"):
+        deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=None, output=tmp_path / "lab-2", mode="lab",
+                         model_directory=model_directory)
+
+
+def test_the_deploy_cli_routes_the_v3_render_and_requires_the_model_directory(tmp_path, capsys) -> None:
+    candidate_path, evidence, model_directory = _p26_verified_site(tmp_path)
+    output = tmp_path / "cli-deploy"
+
+    code = deploy_module.main(["render", "--candidate", str(candidate_path), "--evidence", str(evidence),
+                        "--mode", "production", "--output", str(output), "--model-directory", str(model_directory)])
+    assert code == 0
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["mode"] == "production"
+
+    missing = deploy_module.main(["render", "--candidate", str(candidate_path), "--evidence", str(evidence),
+                           "--mode", "production", "--output", str(tmp_path / "cli-2")])
+    assert missing == EXIT_INPUT
+    assert "model-directory" in capsys.readouterr().err

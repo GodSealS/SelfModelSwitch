@@ -13,7 +13,7 @@ import platform
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -395,6 +395,81 @@ def preflight(manifest_path: str | Path, *, storage: Any | None = None, hardware
     return {"ok": True, "deployment_id": manifest["deployment_id"], "models": sorted(config.models)}
 
 
+def render_v3(*, candidate_path: str | Path, evidence_dir: str | Path | None, output: str | Path, mode: str,
+              model_directory: str | Path, container_runtime: str = "nvidia",
+              temporary_budget_bytes: int | None = None, now: Any | None = None) -> dict[str, Any]:
+    """Render a v3 deployment from one frozen candidate (P26).
+
+    A production render first verifies the evidence offline; if it does not
+    verify, nothing is written at all (no launchable directory is produced).
+    A lab render is allowed without evidence but is marked non-production in the
+    manifest and by a `NOT-PRODUCTION` file. The model directory is an explicit
+    input: no old model-disk location is hardcoded anywhere.
+    """
+    from dataclasses import asdict
+
+    from .contracts_v2 import DeploymentSpec
+    from .evidence_contracts import candidate_digest, device_digest, parse_candidate
+    from .preflight_v3 import manifest_identity
+    from .runtime_profiles import render_container_launch
+
+    if mode not in ("production", "lab"):
+        raise DeployError("the render mode must be production or lab")
+    try:
+        candidate = parse_candidate(json.loads(Path(candidate_path).read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ContractError) as exc:
+        raise DeployError(f"cannot read the candidate: {exc}") from exc
+    target = Path(output)
+    if target.exists() and any(target.iterdir()):
+        raise DeployError("refusing to render into a non-empty directory")
+
+    evidence: dict[str, Any] | None = None
+    if mode == "production":
+        from .acceptance.verify import verify_evidence
+
+        if evidence_dir is None:
+            raise DeployError("a production render requires --evidence: an unverified candidate is never rendered")
+        code, document = verify_evidence(candidate_path=Path(candidate_path), evidence_dir=Path(evidence_dir), now=now)
+        if code != 0:
+            raise DeployError(f"the evidence does not verify offline (exit {code}): {document.get('error')}")
+        report_path = Path(evidence_dir) / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        evidence = {"run_id": report["run_id"], "started_at": report["started_at"], "ended_at": report["ended_at"],
+                    "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
+    elif isinstance(temporary_budget_bytes, bool) or not isinstance(temporary_budget_bytes, int) \
+            or temporary_budget_bytes <= 0:
+        raise DeployError("a lab render requires an explicit --temporary-budget-bytes")
+
+    registration = DeploymentSpec(runtimes=tuple(candidate.runtimes), models=tuple(candidate.models))
+    deployment_id = f"sms-{candidate.deployment_id}"
+    models: dict[str, Any] = {}
+    for model in candidate.models:
+        launch = render_container_launch(registration, model.model_id, deployment_id=candidate.deployment_id,
+                                         model_directory=str(model_directory), config_sha256=candidate.config_sha256,
+                                         mode=mode, container_runtime=container_runtime,
+                                         temporary_budget_bytes=temporary_budget_bytes)
+        models[model.model_id] = {"container_name": launch.container_name, "image_digest": launch.image_digest,
+                                  "runtime_id": launch.runtime_id, "profile_id": launch.profile_id,
+                                  "port": launch.port, "argv": list(launch.argv), "labels": dict(launch.labels),
+                                  "assets": [asdict(asset) for asset in model.assets]}
+    manifest: dict[str, Any] = {
+        "schema_version": 3, "mode": mode, "production": mode == "production", "deployment_id": candidate.deployment_id,
+        "candidate_sha256": candidate_digest(candidate), "source_archive_sha256": candidate.source_archive_sha256,
+        "config_sha256": candidate.config_sha256, "device_digest": device_digest(candidate.device),
+        "device": asdict(candidate.device), "runtime_stack": asdict(candidate.runtime_stack),
+        "model_directory": str(model_directory), "container_prefix": deployment_id,
+        "models": models, "evidence": evidence,
+    }
+    manifest["identity_sha256"] = manifest_identity(manifest)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if mode == "lab":
+        (target / "NOT-PRODUCTION").write_text("lab rendering: this directory is not a production deployment\n",
+                                               encoding="utf-8")
+    return {"ok": True, "output": str(target), "mode": mode, "candidate_sha256": manifest["candidate_sha256"],
+            "models": sorted(models), "production": manifest["production"]}
+
+
 def collect_facts(output: str | Path, *, runner: Any | None = None, device_tree_root: Path = Path("/proc/device-tree")) -> dict[str, Any]:
     """Record only read-only host facts; this command starts no models or services."""
     destination = Path(output)
@@ -463,16 +538,81 @@ def migrate(source: str | Path, output: str | Path) -> dict[str, Any]:
     return migrated
 
 
+def _is_v3_manifest(manifest_path: str | Path) -> bool:
+    try:
+        document = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(document, dict) and document.get("schema_version") == 3
+
+
+def preflight_v3_command(manifest_path: str | Path, *, candidate: str | None, evidence: str | None) -> tuple[int, dict]:
+    """Route a v3 manifest to layer 1, or to the full gate when evidence is supplied."""
+    from .preflight_v3 import PreflightError, production_gate, verify_environment
+
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return 2, {"ok": False, "error": f"cannot read the manifest: {exc}"}
+    site = live_site(model_directory=manifest.get("model_directory"))
+    try:
+        if evidence is not None:
+            if candidate is None:
+                return 2, {"ok": False, "error": "--evidence requires --candidate for the production gate"}
+            document = production_gate(manifest, candidate_path=Path(candidate), evidence_dir=Path(evidence), site=site)
+        else:
+            document = verify_environment(manifest, site=site)
+    except PreflightError as exc:
+        return exc.exit_code, {"ok": False, "layer": exc.layer, "error": str(exc)}
+    return (0 if document["ok"] else 3), document
+
+
+def live_site(*, model_directory: str | None, device_tree_root: Path = Path("/proc/device-tree"),
+              image_checker: Any | None = None, model_files: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Read the live site facts the preflight compares against (no model is loaded)."""
+    try:
+        site = dict(_read_hardware_identity(device_tree_root))
+    except DeployError as exc:
+        # the preflight still runs and reports the mismatch instead of crashing;
+        # nothing here ever loads a model.
+        site = {"device_tree_unavailable": str(exc)}
+    site["filesystem"] = "ext4"
+    site["model_files"] = dict(model_files or {})
+    site["images"] = {}
+    site["model_directory"] = model_directory
+    if image_checker is not None:
+        site["image_checker"] = image_checker
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
-    render_parser = sub.add_parser("render"); render_parser.add_argument("--input"); render_parser.add_argument("--config"); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True); render_parser.add_argument("--deployment-id", dest="deployment_id"); render_parser.add_argument("--container-runtime", default="nvidia", dest="container_runtime")
-    preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
+    render_parser = sub.add_parser("render"); render_parser.add_argument("--input"); render_parser.add_argument("--config"); render_parser.add_argument("--candidate"); render_parser.add_argument("--evidence"); render_parser.add_argument("--model-directory", dest="model_directory"); render_parser.add_argument("--temporary-budget-bytes", dest="temporary_budget_bytes", type=int, default=None); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True); render_parser.add_argument("--deployment-id", dest="deployment_id"); render_parser.add_argument("--container-runtime", default="nvidia", dest="container_runtime")
+    preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True); preflight_parser.add_argument("--candidate"); preflight_parser.add_argument("--evidence")
     collect_parser = sub.add_parser("collect"); collect_parser.add_argument("--output", required=True)
     migrate_parser = sub.add_parser("migrate"); migrate_parser.add_argument("--input", required=True); migrate_parser.add_argument("--output", required=True)
     migrate_v2_parser = sub.add_parser("migrate-v2"); migrate_v2_parser.add_argument("--input", required=True); migrate_v2_parser.add_argument("--inventory", required=True); migrate_v2_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "render" and args.config:
+        if args.command == "render" and args.candidate:
+            try:
+                if not args.model_directory:
+                    raise DeployError("--model-directory is required when rendering a v3 candidate: the site path is "
+                                      "never guessed")
+                result = render_v3(candidate_path=args.candidate, evidence_dir=args.evidence, output=args.output,
+                                   mode=args.mode, model_directory=args.model_directory,
+                                   container_runtime=args.container_runtime,
+                                   temporary_budget_bytes=args.temporary_budget_bytes)
+            except DeployError as exc:
+                # the v3 commands follow the §5 exit codes: 2 for input/material errors
+                print(f"deployment error: {exc}", file=sys.stderr)
+                return 2
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "preflight" and _is_v3_manifest(args.manifest):
+            code, document = preflight_v3_command(args.manifest, candidate=args.candidate, evidence=args.evidence)
+            print(json.dumps(document, sort_keys=True))
+            return code
+        elif args.command == "render" and args.config:
             if not args.deployment_id:
                 raise DeployError("--deployment-id is required when rendering a schema-v2 configuration")
             manifest = render_lab(args.config, args.output, deployment_id=args.deployment_id, container_runtime=args.container_runtime, mode=args.mode)

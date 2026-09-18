@@ -69,6 +69,29 @@ def _stop(name: str, deployment_id: str, model_id: str, config_sha256: str) -> i
     return subprocess.run(["docker", "stop", "--time", "30", name], timeout=45).returncode
 
 
+def _require_v3_identity(model_id: str) -> None:
+    """A v3 manifest must verify its own identity before anything is started (P26).
+
+    The identity block covers the candidate/source/config/device digests and each
+    model's pinned image digest, so a replaced image or an edited manifest is
+    refused here instead of being launched.
+    """
+    try:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError("manifest unavailable") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 3:
+        return
+    try:
+        from model_scheduler.preflight_v3 import PreflightError, require_manifest_identity
+    except ImportError as exc:  # pragma: no cover - a v3 manifest without the module cannot be trusted
+        raise RunnerError("the v3 preflight module is not installed") from exc
+    try:
+        require_manifest_identity(manifest, model_id=model_id)
+    except PreflightError as exc:
+        raise RunnerError(str(exc)) from exc
+
+
 def _require_pinned_contract() -> None:
     """A lab start refuses to run without the measured llama-swap contract (P06a)."""
     try:
@@ -167,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError("invalid manifest config digest")
             require_manifest_config_digest(manifest, config_sha256)
             return _stop(name, deployment_id, args.model_id, config_sha256)
+        _require_v3_identity(args.model_id)
         _verify_storage()
         config_digest = _config_digest()
         require_manifest_config_digest(manifest, config_digest)
