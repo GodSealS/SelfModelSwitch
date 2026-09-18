@@ -4,9 +4,11 @@ import asyncio
 
 import pytest
 
-from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult
+from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult, State
 from model_scheduler.model_registry import Book, Conflict
+from model_scheduler.request_queue import WaitKind, WaitState
 from model_scheduler.scheduler import ModelScheduler, ModelUnavailable, QueueFull
+from model_scheduler.session_manager import SessionConflict, SessionManager, SessionNotFound
 
 
 class Resources:
@@ -560,3 +562,236 @@ async def test_status_projects_model_contract_fields_and_waiting_count() -> None
     assert model["idle_seconds"] is None
     assert model["total_requests"] == 1
     await scheduler.release(lease, Outcome.SUCCESS)
+
+
+# ---------------------------------------------------------------------------
+# P09: C04 exclusive sessions on the same scheduler authority.
+# ---------------------------------------------------------------------------
+
+
+class ManualClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class SessionBackend:
+    def __init__(self) -> None:
+        self.loads: list[str] = []
+        self.stops: list[str] = []
+        self.stop_failures: set[str] = set()
+
+    async def load(self, operation, deadline):
+        self.loads.append(operation.model_id)
+        return Observation(Presence.RUNNING, f"instance-{operation.model_id}", True, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        if operation.model_id in self.stop_failures:
+            return Observation(Presence.UNKNOWN, None, False, 0, "stop_unverified")
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
+def session_policy(**overrides) -> SessionManager:
+    policy = {
+        "wait_seconds": 100.0,
+        "hard_deadline_seconds": 200.0,
+        "heartbeat_seconds": 10.0,
+        "ttl_seconds": 30.0,
+        "prepare_seconds": 100.0,
+        "drain_seconds": 30.0,
+        "retry_seconds": 30.0,
+        "cleanup_seconds": 60.0,
+        "cancel_seconds": 10.0,
+        "stop_grace_seconds": 30.0,
+        "reconcile_seconds": 5.0,
+    }
+    policy.update(overrides)
+    return SessionManager(**policy)
+
+
+class ClockedResources:
+    """The same sample shape as `Resources`, on the scheduler's injected clock."""
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+
+    async def snapshot(self):
+        return MemorySample(10_000, 9_000, self.clock())
+
+
+def session_scheduler(registry: Book, backend: SessionBackend, clock: ManualClock, sessions: SessionManager | None = None) -> ModelScheduler:
+    return ModelScheduler(
+        registry, ClockedResources(clock), backend,
+        sessions=sessions if sessions is not None else session_policy(),
+        clock=clock,
+        poll_interval_seconds=0.01,
+    )
+
+
+async def eventually(predicate, *, attempts: int = 300) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_a_session_takes_the_model_exclusively_and_stops_the_others() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = two_model_book()
+    scheduler = session_scheduler(registry, backend, clock)
+    other = await scheduler.acquire("second", "interactive-1", asyncio.get_running_loop().time() + 10)
+    await scheduler.release(other, Outcome.SUCCESS)
+
+    view = await asyncio.wait_for(scheduler.open_session("first", "client-a", "session-1", hard_deadline_seconds=200), 5)
+
+    assert view["phase"] == "active"
+    assert backend.stops == ["second"]  # every other model was stopped and confirmed
+    assert "first" in backend.loads
+    assert registry.runtime["second"].state is State.UNLOADED
+    with pytest.raises(Conflict):
+        await scheduler.acquire("first", "interactive-2", asyncio.get_running_loop().time() + 10)
+
+    closed = await asyncio.wait_for(scheduler.close_session("session-1"), 5)
+
+    assert closed["phase"] == "closed"
+    assert registry.runtime["first"].state is State.UNLOADED  # a normal end cleans up exactly the same way
+    lease = await scheduler.acquire("first", "interactive-3", asyncio.get_running_loop().time() + 10)
+    await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_a_held_lease_is_never_killed_and_the_session_yields_instead() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    sessions = session_policy(drain_seconds=30.0, retry_seconds=30.0)
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    lease = await scheduler.acquire("chat", "interactive-1", asyncio.get_running_loop().time() + 10)
+    opening = asyncio.create_task(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200))
+
+    assert await eventually(lambda: scheduler._session_freeze == "session-1")
+    assert registry.runtime["chat"].leases.get(lease.lease_id) == lease  # the lease is never revoked
+    assert sessions.get("session-1").phase == "preparing"
+
+    clock.advance(30.0)  # the drain window elapses
+    assert await eventually(lambda: scheduler._session_freeze is None)
+    yielded = sessions.get("session-1")
+    assert yielded.phase == "preparing"
+    assert yielded.retry_at == 60.0
+    waiter = scheduler._queue.get("session-1")
+    assert waiter is not None and waiter.state is WaitState.WAITING and waiter.kind is WaitKind.SESSION
+
+    await scheduler.release(lease, Outcome.SUCCESS)
+    clock.advance(30.0)  # the backoff elapses and the retained waiter is retried
+
+    view = await asyncio.wait_for(opening, 5)
+    assert view["phase"] == "active"
+    assert scheduler._queue.get("session-1") is None
+
+
+@pytest.mark.asyncio
+async def test_two_clients_racing_cannot_both_become_active() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    sessions = session_policy()
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    first = asyncio.create_task(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200))
+    second = asyncio.create_task(scheduler.open_session("chat", "client-b", "session-2", hard_deadline_seconds=200))
+
+    assert await eventually(lambda: sessions.active_id is not None)
+    active = [session_id for session_id, record in sessions.records.items() if record.phase == "active"]
+    winner = active[0]
+    loser = "session-2" if winner == "session-1" else "session-1"
+    assert len(active) == 1 and sessions.active_id == winner
+    assert sessions.records[loser].phase == "preparing"
+
+    await asyncio.wait_for(first if winner == "session-1" else second, 5)
+    await asyncio.wait_for(scheduler.close_session(winner), 5)
+    pending = second if winner == "session-1" else first
+    assert (await asyncio.wait_for(pending, 5))["phase"] == "active"
+    await asyncio.wait_for(scheduler.close_session(loser), 5)
+
+
+@pytest.mark.asyncio
+async def test_a_session_uses_the_registered_parallel_slots() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, max_concurrency=2)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    sessions = session_policy()
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    await asyncio.wait_for(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200), 5)
+
+    first = await scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 10, session_id="session-1")
+    second = await scheduler.acquire("chat", "req-2", asyncio.get_running_loop().time() + 10, session_id="session-1")
+    with pytest.raises(Conflict):
+        await scheduler.acquire("chat", "req-3", asyncio.get_running_loop().time() + 10, session_id="session-1")
+    assert sessions.in_flight["session-1"] == 2
+
+    await scheduler.release(first, Outcome.SUCCESS)
+    third = await scheduler.acquire("chat", "req-3", asyncio.get_running_loop().time() + 10, session_id="session-1")
+    await scheduler.release(second, Outcome.SUCCESS)
+    await scheduler.release(third, Outcome.SUCCESS)
+    with pytest.raises(SessionNotFound):
+        await scheduler.acquire("chat", "req-4", asyncio.get_running_loop().time() + 10, session_id="session-9")
+    await asyncio.wait_for(scheduler.close_session("session-1"), 5)
+
+
+@pytest.mark.asyncio
+async def test_pinned_or_preload_configuration_refuses_a_session() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, pinned=True, preload=True)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = session_scheduler(registry, backend, clock)
+
+    with pytest.raises(SessionConflict):
+        await scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200)
+    assert scheduler.sessions.records == {}
+
+
+@pytest.mark.asyncio
+async def test_health_information_stays_available_while_a_session_waits() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    scheduler = session_scheduler(registry, backend, clock)
+    lease = await scheduler.acquire("chat", "interactive-1", asyncio.get_running_loop().time() + 10)
+    opening = asyncio.create_task(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200))
+
+    assert await eventually(lambda: scheduler._session_freeze == "session-1")
+    status = await asyncio.wait_for(scheduler.status(), 2)
+
+    assert status["sessions"]["pending"][0]["phase"] == "preparing"
+    assert status["sessions"]["frozen"] is True
+    await scheduler.release(lease, Outcome.SUCCESS)
+    await asyncio.wait_for(opening, 5)
+    await asyncio.wait_for(scheduler.close_session("session-1"), 5)
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_cleanup_blocks_and_keeps_the_budget_until_it_reconciles() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    sessions = session_policy()
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    await asyncio.wait_for(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200), 5)
+    backend.stop_failures.add("chat")
+
+    closed = await asyncio.wait_for(scheduler.close_session("session-1"), 5)
+
+    assert closed["phase"] == "blocked"
+    assert closed["blocked_reason"] == "stop_unconfirmed"
+    assert registry.runtime["chat"].state is State.ERROR
+    assert registry.committed > 0  # the slot and the budget stay on the books
+
+    backend.stop_failures.clear()
+    clock.advance(5.0)
+    assert await eventually(lambda: sessions.get("session-1").phase == "closed")
+    assert registry.committed == 0

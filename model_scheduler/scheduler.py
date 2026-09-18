@@ -1,4 +1,12 @@
-"""Single-owner async scheduler built around the atomic :class:`Book`."""
+"""Single-owner async scheduler built around the atomic :class:`Book`.
+
+Interactive requests and C04 exclusive sessions are decided under the same
+condition; every lifecycle I/O (load, drain, stop) happens outside it, and all
+session lifecycle I/O runs in one worker so two clients can never both become
+ACTIVE. A session that cannot get the model to itself within the drain window
+yields and retries later without losing its queue position, and a session that
+holds a lease never has it killed.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,11 +14,13 @@ from collections import deque
 from dataclasses import dataclass
 import inspect
 from time import monotonic
+from typing import Awaitable, Callable
 
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
 from .eviction_policy import EvictionPolicy
 from .model_registry import Book, Conflict, StaleOperation
-from .request_queue import RequestQueue, WaitState
+from .request_queue import RequestQueue, WaitKind, WaitState
+from .session_manager import ACTIVE, BLOCKED, CLOSED, DRAINING, PREPARING, SessionConflict, SessionManager, SessionNotFound
 
 
 class QueueFull(RuntimeError):
@@ -32,7 +42,7 @@ class SwitchIntent:
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic):
         if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds, switch_window_seconds, cooldown_seconds) <= 0 or max_switches_in_window < 1:
             raise ValueError("scheduler intervals must be positive")
         self.book = book
@@ -59,19 +69,35 @@ class ModelScheduler:
         self._switch_successes: deque[float] = deque()
         self._cold_load_not_before = 0.0
         self._recovery_task: asyncio.Task[None] | None = None
+        self.sessions = sessions if sessions is not None else SessionManager()
+        self._clock = clock
+        self._session_worker: asyncio.Task[None] | None = None
+        self._session_leases: dict[str, set[str]] = {}
+        self._session_freeze: str | None = None
 
-    async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
+    async def acquire(self, model_id: str, request_id: str, deadline: float, *, session_id: str | None = None) -> Lease:
         if model_id not in self.book.specs:
             raise KeyError(model_id)
-        if deadline <= monotonic():
+        if deadline <= self._clock():
             raise TimeoutError("queue deadline elapsed")
         async with self._condition:
             if self._shutting_down:
                 raise ModelUnavailable("service_shutting_down")
             if self._storage_unavailable:
                 raise ModelUnavailable("storage_unavailable")
+            if session_id is not None:
+                record = self.sessions.get(session_id)
+                if record.phase != ACTIVE or record.model_id != model_id:
+                    raise SessionConflict("session_not_active")
+                runtime = self.book.runtime[model_id]
+                if runtime.state.value == "ready" and len(runtime.leases) >= self.book.ledger[model_id].max_concurrency:
+                    raise Conflict("session_slots_exhausted")
+            elif self._session_freeze is not None:
+                # A session is being granted or holds the model exclusively.
+                raise Conflict("session_exclusive")
             try:
-                self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, monotonic())
+                kind = WaitKind.SESSION if session_id is not None else WaitKind.INTERACTIVE
+                self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, self._clock(), kind=kind)
             except ValueError as exc:
                 raise Conflict("duplicate waiter") from exc
             except OverflowError as exc:
@@ -83,7 +109,7 @@ class ModelScheduler:
                 admitted = await self._admission_allowed()
                 needs_sample = False
                 async with self._condition:
-                    now = monotonic()
+                    now = self._clock()
                     self._expire_switch_intent(now)
                     if self._shutting_down:
                         raise ModelUnavailable("service_shutting_down")
@@ -107,6 +133,8 @@ class ModelScheduler:
                                             and now >= self._next_switch_attempt.get(model_id, 0))
                         else:
                             self._queue.remove(request_id, WaitState.CLAIMED)
+                            if session_id is not None:
+                                self._note_session_lease(session_id, lease)
                             return lease
                 if needs_sample:
                     # Sampling is external I/O; take it outside the condition and
@@ -115,7 +143,7 @@ class ModelScheduler:
                     async with self._condition:
                         runtime = self.book.runtime[model_id]
                         if admitted and runtime.state.value == "unloaded" and model_id not in self._loads:
-                            now = monotonic()
+                            now = self._clock()
                             if self.book.can_load(model_id, sample, now):
                                 operation = self.book.begin_load(model_id, sample, now)
                                 self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
@@ -126,13 +154,13 @@ class ModelScheduler:
                     if started_operation:
                         continue
                 async with self._condition:
-                    remaining = deadline - monotonic()
+                    remaining = deadline - self._clock()
                     if remaining <= 0:
                         raise TimeoutError("queue deadline elapsed")
                     try:
                         await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
                     except asyncio.TimeoutError as exc:
-                        if monotonic() >= deadline:
+                        if self._clock() >= deadline:
                             raise TimeoutError("queue deadline elapsed") from exc
         finally:
             async with self._condition:
@@ -141,11 +169,13 @@ class ModelScheduler:
                 self._condition.notify_all()
 
     def _cold_request_eligible(self, item) -> bool:
+        if item.kind is WaitKind.INTERACTIVE and self._session_freeze is not None:
+            return False  # an exclusive grant in progress holds the model
         runtime = self.book.runtime[item.model_id]
         if runtime.state.value == "loading" or runtime.state.value == "evicting":
             return False
         if runtime.state.value == "unloaded":
-            now = monotonic()
+            now = self._clock()
             return now >= self._cold_load_not_before and now >= self._next_switch_attempt.get(item.model_id, 0)
         return True
 
@@ -200,7 +230,7 @@ class ModelScheduler:
             observation: Observation = await self.backend.load(operation, deadline)
             async with self._condition:
                 if observation.presence is Presence.RUNNING and observation.healthy:
-                    now = monotonic()
+                    now = self._clock()
                     self.book.loaded(operation, now)
                     self._record_cold_load(now)
                 else:
@@ -244,11 +274,11 @@ class ModelScheduler:
         try:
             async with self._condition:
                 while any(runtime.leases for runtime in self.book.runtime.values()):
-                    remaining = deadline - monotonic()
+                    remaining = deadline - self._clock()
                     if remaining <= 0:
                         for runtime in self.book.runtime.values():
                             for lease in tuple(runtime.leases.values()):
-                                self.book.release(lease, Outcome.ABORTED, monotonic())
+                                self.book.release(lease, Outcome.ABORTED, self._clock())
                         break
                     try:
                         await asyncio.wait_for(self._condition.wait(), remaining)
@@ -321,7 +351,8 @@ class ModelScheduler:
 
     async def release(self, lease: Lease, outcome: Outcome, tokens: int | None = None) -> None:
         async with self._condition:
-            self.book.release(lease, outcome, monotonic(), tokens)
+            self.book.release(lease, outcome, self._clock(), tokens)
+            self._forget_session_lease(lease.lease_id)
             self._condition.notify_all()
 
     async def preload(self, deadline: float) -> tuple[str, ...]:
@@ -352,7 +383,7 @@ class ModelScheduler:
                 started_operation = False
                 async with self._condition:
                     runtime = self.book.runtime[model_id]
-                    now = monotonic()
+                    now = self._clock()
                     if admitted and runtime.state.value == "unloaded" and not self._loads and self._eviction is None:
                         if self.book.can_load(model_id, sample, now):
                             operation = self.book.begin_load(model_id, sample, now)
@@ -368,13 +399,13 @@ class ModelScheduler:
                 if started_operation:
                     continue
             async with self._condition:
-                remaining = deadline - monotonic()
+                remaining = deadline - self._clock()
                 if remaining <= 0:
                     raise TimeoutError("preload deadline elapsed")
                 try:
                     await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
                 except asyncio.TimeoutError as exc:
-                    if monotonic() >= deadline:
+                    if self._clock() >= deadline:
                         raise TimeoutError("preload deadline elapsed") from exc
 
     async def recover(self, deadline: float) -> None:
@@ -405,15 +436,19 @@ class ModelScheduler:
         async with self._condition:
             self._shutting_down = True
             self._queue.clear()
+            for session_id, record in self.sessions.records.items():
+                if record.phase != CLOSED:
+                    self.sessions.begin_drain(session_id, self._clock(), "service_shutdown")
+                    self._release_session_freeze(session_id)
             self._condition.notify_all()
-            while any(runtime.leases for runtime in self.book.runtime.values()) and monotonic() < deadline:
+            while any(runtime.leases for runtime in self.book.runtime.values()) and self._clock() < deadline:
                 try:
-                    await asyncio.wait_for(self._condition.wait(), deadline - monotonic())
+                    await asyncio.wait_for(self._condition.wait(), deadline - self._clock())
                 except asyncio.TimeoutError:
                     break
             for runtime in self.book.runtime.values():
                 for lease in tuple(runtime.leases.values()):
-                    self.book.release(lease, Outcome.ABORTED, monotonic())
+                    self.book.release(lease, Outcome.ABORTED, self._clock())
             if self._eviction is not None:
                 task = self._eviction
             else:
@@ -440,7 +475,7 @@ class ModelScheduler:
             self._queue.clear()
             for runtime in self.book.runtime.values():
                 for lease in tuple(runtime.leases.values()):
-                    self.book.release(lease, Outcome.ABORTED, monotonic())
+                    self.book.release(lease, Outcome.ABORTED, self._clock())
             if self._eviction is not None:
                 task = self._eviction
             else:
@@ -488,7 +523,7 @@ class ModelScheduler:
 
     async def sweep_ttl(self, deadline: float) -> tuple[str, ...]:
         """Stop due idle models, without allowing TTL to outrun queued demand."""
-        now = monotonic()
+        now = self._clock()
         async with self._condition:
             if self._eviction is not None:
                 return ()
@@ -505,6 +540,269 @@ class ModelScheduler:
             self._condition.notify_all()
         return await task
 
+    # -- C04 exclusive sessions ---------------------------------------------
+
+    def _note_session_lease(self, session_id: str, lease: Lease) -> None:
+        leases = self._session_leases.setdefault(session_id, set())
+        leases.add(lease.lease_id)
+        self.sessions.in_flight[session_id] = len(leases)
+
+    def _forget_session_lease(self, lease_id: str) -> None:
+        for session_id, leases in self._session_leases.items():
+            if lease_id in leases:
+                leases.discard(lease_id)
+                self.sessions.in_flight[session_id] = len(leases)
+                return
+
+    def _release_session_freeze(self, session_id: str) -> None:
+        if self._session_freeze == session_id:
+            self._session_freeze = None
+
+    def _exclusive_conflict(self, model_id: str) -> str | None:
+        """pinned/preload registrations conflict with exclusive residency (C04)."""
+        if any(entry.pinned or entry.preload for entry in self.book.ledger.values()):
+            return "pinned_or_preload_conflict"
+        return None
+
+    def _ensure_session_worker(self) -> None:
+        if self._session_worker is None or self._session_worker.done():
+            self._session_worker = asyncio.create_task(self._run_session_lifecycle())
+
+    async def open_session(self, model_id: str, client_id: str, session_id: str, *, priority: int = 0, hard_deadline_seconds: float | None = None, deadline: float | None = None) -> dict[str, object]:
+        """Register a session and wait for it to become ACTIVE (or fail closed)."""
+        async with self._condition:
+            if model_id not in self.book.specs:
+                raise KeyError(model_id)
+            if self._shutting_down:
+                raise ModelUnavailable("service_shutting_down")
+            if self._storage_unavailable:
+                raise ModelUnavailable("storage_unavailable")
+            conflict = self._exclusive_conflict(model_id)
+            if conflict is not None:
+                raise SessionConflict(conflict)
+            record = self.sessions.create(
+                session_id, model_id, client_id,
+                now=self._clock(), queue=self._queue, priority=priority,
+                hard_deadline_seconds=hard_deadline_seconds,
+            )
+            self._ensure_session_worker()
+            self._condition.notify_all()
+        wait_until = record.wait_deadline if deadline is None else min(record.wait_deadline, deadline)
+        while True:
+            async with self._condition:
+                current = self.sessions.get(session_id)
+                if current.phase == ACTIVE:
+                    return self.sessions.view(session_id, now=self._clock())
+                if current.phase == CLOSED:
+                    raise SessionConflict("session_closed")
+                if current.phase == BLOCKED:
+                    raise ModelUnavailable("session_blocked")
+                remaining = min(wait_until, current.preparation_expired_at) - self._clock()
+                if remaining <= 0:
+                    raise TimeoutError("session_wait_deadline")
+                try:
+                    await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
+                except asyncio.TimeoutError:
+                    continue
+
+    async def heartbeat_session(self, session_id: str) -> dict[str, object]:
+        async with self._condition:
+            self.sessions.heartbeat(session_id, self._clock())
+            self._condition.notify_all()
+            return self.sessions.view(session_id, now=self._clock())
+
+    async def close_session(self, session_id: str, *, reason: str = "client_close", deadline: float | None = None) -> dict[str, object]:
+        """Drain, stop and close; idempotent, and BLOCKED keeps the slot and budget."""
+        async with self._condition:
+            record = self.sessions.get(session_id)
+            if record.phase == CLOSED:
+                return self.sessions.view(session_id, now=self._clock())
+            self.sessions.begin_drain(session_id, self._clock(), reason)
+            self._queue.remove(session_id, WaitState.CANCELLED)
+            self._ensure_session_worker()
+            self._condition.notify_all()
+        while True:
+            async with self._condition:
+                current = self.sessions.get(session_id)
+                if current.phase in {CLOSED, BLOCKED}:
+                    return self.sessions.view(session_id, now=self._clock())
+                if deadline is not None and self._clock() >= deadline:
+                    return self.sessions.view(session_id, now=self._clock())
+                try:
+                    await asyncio.wait_for(self._condition.wait(), self.poll_interval_seconds)
+                except asyncio.TimeoutError:
+                    continue
+
+    async def session_view(self, session_id: str) -> dict[str, object]:
+        async with self._condition:
+            return self.sessions.view(session_id, now=self._clock())
+
+    async def _run_session_lifecycle(self) -> None:
+        """The single session worker: every lifecycle step runs here, never under the lock."""
+        try:
+            while True:
+                plan = await self._next_session_plan()
+                if plan is None:
+                    async with self._condition:
+                        if not self.sessions.pending():
+                            return
+                        try:
+                            await asyncio.wait_for(self._condition.wait(), self.poll_interval_seconds)
+                        except asyncio.TimeoutError:
+                            pass
+                    continue
+                action, session_id = plan
+                if action == "expire":
+                    await self._expire_session(session_id)
+                elif action == "prepare":
+                    await self._prepare_session(session_id)
+                else:  # close and reconcile share the same cleanup path
+                    await self._drain_session(session_id)
+        finally:
+            async with self._condition:
+                self._session_worker = None
+                self._condition.notify_all()
+
+    async def _next_session_plan(self) -> tuple[str, str] | None:
+        async with self._condition:
+            now = self._clock()
+            for record in self.sessions.expired(now):
+                if record.phase == PREPARING:
+                    self._queue.remove(record.session_id, WaitState.EXPIRED)
+                return ("expire", record.session_id)
+            for record in self.sessions.blocked_due(now):
+                return ("reconcile", record.session_id)
+            head = self._queue.head(
+                now,
+                kind=WaitKind.SESSION,
+                eligible=lambda item: self.sessions.candidate(item.request_id, now) is not None,
+            )
+            if head is not None:
+                return ("prepare", head.request_id)
+            for record in self.sessions.records.values():
+                if record.phase == DRAINING:
+                    return ("close", record.session_id)
+            return None
+
+    async def _expire_session(self, session_id: str) -> None:
+        async with self._condition:
+            record = self.sessions.get(session_id)
+            if record.phase == PREPARING:
+                self._queue.remove(session_id, WaitState.EXPIRED)
+                self.sessions.mark_closed(session_id, self._clock())
+                self._release_session_freeze(session_id)
+                self._condition.notify_all()
+                return
+            self.sessions.begin_drain(session_id, self._clock(), "expired")
+            self._condition.notify_all()
+
+    async def _prepare_session(self, session_id: str) -> None:
+        async with self._condition:
+            record = self.sessions.get(session_id)
+            if record.phase != PREPARING:
+                return
+            model_id = record.model_id
+            prepare_deadline = record.preparation_expired_at
+            self._session_freeze = session_id
+            drain_deadline = self._clock() + self.sessions.drain_seconds
+            self._condition.notify_all()
+        if not await self._wait_for_leases_to_drain(drain_deadline):
+            # Undo the freeze, keep the waiter, retry after the backoff (C04).
+            async with self._condition:
+                self.sessions.yield_prepare(session_id, self._clock())
+                self._release_session_freeze(session_id)
+                self._condition.notify_all()
+            return
+        try:
+            await self._stop_other_models(model_id, min(prepare_deadline, self._clock() + self.sessions.cleanup_seconds))
+            await self._preload_one(model_id, min(prepare_deadline, self._clock() + self.sessions.prepare_seconds))
+        except (Conflict, ModelUnavailable, TimeoutError):
+            async with self._condition:
+                self.sessions.mark_blocked(session_id, self._clock(), "prepare_unconfirmed")
+                self._condition.notify_all()
+            return
+        async with self._condition:
+            if self.sessions.get(session_id).phase == PREPARING:
+                self.sessions.mark_active(session_id, self._clock())
+                self._queue.remove(session_id, WaitState.GRANTED)
+            self._condition.notify_all()
+
+    async def _drain_session(self, session_id: str) -> None:
+        async with self._condition:
+            record = self.sessions.get(session_id)
+            model_id = record.model_id
+            cancel_deadline = self._clock() + self.sessions.cancel_seconds
+            cleanup_deadline = self._clock() + self.sessions.stop_grace_seconds
+        await self._wait_for_session_leases(session_id, cancel_deadline)
+        confirmed = await self._stop_models([model_id], cleanup_deadline)
+        async with self._condition:
+            if confirmed:
+                self.sessions.mark_closed(session_id, self._clock())
+                self._release_session_freeze(session_id)
+            else:
+                self.sessions.mark_blocked(session_id, self._clock(), "stop_unconfirmed")
+            self._condition.notify_all()
+
+    async def _wait_for_leases_to_drain(self, deadline: float) -> bool:
+        while True:
+            async with self._condition:
+                if not any(runtime.leases for runtime in self.book.runtime.values()):
+                    return True
+                if self._clock() >= deadline:
+                    return False
+                try:
+                    await asyncio.wait_for(self._condition.wait(), self.poll_interval_seconds)
+                except asyncio.TimeoutError:
+                    continue
+
+    async def _wait_for_session_leases(self, session_id: str, deadline: float) -> bool:
+        while True:
+            async with self._condition:
+                record = self.sessions.get(session_id)
+                if not self._session_leases.get(session_id) and not self.book.runtime[record.model_id].leases:
+                    return True
+                if self._clock() >= deadline:
+                    return False
+                try:
+                    await asyncio.wait_for(self._condition.wait(), self.poll_interval_seconds)
+                except asyncio.TimeoutError:
+                    continue
+
+    async def _stop_other_models(self, keep_model_id: str, deadline: float) -> None:
+        async with self._condition:
+            targets = [
+                model_id for model_id, runtime in self.book.runtime.items()
+                if model_id != keep_model_id and runtime.state.value in {"ready", "error"} and not runtime.leases
+            ]
+        if not targets:
+            return
+        if not await self._stop_models(targets, deadline):
+            raise ModelUnavailable("stop_unconfirmed")
+
+    async def _stop_models(self, model_ids: list[str], deadline: float) -> bool:
+        """One serialized stop batch; True only when every model is proven stopped."""
+        async with self._condition:
+            if self._eviction is not None:
+                task = self._eviction
+                borrowed = True
+            else:
+                targets = [
+                    model_id for model_id in model_ids
+                    if self.book.runtime[model_id].state.value in {"ready", "error"} and not self.book.runtime[model_id].leases
+                ]
+                if not targets:
+                    return True
+                operations = self.book.begin_cleanup(targets)
+                task = asyncio.create_task(self._run_eviction(operations, deadline))
+                self._eviction = task
+                borrowed = False
+                self._condition.notify_all()
+        await task
+        if borrowed:
+            return True  # the in-flight batch owns the stop; the next attempt re-checks
+        async with self._condition:
+            return all(self.book.runtime[model_id].state.value == "unloaded" for model_id in model_ids)
+
     def _rollback_pending(self, operations) -> None:
         for operation in operations:
             try:
@@ -515,7 +813,7 @@ class ModelScheduler:
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()
         async with self._condition:
-            now = monotonic()
+            now = self._clock()
             total, available = snapshot.total_bytes, snapshot.available_bytes
             sampled_at = snapshot.sampled_at
             sample_age = snapshot.age_at(now) if callable(getattr(snapshot, "age_at", None)) else max(0.0, now - sampled_at)
@@ -541,6 +839,14 @@ class ModelScheduler:
                     },
                 },
                 "queue_size": self._queue.size,
+                "sessions": {
+                    "active_id": self.sessions.active_id,
+                    "frozen": self._session_freeze is not None,
+                    "pending": [
+                        self.sessions.view(session_id, now=now)
+                        for session_id, record in self.sessions.records.items() if record.phase != CLOSED
+                    ],
+                },
                 "models": {
                     model_id: {
                         "state": "active" if runtime.state.value == "ready" and runtime.leases else runtime.state.value,

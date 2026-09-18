@@ -14,6 +14,13 @@ class WaitState(str, Enum):
     EXPIRED = "expired"
 
 
+class WaitKind(str, Enum):
+    """Both kinds share one C04 ordering; only the grant decision differs."""
+
+    INTERACTIVE = "interactive"
+    SESSION = "session"
+
+
 @dataclass
 class QueuedRequest:
     request_id: str
@@ -23,6 +30,7 @@ class QueuedRequest:
     deadline: float
     sequence: int
     state: WaitState = WaitState.WAITING
+    kind: WaitKind = WaitKind.INTERACTIVE
 
 
 class RequestQueue:
@@ -36,16 +44,34 @@ class RequestQueue:
         self._items: dict[str, QueuedRequest] = {}
         self._sequence = 0
 
-    def enqueue(self, request_id: str, model_id: str, priority: int, deadline: float, now: float) -> QueuedRequest:
+    def enqueue(self, request_id: str, model_id: str, priority: int, deadline: float, now: float, *, kind: WaitKind = WaitKind.INTERACTIVE) -> QueuedRequest:
         self.expire(now)
         if request_id in self._items:
             raise ValueError("duplicate waiter")
         if len(self._items) >= self.capacity:
             raise OverflowError("queue full")
         self._sequence += 1
-        item = QueuedRequest(request_id, model_id, priority, now, deadline, self._sequence)
+        item = QueuedRequest(request_id, model_id, priority, now, deadline, self._sequence, kind=kind)
         self._items[request_id] = item
         return item
+
+    def requeue(self, item: QueuedRequest) -> QueuedRequest:
+        """Return a retained waiter to the queue without refreshing its identity.
+
+        A session that yields after the drain window keeps its original sequence,
+        `enqueued_at` and deadline, so a retry neither jumps the line nor extends
+        the wait budget (C04).
+        """
+        if item.request_id in self._items:
+            raise ValueError("duplicate waiter")
+        if len(self._items) >= self.capacity:
+            raise OverflowError("queue full")
+        item.state = WaitState.WAITING
+        self._items[item.request_id] = item
+        return item
+
+    def get(self, request_id: str) -> QueuedRequest | None:
+        return self._items.get(request_id)
 
     def expire(self, now: float) -> tuple[QueuedRequest, ...]:
         expired = tuple(item for item in self._items.values() if now >= item.deadline)
@@ -60,15 +86,18 @@ class RequestQueue:
             item.state = state
         return item
 
-    def head(self, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None) -> QueuedRequest | None:
+    def head(self, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None, kind: WaitKind | None = None) -> QueuedRequest | None:
         self.expire(now)
-        items = tuple(self._items.values()) if eligible is None else tuple(item for item in self._items.values() if eligible(item))
+        candidates = self._items.values()
+        if kind is not None:
+            candidates = (item for item in candidates if item.kind is kind)
+        items = tuple(candidates) if eligible is None else tuple(item for item in candidates if eligible(item))
         if not items:
             return None
         return min(items, key=lambda item: (-self._priority(item, now), item.sequence))
 
-    def is_head(self, request_id: str, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None) -> bool:
-        item = self.head(now, eligible=eligible)
+    def is_head(self, request_id: str, now: float, *, eligible: Callable[[QueuedRequest], bool] | None = None, kind: WaitKind | None = None) -> bool:
+        item = self.head(now, eligible=eligible, kind=kind)
         return item is not None and item.request_id == request_id
 
     def contains(self, request_id: str) -> bool:
