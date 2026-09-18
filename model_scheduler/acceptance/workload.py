@@ -22,7 +22,10 @@ from ..evidence_contracts import (MAX_ARRIVAL_GAP_SECONDS, MAX_ERROR_RATE, MAX_Q
 from .collector import FileCollector
 
 OUTCOMES = ("ok", "queue_full", "timeout", "server_error", "oom", "error")
-ZERO_TOLERANCE_STATE = ("oom", "unexpected_500", "unsafe_evictions", "residual", "queue_depth", "leases", "sessions")
+# §3 O01: the run ends with an empty queue/lease/session set and every instance STOPPED;
+# OOM, unexpected 500s, unsafe evictions and residual instances must all be zero.
+ZERO_TOLERANCE_STATE = ("oom", "unexpected_500", "unsafe_evictions", "residual", "queue_depth", "leases",
+                        "sessions", "instances_running")
 
 
 class WorkloadError(RuntimeError):

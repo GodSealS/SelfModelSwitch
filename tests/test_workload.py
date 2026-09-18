@@ -18,7 +18,7 @@ POLICY = {"duration_seconds": 1800, "arrival_requests": 120, "arrival_gap_second
           "timeout_rate_max": 0.1}
 
 CLEAN_STATE = {"oom": 0, "unexpected_500": 0, "unsafe_evictions": 0, "residual": 0, "queue_depth": 0,
-               "leases": 0, "sessions": 0}
+               "leases": 0, "sessions": 0, "instances_running": 0}
 
 
 class FakeClock:
@@ -161,6 +161,10 @@ def test_the_end_state_must_report_every_zero_tolerance_counter() -> None:
 
     missing = wl.evaluate_workload(sent, final_state={"oom": 0}, policy=POLICY)
     assert any("does not report 'leases'" in problem for problem in missing["problems"])
+    assert any("does not report 'instances_running'" in problem for problem in missing["problems"])
+
+    running = wl.evaluate_workload(sent, final_state={**CLEAN_STATE, "instances_running": 1}, policy=POLICY)
+    assert any("instances_running=1" in problem for problem in running["problems"])
 
     dirty = wl.evaluate_workload(sent, final_state={**CLEAN_STATE, "residual": 1, "oom": 2}, policy=POLICY)
     assert any("must be 0 at the end of the run" in problem for problem in dirty["problems"])

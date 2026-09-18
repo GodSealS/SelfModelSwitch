@@ -1267,12 +1267,20 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 形成真实混合负载、受限故障与恢复/回滚场景，故障隔离到本deployment。
 **Files likely touched:** `model_scheduler/acceptance/operational_cases.py`、`model_scheduler/acceptance/workload.py`、`tests/test_operational_cases.py`、`tests/test_workload.py`（均新增）。
 **Acceptance criteria:**
-- [ ] O01实际请求>=1800s、arrival>=100、每模型>=3、间隙<=15s、发送偏差<=1000ms；结尾队列/lease/session空、实例STOPPED。
-- [ ] O02模型盘故障用本deployment私有mount namespace隔离，不卸载整机共享盘；暂存满用专用小配额文件系统，不填满根盘。
-- [ ] O03—O06覆盖Docker通道不可达/陌生端口/stop超时/重启旧token/preflight核验原语篡改/优雅停机及恢复；不破坏其他容器。
+- [x] O01实际请求>=1800s、arrival>=100、每模型>=3、间隙<=15s、发送偏差<=1000ms；结尾队列/lease/session空、实例STOPPED。
+- [x] O02模型盘故障用本deployment私有mount namespace隔离，不卸载整机共享盘；暂存满用专用小配额文件系统，不填满根盘。
+- [x] O03—O06覆盖Docker通道不可达/陌生端口/stop超时/重启旧token/preflight核验原语篡改/优雅停机及恢复；不破坏其他容器。
   O05不调用依赖最终O05报告的完整production gate，O06隔离lab演练及无已验收旧版拒绝分支按第3节执行。
-- [ ] p95/p99 nearest-rank，成功请求含排队+加载+执行；429/504各比例分母是全部发送请求，上限均<=0.1；OOM/非预期500/不安全淘汰/残留为0。
+- [x] p95/p99 nearest-rank，成功请求含排队+加载+执行；429/504各比例分母是全部发送请求，上限均<=0.1；OOM/非预期500/不安全淘汰/残留为0。
 **Verification:** `python -m pytest tests/test_operational_cases.py tests/test_workload.py -q`；此处注入preflight/rollback端口验证编排；P30真实执行，缺条件标not_run。
+
+**本轮执行记录（2026-09-18）:** status=complete（编排逻辑 + 注入端口测试 + 目标核验；真实 O01—O06 执行属 P30）；起点 commit `3552fd4`（P23 记录提交）；实现提交 `46c1436`（首版）、记录轮另含"结尾实例 STOPPED"零容忍项补入；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/acceptance/workload.py`：`build_arrival_plan`（轮转分布、每模型计数、计划间隙）在构造期即拒绝"请求数过少/间隙>15s/时长不足"的输入；`validate_arrival_plan` 逐条对照 §4 下限（1800s、100 请求、每模型≥3、间隙≤15s）；`run_workload` 按计划时点发送并逐条记录**发送偏差**（对计划，不四舍五入），429/504/500/异常各自归类；`nearest_rank` 按 §4 定义（1-based ceil）；`evaluate_workload` 输出成功请求的 queue+load+execute 总时延 p95/p99（含每模型）、429/504/错误率（**分母为全部发送请求**）、发送偏差最大值，并校验 policy **只可更严**；结尾状态必须逐项报告且为零：OOM、非预期 500、不安全淘汰、残留实例、队列深度、lease、session、实例仍在运行（missing 即"无法证明为零"，不假定 0）。
+新增 `model_scheduler/acceptance/operational_cases.py`：O01（真实到达计划 + 指标判定，缺 policy → **not_run** 而非占位通过）、O02（私有 mount namespace、**拒绝整机共享盘卸载**、专用小配额文件系统、root 盘零写入、恢复后重 hash）、O03（Docker 不可达/陌生实例/stop 超时：health 503 + 保留预算 + 不波及其他容器）、O04（重启清理残留、旧 token 拒绝且带原因、清理后可准入、不得重放推理）、O05（正确候选接受、**每个篡改场景都必须被拒且拒绝发生在 load 之前**、只用 P26 原语并拒绝 production gate、无场景即失败）、O06（优雅停机、日志容量/脱敏、备份→恢复摘要一致、回滚；**无已验收证据的旧版回滚必须被拒并给出原因**）；任一步骤崩溃 → failed 且保留 failure 记录；`CaseResult` 自检禁止"passed 带问题"。
+测试：`tests/test_workload.py` 9 项 + `tests/test_operational_cases.py` 10 项（计划下限/间隙/最少到达、发送偏差 1.2s 触发失败、nearest-rank 定义、成功时延=排队+加载+执行、比率分母=全部发送、policy 只可更严、零容忍项缺报/非零、collector 逐条落盘；O01 干净 1800s 通过/缺 policy not_run/429 超限失败、O02—O06 各自的**规则破坏变体**必须失败、不可用即 not_run、步骤崩溃留 failure）。
+开发机：P24 Verification = 19 passed；全量 `pytest tests -m 'not thor' -q` = 717 passed, 1 skipped, 1 deselected（P23 基线 698）；`ruff check .` exit 0。
+目标机（Linux aarch64，`46c1436`）：`pytest tests/test_workload.py tests/test_operational_cases.py -q` = 19 passed；真实模型集（embedding、qwen-small）1800s/120 请求计划 `validate_arrival_plan == []`、每模型 60 次、最大间隙 15.0s（恰在闸门）；用真实 policy 对 120 条干跑记录评估 → `verdict=passed`、`queue_full_rate=0.0083`、`p95=0.6s`；目标树为空。
+未解决：①真实故障注入（docker 通道/挂载命名空间/配额文件系统/重启与回滚演练）与 O01 的 1800s 真实混合负载属 P30；本任务按计划注入端口验证编排，缺条件一律 `not_run`；②O02 的 mount namespace 与配额文件系统实现需宿主特权，端口契约已固定但真实实现待 P30/P27；③O05 仅调用 P26 的 preflight 原语（不依赖 O05 自身报告），完整 production gate 由 P31 执行。
 
 ### P25 — 独立evaluator与离线verify（M06）
 

@@ -1043,3 +1043,50 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - **真实 `CaseDriver`**（控制 API 客户端的 load/start/execute/cancel/stop）与 `run --layers B` 编排未实现；`run` 目前校验层集合后显式 exit 3 且不写任何部分输出——属 P24（运维执行器）与 P29（真实运行）。
 - capability 输出契约只覆盖协议/shape/有限值/范围；本计划不声称转写/人脸/声纹/视频质量达标。
 - embeddings/rerank 的 batch/document 上限沿用 P20 的接口层保守默认 256；实测上限绑定候选待 P29。
+
+## P24 记录（2026-09-18）
+
+范围：O01—O06 运维执行器——交付 `acceptance/workload.py`（到达计划、真实发送与 §4 指标）与 `acceptance/operational_cases.py`（注入故障/lab 端口的编排），硬规则逐条显式校验。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P24 |
+| status | complete（编排逻辑 + 注入端口测试 + 目标核验；真实 O01—O06 属 P30） |
+| source_commit | `3552fd4`（P23 记录提交，起点） |
+| implementation_commits | `46c1436`（首版）+ 本轮"结尾实例 STOPPED"零容忍项 |
+| target_commit | `46c14363aa333497f71d9e16a3989a0aa8e2ca95`（核验时；最终记录提交随后同步） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 开发机 pytest 报告 + 目标机同测试输出（无设备侧材料，真实执行属 P30） |
+
+判定 `complete`：四条 AC 均有单测覆盖并逐一在规则破坏变体上验证"会失败"，目标机复核测试与计划闸门；真实故障注入与 1800s 混合负载按计划留待 P30，缺条件一律 `not_run`。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_operational_cases.py tests/test_workload.py -q`（Verification，开发机） | 0 | `19 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `717 passed, 1 skipped, 1 deselected`（P23 基线 698） |
+| `ruff check .` | 0 | 通过 |
+| 目标机同 Verification | 0 | `19 passed` |
+| 目标机真实模型集计划（1800s/120 请求） | 0 | `validate_arrival_plan == []`、每模型 60、最大间隙 15.0s（恰在闸门） |
+| 目标机真实 policy 干跑评估（120 条） | 0 | `verdict=passed`、`queue_full_rate=0.0083`、`p95=0.6s` |
+
+### 3. 关键事实
+
+- **指标定义不模糊**：p95/p99 用 §4 的 nearest-rank（1-based ceil，测试用 1..100 验证等于 95/99）；成功请求时延 = queue+load+execute（429/504 无总时延）；429/504/错误率**分母是全部发送请求**（测试用 10/100 与 12/100 验证 0.10 通过、0.12 失败）。
+- **policy 只可更严**：`evaluate_workload` 检查 `*_rate_max` 是否被放宽超过 06-acceptance 上限，放宽即问题（不是静默采用）。
+- **结尾状态必须逐项报告**：OOM、非预期 500、不安全淘汰、残留实例、队列深度、lease、session、仍在运行的实例——缺报即"无法证明为零"，非零即失败（不假定 0）。
+- **O02 隔离硬规则**：私有 mount namespace 必须为真、**禁止卸载整机共享盘**、暂存必须用专用小配额文件系统、root 盘写入必须为 0、恢复必须重 hash；任一违反即失败（测试逐条破坏验证）。
+- **O03/O04 语义**：故障期间 health 必须 503 且预算保留（UNKNOWN/BLOCKED 不释放）、不得波及其他容器；重启必须清残留、旧 token 必须拒绝且给出原因、清理后可再准入、不得重放推理。
+- **O05 只用原语**：正确候选接受、每个篡改场景**必须在 load 之前被拒**且带原因、禁止调用 production gate（该 gate 依赖 O05 自身报告）、无场景即失败。
+- **O06 回滚分支**：备份须给出 64-hex 摘要与文件数、恢复摘要必须一致、回滚对**无已验收证据的旧版必须被拒并说明原因**。
+- 崩溃语义：任一步骤异常 → `failed` 且 failure 入材料；`CaseResult` 自检禁止 passed 携带问题；缺条件（端口报 `available=False`）→ `not_run`，不写占位通过。
+
+### 4. 未执行 / 未解决
+
+- **真实执行属 P30**：O01 的 1800s 真实混合负载、O02 的挂载命名空间/配额文件系统、O03 的真实 Docker 故障、O04 的真实重启/残留、O06 的隔离 lab release 演练均需目标设备与宿主特权；本任务按计划只交付编排与端口契约。
+- O05 仅调用 P26 的 preflight 原语；完整 production gate 在 P31 执行。
+- `workload.py` 的发送使用注入的 clock/wait，真实运行需真实时钟（P30 接线）。

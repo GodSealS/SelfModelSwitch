@@ -17,7 +17,7 @@ POLICY = {"duration_seconds": 1800, "arrival_requests": 120, "arrival_gap_second
           "send_deviation_milliseconds_max": 1000.0, "error_rate_max": 0.1, "queue_full_rate_max": 0.1,
           "timeout_rate_max": 0.1}
 CLEAN_STATE = {"oom": 0, "unexpected_500": 0, "unsafe_evictions": 0, "residual": 0, "queue_depth": 0,
-               "leases": 0, "sessions": 0}
+               "leases": 0, "sessions": 0, "instances_running": 0}
 
 
 class FakeClock:
