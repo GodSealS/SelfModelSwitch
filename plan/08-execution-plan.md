@@ -1106,11 +1106,11 @@ mid-stream 失败与预派发拒绝在 P17/P16 后续不区分 → 走 awaiting-
 - [x] 两listener共享同一boot/Book，lifespan启动和清理各一次；TCP/internal/*返回404。
 - [x] run.py明确v1/v2分支：解析→唯一锁→创建一次运行上下文→旧实例reconcile→Blob恢复→开放入口；
   仅依赖llama-swap的profile导入CONTROL_CONTRACT，v2不走旧四模型专用build_backend分支。
-- [ ] Linux两UID真实连接：允许UID可访问、非允许UID拒绝；伪X-UID无效；socket0660/目录权限符合部署配置。
+- [x] Linux两UID真实连接：允许UID可访问、非允许UID拒绝；伪X-UID无效；socket0660/目录权限符合部署配置。
 - [x] 单worker/instance_lock；第二进程明确拒绝；半包、超大头、body timeout、断线不泄漏task/FD。
-**Verification:** `python -m pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`；Linux真实UID测试属S门禁，Mac skip不能计该项通过。
+**Verification:** `python -m pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`；Linux 真实 UID 门禁需 root 执行（已在目标机完成，见下），Mac skip 不能计该项通过。
 
-**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `2e27543`（P16 目标复验记录提交）；实现提交 `efb19f5`、`c1ba156`、`f096213`；
+**本轮执行记录（2026-09-18）:** status=complete（AC3 两真实 UID 门禁于当日补验，见下）；起点 commit `2e27543`（P16 目标复验记录提交）；实现提交 `efb19f5`、`c1ba156`、`f096213`；
 python=3.13.5（开发机）。`pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q` = 14 passed, 1 skipped（实现前 control_server 不存在，收集 ImportError，即 RED）；
 全量 `pytest tests -m 'not thor' -q` = 585 passed, 1 skipped, 1 deselected（P16 基线 571）；`ruff check .` exit 0；`run.py --check-config` 仍 v1 四 ID。
 新增 `model_scheduler/control_server.py`：`peer_uid_of`（Linux `SO_PEERCRED` / macOS `LOCAL_PEERCRED`，socketpair 自证真实内核凭据）；
@@ -1129,9 +1129,12 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 `pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q` = 15 passed, 1 skipped ——**Linux `SO_PEERCRED` 真路径全执行**（允许 uid 访问、名单外 uid 拒绝、伪头无效、0660、帧层滥用不泄漏）；skip 仅两真实 UID 门禁项（需 root/第二 uid 的 S 流程）。
 复验曾抓到两处真实平台差异并修复（`fix: ...raced reset...` 等两提交）：Linux 对"读毕即关"回 RST 而非 FIN，拒绝类断言现同时接受 EOF/ECONNRESET——属测试面修正，服务端行为未改。
 全量 `pytest tests -m 'not thor' -q` = 582 passed, 1 skipped + 3 项既有 `test_release` 环境失败（P10/P13/P14/P16 同款，P28 范围），无回归。
-未解决：①**两个真实 UID 的 Linux 门禁测试未执行**（需 root 或预配置第二 uid 的专用 S 流程；目标机普通用户仅能证明"名单外 uid 拒绝"这一半，故 AC3 保持未勾）；
-②TCP 侧旧 API（/v1/*、SSE、/api/*）的 v2 完整回归属 P19；③`/internal/*` 正式路由与错误映射属 P18；④unit 的客户端组/UID 由部署输入渲染属 P27；
-⑤控制口 body 流式（1 GiB 上传）在 P18 扩 ControlServer 时处理，当前 buffered ≤4 MiB（inline 帽）。
+**AC3 补验（2026-09-18，目标机 root 两真实 UID）:** 起点 `f89b0f8`；测试面修复提交 `e65908b`（让门禁真的执行）与 `a2789d3`（让名单外 UID 真实到达 socket 并被 allow-list 拒绝）。
+目标机（Linux aarch64，python 3.12.14）`pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`：root = `16 passed`（门禁项计入、无 skip），jtzn = `15 passed, 1 skipped`；目标树前后为空。
+门禁细节：socket 0660 且组属 `nogroup`、目录 0750 组可穿越（保持非 world-accessible，`ControlServer` 拒绝 0o007 父目录）——allowed 客户端（uid 0）经真实 socket 得到 `200`/`owner=uid:0`；nobody（65534）在**真实 connect 成功**后只写出自身的 `connected` 标记、零 HTTP 应答，证明身份取自在 accepted socket 上读到的内核 `SO_PEERCRED`，allow-list 是唯一拒绝来源。
+修复前该门禁为假通过（`drive()` 是 async 却从未被 await，`RuntimeWarning: coroutine was never awaited`）；真实执行后又暴露服务端事件循环内同步 `subprocess.run` 的自饥饿（allowed 客户端 10s 超时）；两处均为测试面修正，服务端行为未改。
+未解决：①真实部署的客户端组/UID 由部署输入渲染、两 UID 的 create→execute→cancel/close 黑盒闭环属 P18/P27（CP2），本任务只证明身份传递本身；
+②TCP 侧旧 API（/v1/*、SSE、/api/*）的 v2 完整回归属 P19；③`/internal/*` 正式路由与错误映射属 P18；④控制口 body 流式（1 GiB 上传）在 P18 扩 ControlServer 时处理，当前 buffered ≤4 MiB（inline 帽）。
 
 ### P18 — 控制HTTP路由闭环（M04）
 

@@ -732,15 +732,15 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | 项 | 值 |
 |---|---|
 | task_id | P17 |
-| status | software_only |
+| status | complete（AC3 两真实 UID 门禁当日补验） |
 | source_commit | `2e27543`（P16 目标复验记录提交，起点） |
-| implementation_commits | `efb19f5`（控制监听器）、`c1ba156`（run.py 分支 + 双 listener）、`f096213`（部署目录/文档） |
-| target_commit | `1f5936a4cc59a52d4b110b9b2014488aa1493277`（显式从 GitHub fast-forward，目标树为空） |
+| implementation_commits | `efb19f5`（控制监听器）、`c1ba156`（run.py 分支 + 双 listener）、`f096213`（部署目录/文档）、`e65908b`（门禁测试真执行）、`a2789d3`（名单外 UID 真实到达 socket 并被拒） |
+| target_commit | 门禁补验时 `a2789d3e915745f93287c9a1e86ab18150dc9111`（显式从 GitHub fast-forward，目标树为空；先前复验为 `1f5936a4cc59a52d4b110b9b2014488aa1493277`） |
 | candidate_sha256 | null（本任务不产出候选） |
 | python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
 | evidence_directory | 无新目录；目标机只跑既有测试套件 |
 
-判定 `software_only`：AC1/AC2/AC4 由真实 AF_UNIX socket 测试与 run 分支测试支撑；AC3 的"两个真实 UID"半项属 S 门禁（需 root/预配置 uid），本轮如实不勾选、skip 不计通过。
+判定 `complete`：AC1/AC2/AC4 由真实 AF_UNIX socket 测试与 run 分支测试支撑；AC3 的"两个真实 UID"于当日以目标机 root 补验（见 §4 首条），普通用户下该门禁如实 skip、skip 不计通过。
 
 ### 2. 本轮命令与结果
 
@@ -752,6 +752,8 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | `ruff check .` / `run.py --check-config` | 0 | 通过 / 仍 v1 四 ID |
 | 目标机（Linux，`1f5936a`，python 3.12.14）计划验证命令 | 0 | `15 passed, 1 skipped`（真 `SO_PEERCRED` 路径全执行；skip=两真实 UID 门禁项） |
 | 目标机全量 | 1 | `582 passed, 1 skipped` + 3 项既有 `test_release` 环境失败（无回归） |
+| 目标机（`a2789d3`，root）门禁项 `test_two_real_uids_on_linux_one_allowed_one_not` | 0 | `1 passed`（真两 UID：uid 0 得 `200`/`owner=uid:0`；nobody 连接后被 allow-list 静默拒绝） |
+| 目标机（`a2789d3`）control_socket + instance_lock 全量：root / jtzn | 0 / 0 | `16 passed` / `15 passed, 1 skipped`（树前后为空） |
 
 ### 3. 关键事实
 
@@ -763,6 +765,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 ### 4. 未执行 / 未解决
 
-- **两个真实 UID 的 Linux 门禁测试**：需要 root 或预配置的第二 uid（S 流程执行）；本轮开发/目标均为普通用户 → 该子项未验证，AC3 未勾选（目标机已验证同一 allow-list 代码路径的单侧拒绝）。
+- AC3 门禁补验细节（root，目标机）：门禁测试把 socket 置 0660/组 `nogroup`、父目录 0750 组可穿越（保持非 world-accessible，`ControlServer` 拒绝 0o007），让 nobody **真实 connect**——allowed（uid 0）得 `200` 与 `owner=uid:0`；nobody 只写出自身 `connected` 标记、零 HTTP 应答。断言 `denied.stdout == b"connected\n"` 同时排除"被文件权限挡住"（stdout 会为空）与"错误放行"（stdout 会含 HTTP），因此身份确实取自在 accepted socket 上读到的内核 `SO_PEERCRED`、allow-list 是唯一拒绝来源。修复前该门禁为假通过（async `drive()` 从未被 await，`RuntimeWarning: coroutine was never awaited`）；真实执行后又暴露事件循环内同步 `subprocess.run` 的自饥饿（allowed 客户端 10s 超时）；两处均为测试面修正，服务端行为未改。
+- 真实部署的客户端组/UID 由部署输入渲染（P27）、两 UID 的 create→execute→cancel/close 黑盒闭环属 P18（CP2）；本任务只证明身份传递本身。
 - `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18)；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
 - 目标机复验曾暴露 Linux RST vs macOS FIN 的断言差异（`52b739c`、`1f5936a` 两修复后全绿）：记录为测试面修正，非服务端行为变更。
