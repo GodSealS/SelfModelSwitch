@@ -622,7 +622,7 @@ def test_the_service_units_render_every_site_value_from_the_inputs(tmp_path) -> 
     assert "media-jtzn-sandisk\\x2dext4.mount" in scheduler
     assert "User=model-scheduler" in scheduler and "Group=model-scheduler" in scheduler
     assert "ReadOnlyPaths=/media/jtzn/sandisk-ext4/models" in scheduler
-    assert "RequiresMountsFor=/media/jtzn/sandisk-ext4/models" in scheduler
+    assert "RequiresMountsFor=/media/jtzn/sandisk-ext4" in scheduler  # the mount, from [Unit]
     assert "SMS_CONTROL_SOCKET_MODE=0660" in scheduler and "SMS_CLIENT_UID=1003" in scheduler
     assert "SMS_CLIENT_GROUP=sms-client" in scheduler and "SMS_BLOB_QUOTA_BYTES=17179869184" in scheduler
     assert "SMS_BLOB_DISK_UUID=25e77400-6e42-470b-bf06-1a5e6dd2b548" in scheduler
