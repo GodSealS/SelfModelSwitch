@@ -52,6 +52,19 @@ async def _request(uds_path: str, *, method="GET", path="/internal/peer", header
         return await client.request(method, path, headers=headers or {})
 
 
+async def _closed_without_answer(reader: asyncio.StreamReader) -> None:
+    """The kernel refused this peer: EOF (macOS FIN) or ECONNRESET (Linux RST), never an answer."""
+    try:
+        answer = await asyncio.wait_for(reader.read(4096), 5)
+    except ConnectionResetError:
+        return
+    assert answer == b""
+
+
+def _close_quietly(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+
+
 def _stat_mode(path) -> int:
     return os.stat(path).st_mode & 0o777
 
@@ -93,9 +106,8 @@ async def test_a_uid_outside_the_allow_list_is_closed_before_any_response(sdir) 
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writer.write(b"GET /internal/peer HTTP/1.1\r\nHost: control\r\n\r\n")
         await writer.drain()
-        answer = await asyncio.wait_for(reader.read(4096), 5)
-        assert answer == b""  # refused without parsing, without an HTTP answer, without body leakage
-        writer.close()
+        await _closed_without_answer(reader)  # refused before parsing, without an HTTP answer or body leakage
+        _close_quietly(writer)
         await writer.wait_closed()
     finally:
         await server.stop()
@@ -129,16 +141,16 @@ async def test_oversized_headers_and_half_packets_close_without_leaking_tasks_or
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writer.write(b"GET /internal/peer HTTP/1.1\r\nHost: c\r\n" + b"X-Junk: " + b"a" * 4096 + b"\r\n\r\n")
         await writer.drain()
-        assert (await asyncio.wait_for(reader.read(4096), 5)) == b""
-        writer.close()
+        await _closed_without_answer(reader)
+        _close_quietly(writer)
         await writer.wait_closed()
 
         # half packet: bytes begin, a request never completes, the timeout reaps the connection
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writer.write(b"GET /internal/peer HTTP/1.1\r\nHost: c\r\n")
         await writer.drain()
-        assert (await asyncio.wait_for(reader.read(4096), 5)) == b""
-        writer.close()
+        await _closed_without_answer(reader)
+        _close_quietly(writer)
         await writer.wait_closed()
     finally:
         await server.stop()
@@ -156,8 +168,8 @@ async def test_only_http_11_get_and_post_and_no_upgrade_or_proxy_methods(sdir) -
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         writer.write(payload)
         await writer.drain()
-        assert (await asyncio.wait_for(reader.read(4096), 5)) == b""
-        writer.close()
+        await _closed_without_answer(reader)
+        _close_quietly(writer)
         await writer.wait_closed()
 
     try:
