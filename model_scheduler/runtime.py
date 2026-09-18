@@ -1,19 +1,21 @@
 """Explicit runtime composition for the single scheduler process."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
-import re
 from pathlib import Path
-from typing import Any, Mapping
+import re
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from .backend_control import LlamaSwapBackend, ManagedModel
 from .deploy import DeployError
 from .config import AppConfig, model_specs
-from .control_recovery import ControlRecoveryClient
+from .control_recovery import ControlRecoveryClient, DeploymentRecovery, ReconcileOutcome
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
 from .model_registry import Book
+from .ports_v3 import ObservationTarget, STOPPED
 from .process_observer import ProcessObserver
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
@@ -73,8 +75,65 @@ def build_backend(config: AppConfig, manifest: Any, config_sha256: str, contract
     return LlamaSwapBackend(control, ProcessObserver(deployment_id, image, config_sha256), managed)
 
 
-def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = None, storage_guard: Any | None = None, recovery: Any | None = None) -> ModelScheduler:
-    """Build the one authoritative book from strict config and injected ports."""
+@dataclass(frozen=True)
+class StartupReconciliation:
+    """What the C03 startup sequence proved for this deployment (P07)."""
+
+    ok: bool
+    error_code: str | None
+    confirmed_stopped: frozenset[str]
+    unproven: frozenset[str]
+    remaining_container_ids: tuple[str, ...]
+
+
+async def reconcile_startup(
+    book: Book,
+    recovery: DeploymentRecovery,
+    observers: Mapping[str, Any],
+    *,
+    deadline: float,
+) -> StartupReconciliation:
+    """Close admission, clean this deployment's leftovers, then clear the book.
+
+    Admission closes before any docker I/O. Only a model whose instance is
+    independently observed STOPPED may be reconciled; any unproven or unremoved
+    instance keeps `Book.recovering` set, so no load is admitted and no
+    reservation is released (plan/08-execution-plan.md C03).
+    """
+    epoch = book.begin_recovery()
+    outcome: ReconcileOutcome = recovery.reconcile(close_admission=lambda: book.begin_recovery(), deadline=deadline)
+    confirmed: set[str] = set()
+    unproven: set[str] = set(book.specs) - set(observers)
+    for model_id, observer in observers.items():
+        if model_id not in book.specs:
+            unproven.add(model_id)
+            continue
+        observation = await observer.observe(ObservationTarget(deployment_id=recovery.deployment_id), deadline)
+        (confirmed if observation.state == STOPPED else unproven).add(model_id)
+    if not outcome.ok:
+        return StartupReconciliation(False, outcome.error_code, frozenset(confirmed), frozenset(unproven), outcome.remaining_container_ids)
+    if unproven:
+        return StartupReconciliation(False, "unproven_stop", frozenset(confirmed), frozenset(unproven), ())
+    book.finish_recovery(epoch, frozenset(confirmed))
+    return StartupReconciliation(True, None, frozenset(confirmed), frozenset(), ())
+
+
+def build_scheduler(
+    config: AppConfig,
+    backend: Any,
+    *,
+    resources: Any | None = None,
+    storage_guard: Any | None = None,
+    recovery: Any | None = None,
+    confirmed_stopped: Iterable[str] | None = None,
+) -> ModelScheduler:
+    """Build the one authoritative book from strict config and injected ports.
+
+    `confirmed_stopped=None` keeps the legacy v1 bootstrap (every model starts
+    UNLOADED). The v3 entry passes the observed set: only those models are
+    bootstrapped, and every model without independent stop evidence stays
+    UNKNOWN, which no load can ever admit.
+    """
     resource_port = resources or ResourceMonitor()
     snapshot = resource_port.snapshot_now()
     budget = snapshot.total_bytes - config.resources.system_reserve_bytes - config.scheduler.min_free_memory_bytes
@@ -90,8 +149,16 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         request_weight=config.scheduler.heat.request_weight,
         token_weight=config.scheduler.heat.token_weight,
     )
-    for model_id in book.specs:
-        book.bootstrap_stopped(model_id)
+    if confirmed_stopped is None:
+        for model_id in book.specs:
+            book.bootstrap_stopped(model_id)
+    else:
+        observed = frozenset(confirmed_stopped)
+        unknown_ids = observed - set(book.specs)
+        if unknown_ids:
+            raise ValueError(f"stop evidence names unknown models: {sorted(unknown_ids)}")
+        for model_id in observed:
+            book.bootstrap_stopped(model_id)
     guard = storage_guard if storage_guard is not None else StorageAdmissionGuard(
         StorageMonitor(
             config.storage.mount_path,
