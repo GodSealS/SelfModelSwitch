@@ -1398,6 +1398,15 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **本任务实际交付**：`docs/operations.md` 新增**证据索引**（目标机各证据目录、内容、离线复核命令；不含任何设备凭据）与本节记录；P29 的三条 AC 全部保持未勾。
 **恢复路径（依赖顺序）**：①按 §6 构建并固定 ARM64 runtime 镜像（P06a 已有 fixture/CONTROL_CONTRACT，需镜像 digest 入库）→ ②用 P21 的 `MemorySampler` 做一次 **fresh** 3 轮校准（产出含 MemFree 与单调窗口的原始材料，`physical_resident_peak_bytes` 由 null 升级为实测值）→ ③接线真实 `CaseDriver` 与 `run --layers` 编排 → ④重跑 P22 candidate 与 P23 `run --layers B`（新建候选、完整 S/B/O，绝不拼接历史通过）→ ⑤P29 三条 AC 方可勾选。到 M07 的 P30/P31 同样依赖该链。
 
+**进展（2026-09-19）**：①已完成（镜像按 digest 写入登记：`sms-llama-cpp@sha256:8e572bb9…`，容器内 llama-server `4bc272f`）；②已完成（fresh 校准 passed，`physical_resident_peak_bytes=29,675,012,096 B`）；③④未做。
+
+**③ 接线设计（2026-09-19 侦察结论，供下一次实施；本轮不写半成品代码）**
+- **协议面已定位**：`model_scheduler/control_api.py` 暴露 `POST/GET /internal/sessions/{id}`（create/read）、`/heartbeat`、`/close`；`POST/GET /internal/executions/{id}`、`/cancel`；`POST/GET/DELETE /internal/blobs/{id}`。传输是 **Unix socket 上的 HTTP**（由 `control_server.build_control_app(boot_id, api)` 组装；peer 身份取自 socket，不信任 header）。
+- **`CaseDriver` 映射**（协议定义在 `acceptance/backend_cases.py`，`CaseExecutor` 逻辑已完整）：`load(cold=True)`→session create（冷启动语义必须在会话创建时体现，不能用"先 stop 再 start"替代）；`execute`→execution create（请求内联或 blob 引用）；`cancel`→execution cancel；`stop`→session close + 实例停止证明；`cleanup`→blob delete。归属事实（provider、设备活动、实际输出）取执行响应与 P17/P18 既有字段；executor crash 也须留下 attempt 与清理记录。
+- **层定义**（06-acceptance 第 3 节）：S 层 = `S01`—`S06` 软件验证（动态模型/runtime/多资产、严格 schema、旧配置迁移、无业务耦合）；B 层 case id = `B:<model_id>:<load|infer|envelope|cancel|stop|reload>`；O 层 = `O01`—`O06`（`operational_cases.py` 的 DiskFault/Fault/Recovery/Preflight/LabRelease 端口 + `workload.ArrivalPlan`）。材料由 `FileCollector` 落盘、`acceptance/evaluator.py` 复算；`merge`/`verify` 已强制"同候选、同设备、原始材料可复算"。
+- **运行前置（关键）**：B/O 层必须打到**运行中的 deployment**（活控制 socket）。P27 只渲染了 systemd 单元、正式安装属 P31，因此 `run` 必须：①没有活控制 socket 时**拒绝执行**（不假装、不写部分 run）；②**绝不自行启动生产实例**——lab 场景由操作者按 `docs/operations.md` 启动；③报告与 run 内材料绑定 `candidate_sha256`。
+- **实施顺序**：①~~先落 `acceptance/driver.py`~~ **已完成（2026-09-19）**：`ControlApiCaseDriver` + `UnixControlTransport`（Unix socket 上的 HTTP/1.1，带协议版本头；driver 只调 API，绝不自行启停 deployment）+ 7 项单测（请求序列与幂等键、终态轮询与超时拒绝、未 load 即 execute 拒绝、API 4xx 原样上报、二次 load 拒绝与 stop/cleanup、cancel 路径、真实 transport 的 HTTP 收发）；②再接 `__main__._run` 的层编排（S/B/O 各自的前置与拒绝路径）；③最后在目标 lab 启动 deployment 跑真实 B 层并回填 P29 AC2。
+
 ### P30 — 真实混合负载、故障恢复及离线复核（M07）
 
 **Primary owner:** backend；**Dependencies:** P29；**Estimated scope:** S。
