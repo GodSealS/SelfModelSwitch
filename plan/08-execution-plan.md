@@ -1308,12 +1308,21 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 旧deploy入口新增v3模式，只使用同candidate已验证材料，旧报告不能冒充新证据。
 **Files likely touched:** `model_scheduler/deploy.py`、`model_scheduler/preflight_v3.py`（新增）、`tests/test_deploy_render.py`、`tests/test_preflight_v3.py`（新增）、`deploy/model-runner.py`。
 **Acceptance criteria:**
-- [ ] production render先离线verify；缺材料不输出可启动目录，目标非空拒绝；lab输出明显标记不可生产。
-- [ ] preflight分两层：无load的verify_environment核对现场身份；production_gate再校验最终S/B/O全集。
+- [x] production render先离线verify；缺材料不输出可启动目录，目标非空拒绝；lab输出明显标记不可生产。
+- [x] preflight分两层：无load的verify_environment核对现场身份；production_gate再校验最终S/B/O全集。
   O05只调用前者及完整gate的缺材料/篡改拒绝路径；完整gate的正向验收在P31，避免证据自引用。
   preflight重核源码/配置/模型逐文件/镜像/实际设备/栈/模式/证据及期限；错配在模型启动前阻断，无force。
-- [ ] runtime runner每次load验证本次manifest身份；禁止替换已验收镜像/tag；生成路径不硬编码旧模型盘位置。
+- [x] runtime runner每次load验证本次manifest身份；禁止替换已验收镜像/tag；生成路径不硬编码旧模型盘位置。
 **Verification:** `python -m pytest tests/test_deploy_render.py tests/test_preflight_v3.py -q`；目标核验原语及篡改副本验证，确认无模型启动；生产完整通过在P31。到K7。
+
+**本轮执行记录（2026-09-18/19）:** status=complete（v3 render + 两层 preflight + runner 身份校验；生产完整通过在 P31）；起点 commit `d22a23b`（P25 记录提交）；实现提交 `d7ff362`；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/preflight_v3.py`：`manifest_identity`/`require_manifest_identity` 给出**防篡改身份块**（覆盖 schema/mode/deployment/candidate/source/config/device 与每个模型的 image digest+container name；自身摘要不在被覆盖字段内，无 hash 环）；`verify_environment`（层 1）**不加载任何模型**（返回 `loaded_models=0`）并逐项比对现场：设备身份 7 项、config/source 摘要、文件系统、每个模型镜像在本机是否存在、每个资产在本地的 size+sha256、模式（lab 不得当作生产）、证据有效期（未来 ≤5min、自 start 7 天过期），并拒绝任何 `force`；`production_gate`（层 2）先跑层 1 再调用 P25 离线 verify 复算全集证据（缺材料/篡改 → 拒绝）。
+`deploy.py` 新增 `render_v3`：production 模式**先离线 verify**，不通过就**不写任何可启动目录**（输出目录保持空/不存在）；目标非空拒绝；lab 模式需显式 `--temporary-budget-bytes`，manifest 标 `mode=lab/production=false` 并写 `NOT-PRODUCTION` 标记文件；模型目录是**显式输入**（`--model-directory`，缺失即拒绝，绝不硬编码旧模型盘）；逐模型用 P06 的 `render_container_launch` 渲染 argv/labels/name，manifest 内嵌 `identity_sha256`。CLI：`render --candidate/--evidence/--model-directory`、`preflight --manifest [--candidate --evidence]` 路由到 v3 两层（v3 命令错误统一 2、语义 3；legacy 路径不变）。`deploy/model-runner.py` 新增 `_require_v3_identity`：schema v3 的 manifest 在**每次 start 前**重算身份块，镜像被替换或字段被编辑即拒绝（legacy manifest 不受影响）。
+测试：`tests/test_deploy_render.py` **追加** 5 项（生产渲染冻结身份、未验证材料拒渲染且不写目录、非空目标拒绝、lab 标记不可生产、CLI 路由并要求 model-directory）＋新增 `tests/test_preflight_v3.py` 7 项（层 1 匹配通过且 0 加载、9 类现场错配逐项阻断+镜像缺失+资产 hash 篡改+证据过期、lab manifest 不得当生产、身份块防篡改（改镜像 → exit 3 / 删 identity / 未知模型）、层 2 复算全集与缺材料拒绝、runner 每次 load 校验身份、CLI 层 1 与 gate）。
+**事故与纠正（如实记录）**：本轮以 `write_to_file` 覆盖了**已存在**的 `tests/test_deploy_render.py`（P06b/P17 遗留 18 项测试），导致全量测试数一度从 736 掉到 731。已用 `git checkout HEAD --` 恢复原文件并把 P26 的测试**追加**进去（帮助函数改名 `_p26_*` 避免冲突）；最终 `git diff --numstat` 为 `142 0`（纯增补、零删除），全量回到 747 passed。教训：本任务清单里 `tests/test_deploy_render.py` 并非新增文件，凡"Files likely touched"未标（新增）的测试文件必须先读后改。
+开发机：P26 Verification = 30 passed；全量 `pytest tests -m 'not thor' -q` = 747 passed, 1 skipped, 1 deselected（P25 基线 735）；`ruff check .` exit 0。
+目标机（Linux aarch64，`d7ff362`）：Verification = 30 passed；真实文件系统上 production 渲染成功（`production=True`、模型 qwen-small）；`live_site()` 读真实 `/proc/device-tree` 后跑层 1 → `ok=False`、`loaded_models=0`、12 条现场错配（设备身份 7 项 + 摘要 + 镜像等），**未启动任何模型**；把 manifest 的 image digest 替换为另一摘要 → `require_manifest_identity` 以 exit 3 拒绝（"the manifest identity digest does not match its content"）；目标树为空。
+未解决：①`live_site` 目前返回 v1 形状的硬件身份（`_read_hardware_identity`）并留空 `images`，与 v3 站点字段的适配（`machine_id_sha256`/`device_tree_sha256`/`arch`/`mem_total`/盘 UUID、`docker image inspect` 存在性、模型文件逐文件 hash）待 P27/P29 完成——层 1 的比较逻辑与拒绝语义已就绪；②生产完整通过（真实 S/B/O 全集）在 P31；③O05 调用层 1 与 gate 的拒绝路径，正向 gate 不依赖 O05 自身报告。
 
 ### P27 — 服务部署、优雅停机与回滚（M06）
 

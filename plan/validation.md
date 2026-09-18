@@ -1136,3 +1136,45 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 真实 S/B/O 材料在 P29/P30 产生；本任务的证据为合成材料（结构与判据真实，不含设备证据）。
 - 候选的 `evaluator_sha256` 目前由 fixtures 声明的 evaluator 材料提供（P22 设计）；P29 重做 source/candidate 时应改为绑定本任务交付的 `acceptance/evaluator.py` 源码 hash。
 - `merge` 的 run 拆分策略（S+B / O 分批）随 P30 的真实执行落地。
+
+## P26 记录（2026-09-18/19）
+
+范围：production render 与现场 preflight——交付 `preflight_v3.py`（两层预检 + 防篡改 manifest 身份）、`deploy.render_v3` 与 CLI 路由、`deploy/model-runner.py` 的每次 load 身份校验。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P26 |
+| status | complete（渲染与两层预检 + 目标核验；生产完整通过在 P31） |
+| source_commit | `d22a23b`（P25 记录提交，起点） |
+| implementation_commits | `d7ff362` |
+| target_commit | `d7ff3622958f5c4eeca575af6f74fe1596dcd9ef`（经裸仓 origin fast-forward，目标树空） |
+| candidate_sha256 | P29 生成真实候选；本任务用夹具候选（单已测模型） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 开发机 pytest 报告 + 目标机 `/home/jtzn/self-model-switch-evidence/p26/`（渲染目录与层 1 结果） |
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_deploy_render.py tests/test_preflight_v3.py -q`（Verification，开发机） | 0 | `30 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `747 passed, 1 skipped, 1 deselected`（P25 基线 735） |
+| `ruff check .` | 0 | 通过 |
+| 目标机同 Verification | 0 | `30 passed` |
+| 目标机 production 渲染（真实文件系统） | 0 | `production=True`、模型 qwen-small、`identity_sha256` 已写入 |
+| 目标机层 1（真实 `/proc/device-tree`） | — | `ok=False`、`loaded_models=0`、12 条现场错配，**未启动模型** |
+| 目标机身份篡改（替换 image digest） | **3** | `require_manifest_identity` 拒绝："identity digest does not match its content" |
+
+### 3. 关键事实
+
+- **不加载即可阻断**：层 1 只读现场事实（设备身份、摘要、文件系统、镜像存在性、资产逐文件 hash、证据期限），任何错配都在模型启动前返回，且报告 `loaded_models=0`；没有 force 开关。
+- **未验证不渲染**：production 渲染先跑 P25 离线 verify，失败时**不写任何文件**（测试断言输出目录不存在或为空）；非空目标拒绝；lab 渲染需显式临时预算并被 `mode=lab` + `NOT-PRODUCTION` 双重标记。
+- **身份防篡改**：`identity_sha256` 覆盖 schema/mode/deployment/candidate/source/config/device 与每模型 image digest+容器名，但**不覆盖自身**（无 hash 环）；runner 在每次 start 前重算，替换镜像/编辑字段即拒绝。
+- **站点路径显式**：`--model-directory` 缺失即拒绝，渲染出的 argv 用该路径做只读 bind mount，代码中不存在旧模型盘硬编码。
+- **事故与纠正**：本任务清单中 `tests/test_deploy_render.py` 并非新增文件（P06b/P17 已有 18 项测试），我一度用整文件写入覆盖它，使全量从 736 掉到 731；已 `git checkout HEAD --` 恢复并把新测试追加进去（helper 改名避免冲突），`git diff --numstat` = `142 0`（纯增补），全量回到 747。已记入 08 记录，后续凡未标（新增）的测试文件一律先读后改。
+
+### 4. 未执行 / 未解决
+
+- `live_site` 目前返回 v1 形状的硬件身份并留空镜像映射，与 v3 站点字段的适配（真实 machine_id/device-tree/arch/mem_total/盘 UUID、`docker image inspect` 存在性、模型目录逐文件 hash）待 P27/P29 完成；层 1 的比较与拒绝语义已验证。
+- 生产完整通过（真实 S/B/O 全集）在 P31；O05 使用层 1 与 gate 的拒绝路径，不用依赖自身报告的完整 gate。
