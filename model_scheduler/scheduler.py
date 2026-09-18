@@ -622,8 +622,14 @@ class ModelScheduler:
         if self._session_worker is None or self._session_worker.done():
             self._session_worker = asyncio.create_task(self._run_session_lifecycle())
 
-    async def open_session(self, model_id: str, client_id: str, session_id: str, *, priority: int = 0, hard_deadline_seconds: float | None = None, deadline: float | None = None) -> dict[str, object]:
-        """Register a session and wait for it to become ACTIVE (or fail closed)."""
+    async def register_session(self, model_id: str, client_id: str, session_id: str, *, priority: int = 0,
+                               hard_deadline_seconds: float | None = None) -> dict[str, object]:
+        """Register one PREPARING session and let the lifecycle worker load it (no wait).
+
+        This is the P18 control-route semantics ("202 session handle, queue the
+        load"): the caller gets the fresh view and polls; `open_session` keeps
+        the waiting behaviour for the in-process callers that need ACTIVE.
+        """
         async with self._condition:
             if model_id not in self.book.specs:
                 raise KeyError(model_id)
@@ -634,13 +640,21 @@ class ModelScheduler:
             conflict = self._exclusive_conflict(model_id)
             if conflict is not None:
                 raise SessionConflict(conflict)
-            record = self.sessions.create(
+            self.sessions.create(
                 session_id, model_id, client_id,
                 now=self._clock(), queue=self._queue, priority=priority,
                 hard_deadline_seconds=hard_deadline_seconds,
             )
             self._ensure_session_worker()
             self._condition.notify_all()
+            return self.sessions.view(session_id, now=self._clock())
+
+    async def open_session(self, model_id: str, client_id: str, session_id: str, *, priority: int = 0, hard_deadline_seconds: float | None = None, deadline: float | None = None) -> dict[str, object]:
+        """Register a session and wait for it to become ACTIVE (or fail closed)."""
+        await self.register_session(model_id, client_id, session_id, priority=priority,
+                                    hard_deadline_seconds=hard_deadline_seconds)
+        async with self._condition:
+            record = self.sessions.get(session_id)
         wait_until = record.wait_deadline if deadline is None else min(record.wait_deadline, deadline)
         while True:
             async with self._condition:

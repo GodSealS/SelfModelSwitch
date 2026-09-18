@@ -17,8 +17,10 @@ import pytest
 from model_scheduler import control_protocol_v1 as cp
 from model_scheduler.blob_store import MAX_BLOB_BYTES, BlobStore
 from model_scheduler.control_api import ControlAPI
-from model_scheduler.control_identity import PeerIdentity
+from model_scheduler.control_identity import PeerIdentity, TokenAuthority
 from model_scheduler.execution_service import blob_owner_for
+from model_scheduler.idempotency import IdempotencyStore
+from model_scheduler.session_manager import SessionNotFound
 
 VERSION = (cp.PROTOCOL_VERSION_HEADER, str(cp.PROTOCOL_VERSION))
 REQUEST_ID = "req-0f1e2d3c4b5a"
@@ -84,6 +86,181 @@ def _owner() -> str:
 def api(tmp_path: Path) -> ControlAPI:
     return ControlAPI(boot_id="boot-18", blobs=BlobStore(tmp_path / "blobs", clock=lambda: 1_000.0),
                       clock=lambda: 1_000.0)
+
+
+class _StubSessions:
+    """The scheduler's session-policy surface that the API reads."""
+
+    hard_deadline_seconds = 3600.0
+
+    def __init__(self) -> None:
+        self.holding: str | None = None
+
+    def holding_id(self) -> str | None:
+        return self.holding
+
+
+class _StubScheduler:
+    """A scripted ModelScheduler with real session phases; the route layer is what is under test."""
+
+    def __init__(self) -> None:
+        self.sessions = _StubSessions()
+        self.records: dict[str, dict] = {}
+        self.registered: list[tuple[str, str, str]] = []
+        self.heartbeats: list[str] = []
+        self.closes: list[str] = []
+        self.reject: Exception | None = None
+        self.close_phase = "closed"
+
+    def view_of(self, session_id: str) -> dict:
+        return dict(self.records[session_id])
+
+    async def register_session(self, model_id, client_id, session_id, *, priority=0, hard_deadline_seconds=None):
+        if self.reject is not None:
+            raise self.reject
+        if model_id != "chat":
+            raise KeyError(model_id)
+        self.registered.append((session_id, model_id, client_id))
+        self.records[session_id] = {"session_id": session_id, "model_id": model_id, "client_id": client_id,
+                                    "phase": "preparing", "expires_in_ms": 25_000, "hard_remaining_ms": 3_600_000,
+                                    "draining_reason": None, "blocked_reason": None}
+        return self.view_of(session_id)
+
+    async def session_view(self, session_id):
+        if session_id not in self.records:
+            raise SessionNotFound(session_id)
+        return self.view_of(session_id)
+
+    async def heartbeat_session(self, session_id):
+        self.heartbeats.append(session_id)
+        return self.view_of(session_id)
+
+    async def close_session(self, session_id, *, reason="client_close", deadline=None):
+        self.closes.append(session_id)
+        self.records[session_id]["phase"] = self.close_phase
+        return self.view_of(session_id)
+
+
+@pytest.fixture
+def sessions(tmp_path: Path):
+    clock = lambda: 1_000.0  # noqa: E731 - one frozen clock for tokens, idempotency and the API
+    tokens = TokenAuthority(boot_key=b"k" * 32, boot_id="boot-18", clock=clock)
+    scheduler = _StubScheduler()
+    api = ControlAPI(boot_id="boot-18", blobs=BlobStore(tmp_path / "blobs", clock=clock),
+                     scheduler=scheduler, tokens=tokens,
+                     idempotency=IdempotencyStore(boot_key=b"i" * 32, clock=clock), clock=clock)
+    return api, scheduler, tokens
+
+
+async def _create_session(api, *, model_id: str = "chat", key: str = "s-1") -> _Response:
+    return await _call(api, "POST", "/internal/sessions", headers=(VERSION,),
+                       body=json.dumps({"model_id": model_id, "idempotency_key": key}).encode("utf-8"))
+
+
+async def test_a_session_create_returns_a_bound_token_and_get_recomputes_it(sessions) -> None:
+    api, scheduler, _ = sessions
+    created = await _create_session(api)
+
+    assert created.status == 202
+    view = cp.parse_session_view(created.document)
+    assert view.state == "preparing" and view.phase == "queued" and view.boot_id == "boot-18"
+    assert view.owner_token is not None
+
+    read = await _call(api, "GET", f"/internal/sessions/{view.session_id}", headers=(VERSION,))
+
+    assert read.status == 200
+    assert cp.parse_session_view(read.document).owner_token == view.owner_token  # rebuilt byte-identically
+
+
+async def test_a_loading_or_active_session_reports_the_p18_phase(sessions) -> None:
+    api, scheduler, _ = sessions
+    session_id = cp.parse_session_view((await _create_session(api)).document).session_id
+
+    scheduler.records[session_id]["phase"] = "active"
+    active = await _call(api, "GET", f"/internal/sessions/{session_id}", headers=(VERSION,))
+    assert cp.parse_session_view(active.document).phase is None
+
+    scheduler.records[session_id]["phase"] = "preparing"
+    scheduler.sessions.holding = session_id
+    loading = await _call(api, "GET", f"/internal/sessions/{session_id}", headers=(VERSION,))
+    assert cp.parse_session_view(loading.document).phase == "loading"
+
+
+async def test_the_same_key_replays_the_session_and_a_new_payload_conflicts(sessions) -> None:
+    api, _, _ = sessions
+    first = cp.parse_session_view((await _create_session(api, key="s-2")).document)
+    replay = cp.parse_session_view((await _create_session(api, key="s-2")).document)
+    conflict = await _create_session(api, model_id="chat-other", key="s-2")
+
+    assert replay.session_id == first.session_id  # one object, no second session
+    assert conflict.status == 409 and _error(conflict).code == "idempotency_conflict"
+
+
+async def test_an_unknown_model_is_404_and_does_not_strand_the_key(sessions) -> None:
+    api, _, _ = sessions
+    missing = await _create_session(api, model_id="missing", key="s-3")
+    recovered = await _create_session(api, key="s-3")
+
+    assert missing.status == 404 and _error(missing).code == "not_found"
+    assert recovered.status == 202  # the refusal released the idempotency key
+
+
+async def test_another_owner_never_learns_the_session_exists(sessions) -> None:
+    api, _, _ = sessions
+    view = cp.parse_session_view((await _create_session(api)).document)
+    other = os.getuid() + 1 if os.getuid() < 65534 else os.getuid() - 1
+    foreign = PeerIdentity(other)
+
+    read = await _call(api, "GET", f"/internal/sessions/{view.session_id}", headers=(VERSION,), peer=foreign)
+    heartbeat = await _call(api, "POST", f"/internal/sessions/{view.session_id}/heartbeat", headers=(VERSION,),
+                            body=json.dumps({"session_token": view.owner_token}).encode("utf-8"), peer=foreign)
+
+    assert read.status == 404 and heartbeat.status == 404
+
+
+async def test_heartbeat_requires_the_session_token(sessions) -> None:
+    api, scheduler, _ = sessions
+    view = cp.parse_session_view((await _create_session(api)).document)
+
+    wrong = await _call(api, "POST", f"/internal/sessions/{view.session_id}/heartbeat", headers=(VERSION,),
+                        body=json.dumps({"session_token": "v1.bogus.bogus"}).encode("utf-8"))
+    right = await _call(api, "POST", f"/internal/sessions/{view.session_id}/heartbeat", headers=(VERSION,),
+                        body=json.dumps({"session_token": view.owner_token}).encode("utf-8"))
+
+    assert wrong.status == 409 and _error(wrong).code == "stale_token"
+    assert right.status == 200 and scheduler.heartbeats == [view.session_id]
+
+
+async def test_close_is_202_while_draining_and_200_once_closed(sessions) -> None:
+    api, scheduler, _ = sessions
+    view = cp.parse_session_view((await _create_session(api)).document)
+    scheduler.close_phase = "draining"
+    payload = json.dumps({"session_token": view.owner_token}).encode("utf-8")
+
+    draining = await _call(api, "POST", f"/internal/sessions/{view.session_id}/close", headers=(VERSION,), body=payload)
+    assert draining.status == 202 and cp.parse_session_view(draining.document).state == "draining"
+
+    scheduler.close_phase = "closed"
+    closed = await _call(api, "POST", f"/internal/sessions/{view.session_id}/close", headers=(VERSION,), body=payload)
+    again = await _call(api, "POST", f"/internal/sessions/{view.session_id}/close", headers=(VERSION,), body=payload)
+
+    assert closed.status == 200
+    final = cp.parse_session_view(closed.document)
+    assert final.state == "closed" and final.owner_token is None
+    assert again.status == 200  # close is idempotent
+
+
+async def test_malformed_and_duplicate_key_bodies_are_rejected(sessions) -> None:
+    api, _, _ = sessions
+    broken = await _call(api, "POST", "/internal/sessions", headers=(VERSION,), body=b"{")
+    duplicated = await _call(api, "POST", "/internal/sessions", headers=(VERSION,),
+                             body=b'{"model_id": "chat", "idempotency_key": "x", "idempotency_key": "y"}')
+    unknown = await _call(api, "POST", "/internal/sessions", headers=(VERSION,),
+                          body=b'{"model_id": "chat", "idempotency_key": "x", "owner": "uid:0"}')
+
+    assert broken.status == 400 and _error(broken).code == "malformed_json"
+    assert duplicated.status == 422 and _error(duplicated).code == "contract_violation"
+    assert unknown.status == 422  # "not accepted: owner/priority/deadline" (C05)
 
 
 async def _upload(api, *, media_type: str = "application/json", payload: bytes = b'{"messages": []}',

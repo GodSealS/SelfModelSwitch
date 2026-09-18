@@ -20,6 +20,8 @@ Sessions and executions land on this same surface in the later P18 slices.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import re
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
@@ -32,11 +34,21 @@ from .contracts_v2 import ContractError
 from .control_identity import IdentityError, owner_from_peer
 from .control_server import send_json
 from .execution_service import ExecutionError, blob_owner_for
+from .idempotency import COMPLETED, IdempotencyError, IdempotencyStore
+from .scheduler import ModelUnavailable
+from .session_manager import BLOCKED, CLOSED, DRAINING, PREPARING, SessionConflict, SessionNotFound
 
 _BLOB_ID_PATTERN = r"[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?"
 _BLOB_ROUTE = re.compile(rf"^/internal/blobs/({_BLOB_ID_PATTERN})$")
+_SESSION_ROUTE = re.compile(rf"^/internal/sessions/({_BLOB_ID_PATTERN})(/heartbeat|/close)?$")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_ERROR_TEXT = 512
+
+# Session refusals onto the closed C05 table.
+_SESSION_CONFLICTS = {"session_capacity": "queue_full", "duplicate_session": "busy",
+                      "invalid_hard_deadline": "contract_violation"}
+_SESSION_UNAVAILABLE = {"storage_unavailable": "storage_unavailable", "session_blocked": "temporarily_unavailable",
+                        "service_shutting_down": "temporarily_unavailable"}
 
 # Blob-store refusals onto the closed C05 error table.
 _BLOB_FAILURES = {
@@ -61,6 +73,23 @@ class _Refused(Exception):
         self.code = code
 
 
+@dataclass
+class _SessionBinding:
+    """The API's own session bookkeeping: who owns it and how its token is rebuilt.
+
+    C05 stores only a token fingerprint for validation, and GET recomputes the
+    identical token from the bound fields (`issued_at` + `expires_at`), so the
+    plain token never has to be persisted.
+    """
+
+    session_id: str
+    owner: str
+    model_id: str
+    issued_at: float
+    expires_at: float
+    fingerprint: str
+
+
 class ControlAPI:
     """The `/internal` route surface except `/internal/peer`, as one ASGI callable."""
 
@@ -72,16 +101,21 @@ class ControlAPI:
         scheduler: Any = None,
         service: Any = None,
         tokens: Any = None,
-        clock: Callable[[], float] = time.monotonic,
+        idempotency: IdempotencyStore | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.boot_id = boot_id
         self.blobs = blobs
         self.scheduler = scheduler
         self.service = service
         self.tokens = tokens
+        self.idempotency = idempotency
         self.clock = clock
+        self._sessions: dict[str, _SessionBinding] = {}
+        self._session_tokens: dict[str, str] = {}
         self._routes: dict[tuple[str, str], Callable[..., Awaitable[None]]] = {
             ("POST", "/internal/blobs"): self._blob_upload,
+            ("POST", "/internal/sessions"): self._session_create,
         }
 
     async def __call__(
@@ -122,6 +156,16 @@ class ControlAPI:
             await self._refuse(guarded_send, code, str(exc), request_id, started)
         except ExecutionError as exc:
             await self._refuse(guarded_send, exc.code, str(exc), request_id, started)
+        except SessionConflict as exc:
+            await self._refuse(guarded_send, _SESSION_CONFLICTS.get(str(exc), "busy"), str(exc), request_id, started)
+        except SessionNotFound as exc:
+            await self._refuse(guarded_send, "not_found", str(exc), request_id, started)
+        except ModelUnavailable as exc:
+            await self._refuse(guarded_send, _SESSION_UNAVAILABLE.get(str(exc), "temporarily_unavailable"),
+                               str(exc), request_id, started)
+        except KeyError as exc:
+            await self._refuse(guarded_send, "not_found",
+                               f"unknown model: {exc.args[0] if exc.args else exc}", request_id, started)
 
     def _route(self, method: str, path: str) -> Callable[..., Awaitable[None]] | None:
         handler = self._routes.get((method, path))
@@ -129,6 +173,14 @@ class ControlAPI:
             return handler
         if _BLOB_ROUTE.fullmatch(path) is not None:
             return {"GET": self._blob_read, "DELETE": self._blob_delete}.get(method)
+        session = _SESSION_ROUTE.fullmatch(path)
+        if session is not None:
+            suffix = session.group(2)
+            if suffix is None:
+                return self._session_read if method == "GET" else None
+            if method != "POST":
+                return None
+            return self._session_heartbeat if suffix == "/heartbeat" else self._session_close
         return None
 
     async def _refuse(self, send, code: str, message: str, request_id: str, started: Mapping[str, bool]) -> None:
@@ -197,6 +249,118 @@ class ControlAPI:
             raise _Refused("temporarily_unavailable", "the blob store is not wired into this process")
         return self.blobs
 
+    # -- C05: sessions ---------------------------------------------------------------
+
+    async def _session_create(self, owner, scope, receive, send, request_id) -> None:
+        scheduler, tokens, idempotency = self._require_sessions()
+        parsed = cp.parse_session_create_request(await _json_body(receive, limit=cp.MAX_INLINE_INPUT_BYTES))
+        record = None
+        if idempotency is not None:
+            payload = {"model_id": parsed.model_id, "correlation_id": parsed.correlation_id}
+            record = idempotency.begin(route="session.create", owner=owner, key=parsed.idempotency_key, payload=payload)
+            if record.state == COMPLETED:
+                replayed = self._sessions.get(record.resource_id or "")
+                if replayed is None:
+                    raise _Refused("not_found", "the replayed session is gone with its boot")
+                await send_json(send, 202, await self._session_document(replayed))  # the object's current state
+                return
+        try:
+            session_id = uuid4().hex
+            view = await scheduler.register_session(parsed.model_id, owner, session_id)
+            binding = self._bind(owner, parsed.model_id, session_id)
+            document = self._session_document_sync(binding, view)
+        except BaseException:
+            if record is not None:
+                idempotency.fail(record)  # a refusal must not strand the key
+            raise
+        if record is not None:
+            idempotency.complete(record, status=202, resource_id=session_id, body=document)
+        await send_json(send, 202, document)
+
+    async def _session_read(self, owner, scope, receive, send, request_id) -> None:
+        self._require_sessions()
+        await send_json(send, 200, await self._session_document(self._owned_session(scope, owner)))
+
+    async def _session_heartbeat(self, owner, scope, receive, send, request_id) -> None:
+        scheduler, _, _ = self._require_sessions()
+        binding = self._owned_session(scope, owner)
+        token = _session_token_of(await _json_body(receive, limit=cp.MAX_INLINE_INPUT_BYTES))
+        self._verify_session_token(binding, owner, token)
+        view = await scheduler.heartbeat_session(binding.session_id)
+        await send_json(send, 200, self._session_document_sync(binding, view))
+
+    async def _session_close(self, owner, scope, receive, send, request_id) -> None:
+        scheduler, _, _ = self._require_sessions()
+        binding = self._owned_session(scope, owner)
+        token = _session_token_of(await _json_body(receive, limit=cp.MAX_INLINE_INPUT_BYTES))
+        self._verify_session_token(binding, owner, token)
+        view = await scheduler.close_session(binding.session_id, reason="client_close")
+        document = self._session_document_sync(binding, view)
+        await send_json(send, 200 if document["state"] == CLOSED else 202, document)
+
+    def _require_sessions(self):
+        if self.scheduler is None or self.tokens is None:
+            raise _Refused("temporarily_unavailable", "the session services are not wired into this process")
+        return self.scheduler, self.tokens, self.idempotency
+
+    def _owned_session(self, scope: Mapping[str, Any], owner: str) -> _SessionBinding:
+        match = _SESSION_ROUTE.fullmatch(str(scope.get("path") or ""))
+        if match is None:
+            raise _Refused("not_found", "the route is not served here")
+        binding = self._sessions.get(match.group(1))
+        if binding is None or binding.owner != owner:
+            raise _Refused("not_found", "no such session belongs to this owner")
+        return binding
+
+    def _bind(self, owner: str, model_id: str, session_id: str) -> _SessionBinding:
+        issued_at = round(float(self.clock()), 3)
+        expires_at = round(issued_at + float(self.scheduler.sessions.hard_deadline_seconds), 3)
+        token = self._issue_token(owner, model_id, session_id, issued_at, expires_at)
+        binding = _SessionBinding(session_id=session_id, owner=owner, model_id=model_id, issued_at=issued_at,
+                                  expires_at=expires_at, fingerprint=self.tokens.fingerprint(token))
+        self._sessions[session_id] = binding
+        self._session_tokens[binding.fingerprint] = session_id
+        return binding
+
+    def _issue_token(self, owner: str, model_id: str, session_id: str, issued_at: float, expires_at: float) -> str:
+        return self.tokens.issue(owner=owner, model_id=model_id, session_id=session_id,
+                                 ttl_seconds=expires_at - issued_at, now=issued_at)
+
+    def _verify_session_token(self, binding: _SessionBinding, owner: str, token: str) -> None:
+        try:
+            self.tokens.verify(token, owner=owner, model_id=binding.model_id,
+                               session_id=binding.session_id, now=self.clock())
+        except IdentityError as exc:
+            raise ExecutionError(exc.code, str(exc)) from exc
+
+    async def _session_document(self, binding: _SessionBinding) -> dict:
+        view = await self.scheduler.session_view(binding.session_id)
+        return self._session_document_sync(binding, view)
+
+    def _session_document_sync(self, binding: _SessionBinding, view: Mapping[str, Any]) -> dict:
+        state = str(view["phase"])
+        phase = None
+        if state == PREPARING:
+            phase = "loading" if self.scheduler.sessions.holding_id() == binding.session_id else "queued"
+        elif state == DRAINING:
+            phase = "draining_existing"
+        error = None
+        if state == BLOCKED:
+            reason = str(view.get("blocked_reason") or "temporarily_unavailable")
+            code = reason if reason in cp.ERROR_STATUS else "temporarily_unavailable"
+            error = {"code": code, "message": reason, "retryable": code in cp.RETRYABLE_ERROR_CODES}
+        token = None if state == CLOSED else self._issue_token(
+            binding.owner, binding.model_id, binding.session_id, binding.issued_at, binding.expires_at)
+        document = {
+            "session_id": binding.session_id, "state": state, "phase": phase, "boot_id": self.boot_id,
+            "model_id": binding.model_id,
+            "expires_in_ms": max(0, int(view["expires_in_ms"])),
+            "hard_remaining_ms": max(0, int(view["hard_remaining_ms"])),
+            "owner_token": token, "error": error,
+        }
+        cp.parse_session_view(document)  # the response is the contract, not a hope
+        return document
+
 
 def _header(scope: Mapping[str, Any], name: str) -> str | None:
     wanted = name.lower().encode("latin-1")
@@ -238,3 +402,43 @@ async def _body_chunks(receive: Callable[[], Awaitable[Mapping[str, Any]]], *, l
             yield bytes(block)
         if not message.get("more_body", False):
             return
+
+
+async def _json_body(receive: Callable[[], Awaitable[Mapping[str, Any]]], *, limit: int) -> Any:
+    """Read one bounded JSON body under the strict-JSON rules of C05."""
+    payload = bytearray()
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            raise _Refused("temporarily_unavailable", "the client disconnected while its body was read")
+        block = message.get("body", b"")
+        if block:
+            payload += block
+            if len(payload) > limit:
+                raise _Refused("payload_too_large", f"the request body must be at most {limit} bytes")
+        if not message.get("more_body", False):
+            break
+    try:
+        return json.loads(payload.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except ContractError:
+        raise  # duplicate keys are a strict-JSON contract violation, not a syntax error
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _Refused("malformed_json", "the request body must be one JSON object") from exc
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ContractError(f"duplicate key: {key!r}")
+        document[key] = value
+    return document
+
+
+def _session_token_of(document: Any) -> str:
+    if not isinstance(document, dict) or set(document) != {"session_token"}:
+        raise ContractError('the request body must be exactly {"session_token": "..."}')
+    token = document["session_token"]
+    if not isinstance(token, str) or not token or len(token) > 4096:
+        raise ContractError("session_token must be a non-empty string of at most 4096 characters")
+    return token
