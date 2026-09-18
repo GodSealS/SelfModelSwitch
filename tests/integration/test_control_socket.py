@@ -357,22 +357,17 @@ def test_two_real_uids_on_linux_one_allowed_one_not(sdir) -> None:
         "sys.stdout.buffer.write(s.recv(4096))"
     )
 
-    async def drive() -> None:
-        loop = asyncio.new_event_loop()
+    async def main() -> None:
+        srv = ControlServer(build_control_app(boot_id="gate"), socket_path=sdir / "control.sock",
+                            allowed_uids=(server_uid,))
+        await srv.start()
+        try:
+            allowed = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10)
+            denied = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10,
+                                    user=alien_uid, group=alien_uid)
+            assert b"200 OK" in allowed.stdout and f"uid:{server_uid}".encode() in allowed.stdout
+            assert denied.stdout == b""  # closed without an HTTP answer
+        finally:
+            await srv.stop()
 
-        async def main():
-            srv = ControlServer(build_control_app(boot_id="gate"), socket_path=sdir / "control.sock",
-                                allowed_uids=(server_uid,))
-            await srv.start()
-            try:
-                allowed = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10)
-                denied = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10,
-                                        user=alien_uid, group=alien_uid)
-                assert b"200 OK" in allowed.stdout and f"uid:{server_uid}".encode() in allowed.stdout
-                assert denied.stdout == b""  # closed without an HTTP answer
-            finally:
-                await srv.stop()
-        loop.run_until_complete(main())
-        loop.close()
-
-    drive()
+    asyncio.run(main())  # a never-awaited coroutine must not be able to call this case green
