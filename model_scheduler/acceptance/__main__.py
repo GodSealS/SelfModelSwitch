@@ -81,7 +81,9 @@ def _calibrate(args) -> int:
         print(f"calibrate: {exc}", file=sys.stderr)
         return EXIT_FAILED if exc.semantic else EXIT_INPUT
     print(f"calibration written to {args.output}: {summary}")
-    return EXIT_OK
+    # A blocked verdict is a semantic failure (C02): the material is kept, the
+    # exit code still says the calibration did not pass.
+    return EXIT_OK if summary.get("verdict") == "passed" else EXIT_FAILED
 
 
 def build_parser() -> argparse.ArgumentParser:

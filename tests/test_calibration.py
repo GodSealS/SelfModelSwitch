@@ -392,7 +392,8 @@ def test_maintenance_must_be_re_verified_live_not_only_declared(tmp_path) -> Non
     assert refused.value.semantic is True
 
 
-def _site(tmp_path: Path, rounds: int = 3, *, vision: bool = True) -> tuple[Path, Path, Path]:
+def _site(tmp_path: Path, rounds: int = 3, *, vision: bool = True,
+          with_free: bool = True) -> tuple[Path, Path, Path]:
     """A complete calibrate input set: v2 config (optionally vision), facts, maintenance."""
     import importlib.util
 
@@ -422,8 +423,27 @@ def _site(tmp_path: Path, rounds: int = 3, *, vision: bool = True) -> tuple[Path
                            encoding="utf-8")
     evidence = tmp_path / "evidence"
     for index in range(1, rounds + 1):
-        _write_round(evidence, f"round-{index}")
+        if with_free:
+            _write_round(evidence, f"round-{index}")
+        else:
+            _write_round(evidence, f"run{index}", with_free=False, window=False, run_json=True)
     return config_path, facts_path, maintenance
+
+
+def test_the_cli_keeps_preserved_material_but_exits_3_when_the_bound_is_unproven(tmp_path) -> None:
+    config_path, facts_path, maintenance = _site(tmp_path, rounds=1, with_free=False)
+    output = tmp_path / "calibration"
+
+    from model_scheduler.acceptance.__main__ import main
+
+    code = main(["calibrate", "--config", str(config_path), "--facts", str(facts_path),
+                 "--maintenance", str(maintenance), "--budget-bytes", "16000000000", "--runs", "1",
+                 "--output", str(output), "--from-evidence", str(tmp_path / "evidence")])
+
+    assert code == EXIT_FAILED  # C02: an unprovable physical bound blocks, it never passes
+    measurement = json.loads((output / "measurements.json").read_text(encoding="utf-8"))
+    assert measurement["summary"]["verdict"] == "blocked"
+    assert "MemFree" in measurement["rounds"][0]["bound_note"]  # the software result is kept and explains why
 
 
 def test_the_cli_recomputes_from_raw_material_and_writes_measurements(tmp_path) -> None:

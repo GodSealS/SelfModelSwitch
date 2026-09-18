@@ -160,8 +160,10 @@ def collect_facts(*, model_disk: str, scratch_disk: str, reader: FactsReader | N
     docker_version = site.run(["docker", "--version"])
     record("device.container_runtime_version", "command:docker --version", docker_version)
 
-    power_mode = _required_text(site.run(["nvpmodel", "-q"]), "nvpmodel -q")
-    record("device.power_mode", "command:nvpmodel -q", power_mode)
+    power_output = site.run(["nvpmodel", "-q"])
+    power_mode = " ".join(part.strip() for part in power_output.splitlines() if part.strip())
+    _required_text(power_mode, "nvpmodel -q")
+    record("device.power_mode", "command:nvpmodel -q", power_output)
 
     governor = _required_text(site.read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"), "cpu0 governor")
     record("device.clock_mode", "file:/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", governor)
