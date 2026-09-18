@@ -318,3 +318,48 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 模型加载只用于产生一个可观察、可精确停止的真实实例，不构成任何能力/性能结论。
 - 未解决：①`tests/test_release.py` 在目标 checkout 因硬编码 `.venv/bin/python` 失败（P28）；②目标 lab venv 依赖（含 pytest/ruff）仍是本轮环境供给，尚未由锁文件安装（P28）；
   ③新 observer/recovery 尚未接入 HTTP/控制路由与 v2 composition（P17/P18）；④本任务触碰 6 个文件（含 `tests/test_control_recovery_port.py`），略超"约 5 个"。
+
+## P08 记录（2026-09-18）
+
+范围：统一 legacy/v2 登记为 Book 的唯一内部规格，并落实 C02 的两套内存账本（模型预算 B + 静态物理上限）；不改 v1 对外数字与运行路径。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P08 |
+| status | complete |
+| source_commit | `336e4611106b4feed0842efe3a39d909353319dc`（P07 记录提交，起点） |
+| implementation_commit | `4fe3c8687149d8cb65b0e2ced35652ac4642fcbc` |
+| target_commit | `4fe3c8687149d8cb65b0e2ced35652ac4642fcbc`（`git status --porcelain --untracked-files=all` 为空，fast-forward） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：三条验收均由开发机与目标机的测试结果支撑，属软件层（S）。**不**产生 `software_verified` / `device_backend_ready` 结论。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_registry.py tests/test_resources.py tests/test_runtime.py -q`（实现前） | 2 | 三个文件收集失败（`ledger_specs_from`、`memory_sample_from`、`STOP_RESAMPLE_GRACE_SECONDS` 等不存在），即 RED |
+| 同上（实现后，开发机） | 0 | `35 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `436 passed, 1 deselected, 2 warnings`（P07 基线 421） |
+| `ruff check .`（开发机） | 0 | `All checks passed!` |
+| `run.py --check-config`（开发机） | 0 | 旧四 ID，未迁移 |
+| 三个测试文件（目标机 `4fe3c86`） | 0 | `35 passed` |
+| `pytest tests -m 'not thor' -q`（目标机） | 1 | `434 passed, 3 failed`；失败仍是 `tests/test_release.py` 的 `.venv/bin/python` 环境假设（P28 范围） |
+
+### 3. 关键事实
+
+- `LedgerSpec` 是唯一内部规格：`effective_reserved_bytes` 由 `contracts_v2.effective_reserved_bytes` 计算，v2 不用 margin，v1 legacy peak 恰好乘一次 margin。
+- 两套账本：`committed`（R 之和）与 `physical_committed`（`ceil(physical_peak*1.15)` 之和），都只统计 `reservation>0`（未证实停止）的模型。
+- 物理门槛仅在至少一个登记带测量峰值时启用；未测模型在此模式下不准入，pure-v1 账本保持单账本原行为。
+- `can_load` 现要求样本晚于上次已证实停止；`stopped(op, now)` 记录停止时刻，`stop_settled()` 暴露 10s 回收窗口。
+- 停止未证实（失败/取消任务）时两套账本都不释放。
+
+### 4. 未执行 / 未解决
+
+- 未执行：真实模型的峰值测量、最大组合输入、真机内存门槛验收（P20 以后）；本任务不产生任何性能结论。
+- `scheduler.py`/`eviction_policy.py` 仍读 `book.specs` 的 v1 字段；v2 登记接线时需迁移（P14/P16）。
+- 低 F "触发清理"与 10s 重采样的调度动作由 P09/P10 接线。

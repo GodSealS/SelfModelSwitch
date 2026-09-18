@@ -814,10 +814,31 @@ docker 列举/解析失败、重复实例、端口 listening 或 unknown、启�
 **Description:** 统一legacy/v2内部规格并落实C02；Book保持纯同步状态，资源采样独立注入。
 **Files likely touched:** `model_scheduler/model_registry.py`、`model_scheduler/resource_monitor.py`、`model_scheduler/runtime.py`、`tests/test_registry.py`、`tests/test_resources.py`。
 **Acceptance criteria:**
-- [ ] v1原行为不变，v2margin只算一次；UNKNOWN/ERROR/未终结启动计入两套账本。
-- [ ] B/F/physical/新模型/READY的等号和1-byte边界、样本2s边界及未来时间全部测试。
-- [ ] STOPPED后才释放模型预算；低F关新执行、触发清理及10s重新采样；不把线程cancel当工作已停。
+- [x] v1原行为不变，v2margin只算一次；UNKNOWN/ERROR/未终结启动计入两套账本。
+- [x] B/F/physical/新模型/READY的等号和1-byte边界、样本2s边界及未来时间全部测试。
+- [x] STOPPED后才释放模型预算；低F关新执行、触发清理及10s重新采样；不把线程cancel当工作已停。
 **Verification:** `python -m pytest tests/test_registry.py tests/test_resources.py tests/test_runtime.py -q`。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `336e461`（P07 记录提交）；实现提交 `4fe3c86`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。`pytest tests/test_registry.py tests/test_resources.py tests/test_runtime.py -q` = 35 passed（实现前收集失败）；
+`pytest tests -m 'not thor' -q` = 436 passed, 1 deselected（P07 基线 421）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+`Book` 现在把每个模型折成唯一内部规格 `LedgerSpec`：`effective_reserved_bytes` 走 `contracts_v2.effective_reserved_bytes`——
+v2 登记的 `reserved_bytes` 已是 R（`ceil(peak*1.15)`）原样使用，v1 legacy peak 在该兼容边界按原 margin 精确乘一次（`ceil(100*1.15)=115`，不再二次放大），
+`physical_reserved_bytes=ceil(physical_resident_peak*1.15)`（未测为 null）；Book 自身的槽位、pinned/evictable/preload/TTL/priority 判断全部改读该内部规格，
+`specs` 仍保留原登记对象供 v1 调用方读取（scheduler/eviction_policy 的 v2 迁移留待 P14/P16）。
+新增第二本账：`physical_committed` 只统计 `reservation>0`（即未证实停止）的模型；`physical_enforced` 仅在至少一个登记带测量物理峰值时为真，
+此时未测模型一律不准入（不猜数值），pure-v1 账本不启用物理门槛从而保持原行为；`physical_admissible()` 排除候选自身避免重复计入。
+`can_load` 增加两条 C02 门槛：物理上限（`others+figure<=B`）与"样本必须晚于上次已证实停止"（`sample.sampled_at>stopped_at`）；
+`stopped(operation, now)` 记录停止时刻，`stop_settled(model_id, now)` 暴露 10s 回收窗口（`STOP_RESAMPLE_GRACE_SECONDS`）；
+停止未证实（任务失败/取消）时两套账本都不释放。`resource_monitor` 增加 C02 事实采样 `memory_sample()`（total/free/available，拒绝 free>total 等不可能值）、
+`system_nonfree_upper_bound_v1()`（同窗口逐样本 `MemTotal-MemFree` 取最大）与 v1 兼容映射 `admission_sample()`；`runtime.ledger_specs_from()` 是唯一登记入口
+（v1 config 或 v2 registration 二选一，重复 model_id 与引用未知 runtime 被拒绝），`build_scheduler` 改用它。
+测试覆盖：v1 margin 只乘一次、v2 不再乘 margin、UNKNOWN/ERROR/未终结 LOADING 计入两套账本、失败停止不释放、B 与物理门槛的等号/1-byte 边界、
+未测模型在物理门槛下拒绝、样本 2s 等号与未来时间戳、停止后必须用更新样本、10s 窗口边界。
+**目标核验**：干净 checkout fast-forward 到 `4fe3c86`；`pytest tests/test_registry.py tests/test_resources.py tests/test_runtime.py -q` = 35 passed；
+全量 `pytest tests -m 'not thor' -q` = 434 passed、3 failed（仍是 `tests/test_release.py` 的 `.venv/bin/python` 环境假设，P28 范围，与 P08 无关）。
+未解决：①低 F 时"触发清理"的调度动作与 10s 重采样等待属于 scheduler/queue 行为，本任务只交付 Book 侧判据与常量，接线在 P09/P10；
+②`scheduler.py`/`eviction_policy.py` 仍从 `book.specs` 读取 v1 登记字段（capabilities/reserved_bytes 展示值），v2 登记接入时需一并迁移（P14/P16）。到 K2。
 
 ### P09 — 公平独占会话准入（M03）
 
