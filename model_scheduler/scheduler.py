@@ -88,8 +88,10 @@ class ModelScheduler:
                 raise ModelUnavailable("storage_unavailable")
             if session_id is not None:
                 record = self.sessions.get(session_id)
-                if record.phase != ACTIVE or record.model_id != model_id:
+                if record.model_id != model_id or record.phase != ACTIVE:
                     raise SessionConflict("session_not_active")
+                if not self.sessions.is_live(session_id, self._clock()):
+                    raise SessionConflict("session_expired")
                 runtime = self.book.runtime[model_id]
                 if runtime.state.value == "ready" and len(runtime.leases) >= self.book.ledger[model_id].max_concurrency:
                     raise Conflict("session_slots_exhausted")
@@ -758,10 +760,21 @@ class ModelScheduler:
                 self._condition.notify_all()
             return
         async with self._condition:
-            if self.sessions.get(session_id).phase == PREPARING:
+            record = self.sessions.get(session_id)
+            activate = record.phase == PREPARING
+            if activate:
                 self.sessions.mark_active(session_id, self._clock())
                 self._queue.remove(session_id, WaitState.GRANTED)
+            ended_model_id = record.model_id
             self._condition.notify_all()
+        if not activate:
+            # The session ended while its model was still loading: clean the
+            # instance up instead of reviving a session nobody owns any more.
+            await self._stop_models([ended_model_id], self._clock() + self.sessions.stop_grace_seconds)
+            async with self._condition:
+                self.sessions.mark_closed(session_id, self._clock())
+                self._release_session_freeze(session_id)
+                self._condition.notify_all()
 
     async def _drain_session(self, session_id: str) -> None:
         async with self._condition:

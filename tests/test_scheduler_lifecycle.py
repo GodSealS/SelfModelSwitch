@@ -975,3 +975,81 @@ async def test_ttl_and_an_unverified_stop_never_release_the_budget() -> None:
     assert stopped == ()
     assert registry.runtime["chat"].state is State.ERROR  # TTL only begins a stop
     assert registry.committed > 0  # and the budget is kept while the stop is unproven
+
+
+@pytest.mark.asyncio
+async def test_close_heartbeat_and_a_late_load_race_without_reviving_the_session() -> None:
+    clock, backend = ManualClock(), GatedBackend()
+    registry = book()
+    sessions = session_policy()
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    opening = asyncio.create_task(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200))
+    await backend.started.wait()  # the load is in flight while the session is still PREPARING
+
+    heartbeating = asyncio.create_task(scheduler.heartbeat_session("session-1"))
+    closing = asyncio.create_task(scheduler.close_session("session-1"))
+    backend.gate.set()  # the load lands after the close was requested
+
+    closed = await asyncio.wait_for(closing, 5)
+
+    assert closed["phase"] == "closed"
+    assert sessions.active_id is None
+    assert await eventually(lambda: registry.runtime["chat"].state is State.UNLOADED)  # no orphan residency
+    with contextlib.suppress(SessionConflict, ModelUnavailable, asyncio.CancelledError):
+        await heartbeating
+    with contextlib.suppress(SessionConflict, ModelUnavailable, asyncio.CancelledError):
+        await opening
+    assert registry.committed == 0
+
+    lease = await asyncio.wait_for(scheduler.acquire("chat", "after-close", asyncio.get_running_loop().time() + 5), 5)
+    await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_an_expired_session_refuses_a_submit_and_never_becomes_active() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    sessions = session_policy(ttl_seconds=30.0)
+    scheduler = session_scheduler(registry, backend, clock, sessions)
+    await asyncio.wait_for(scheduler.open_session("chat", "client-a", "session-1", hard_deadline_seconds=200), 5)
+
+    clock.advance(30.0)  # no heartbeat: the soft TTL lapses
+
+    assert sessions.is_live("session-1", 30.0) is False
+    with pytest.raises(SessionConflict):
+        await scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 5, session_id="session-1")
+    with pytest.raises(SessionConflict):
+        await scheduler.heartbeat_session("session-1")
+    assert await eventually(lambda: sessions.get("session-1").phase in {"draining", "closed"})
+    assert await eventually(lambda: registry.committed == 0)
+
+
+@pytest.mark.asyncio
+async def test_storage_recovery_revalidates_and_never_replays_inference() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    guard_calls = {"count": 0}
+
+    async def guard() -> bool:
+        guard_calls["count"] += 1
+        return True
+
+    scheduler = ModelScheduler(
+        registry, ClockedResources(clock), backend,
+        recovery=Recovery(), admission_guard=guard, clock=clock, poll_interval_seconds=0.01,
+    )
+    lease = await scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 10)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    loads_before = len(backend.loads)
+
+    await asyncio.wait_for(scheduler.storage_lost(asyncio.get_running_loop().time() + 5), 5)
+
+    assert registry.runtime["chat"].state is State.UNLOADED
+    guard_calls["count"] = 0
+    await asyncio.wait_for(scheduler.storage_recovered(asyncio.get_running_loop().time() + 5), 5)
+
+    assert guard_calls["count"] > 0  # the mount/asset validation is re-run before reopening
+    assert len(backend.loads) == loads_before  # nothing is replayed automatically
+    assert registry.runtime["chat"].leases == {}
+    lease = await scheduler.acquire("chat", "req-2", asyncio.get_running_loop().time() + 5)
+    await scheduler.release(lease, Outcome.SUCCESS)

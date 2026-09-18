@@ -156,10 +156,18 @@ class SessionManager:
             raise SessionNotFound(session_id)
         return record
 
+    def is_live(self, session_id: str, now: float) -> bool:
+        """C04: an ACTIVE session is live only inside its soft TTL and hard deadline."""
+        record = self.records.get(session_id)
+        return record is not None and record.phase == ACTIVE and now < record.expires_at
+
     def heartbeat(self, session_id: str, now: float) -> SessionRecord:
         record = self.get(session_id)
         if record.phase not in {PREPARING, ACTIVE}:
             raise SessionConflict("session_not_open")
+        if record.phase == ACTIVE and now >= record.expires_at:
+            # 到期瞬间起 renew 被拒绝；heartbeat 不能复活已失效的会话。
+            raise SessionConflict("session_expired")
         record.heartbeat_at = now
         return record
 

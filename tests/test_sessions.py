@@ -88,7 +88,7 @@ def test_heartbeat_refreshes_the_ttl_but_never_the_hard_deadline() -> None:
     assert not sessions.expired(39.9)
     assert sessions.expired(40.0) == (record,)  # heartbeat_at + ttl
 
-    late = manager()
+    late = manager(ttl_seconds=3600.0)
     late_record = open_session(late, now=0.0)
     late.mark_active("session-1", now=0.0)
     late.heartbeat("session-1", 3590.0)
@@ -194,3 +194,27 @@ def test_the_view_reports_phase_and_remaining_budgets() -> None:
     assert view["expires_in_ms"] == 29000  # heartbeat_at + ttl - now
     assert view["hard_remaining_ms"] == 3589000
     assert view["in_flight"] == 2
+
+
+def test_expiry_refuses_submit_and_heartbeat_at_the_deadline_instant() -> None:
+    sessions = manager(ttl_seconds=30.0)
+    open_session(sessions, now=0.0)
+    sessions.mark_active("session-1", now=0.0)
+
+    assert sessions.is_live("session-1", 29.999) is True
+    assert sessions.is_live("session-1", 30.0) is False
+    with pytest.raises(SessionConflict):
+        sessions.heartbeat("session-1", 30.0)  # a renewal cannot revive an expired session
+
+    sessions.heartbeat("session-1", 20.0)  # inside the TTL it is still renewable
+    assert sessions.is_live("session-1", 49.999) is True
+    assert sessions.is_live("session-1", 50.0) is False
+
+
+def test_a_preparing_session_is_never_live_and_never_heartbeated_into_one() -> None:
+    sessions = manager()
+    open_session(sessions, now=0.0)
+
+    assert sessions.is_live("session-1", 0.5) is False  # only ACTIVE sessions are live
+    assert sessions.heartbeat("session-1", 0.5).phase == PREPARING
+    assert sessions.is_live("missing", 0.5) is False
