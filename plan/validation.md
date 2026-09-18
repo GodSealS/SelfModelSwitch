@@ -496,3 +496,44 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 - 崩溃点恢复日志、启动 GC 与未完成上传隔离属 P12；HTTP 路由与 peer 身份属 P17/P18；配额覆盖进入 candidate 摘要属 P26/P27。
 - macOS 上 `O_NOFOLLOW`/`O_DIRECTORY` 语义与 Linux 一致的部分已覆盖；ext4 上的同一套测试在目标机通过。
+
+## P12 记录（2026-09-18）
+
+范围：Blob 的崩溃点恢复、重启读保护、24h 生命周期与执行输出提交（同一 Fence 裁决）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P12 |
+| status | complete |
+| source_commit | `c541f31ebbd7648fbb8c29942b41e1b33ccf3608`（P11 记录提交，起点） |
+| implementation_commit | `32e1f0a85ed2e6f427b0b1de10461935a9b6779c` |
+| target_commit | `32e1f0a85ed2e6f427b0b1de10461935a9b6779c`（fast-forward，工作区为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：三条验收由开发机与目标机测试支撑（软件层 S）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_blob_recovery.py tests/test_blob_outputs.py -q`（实现前） | 4 | 新 API 不存在，即 RED |
+| 同上（实现后，开发机） | 0 | `11 passed`（四个 Blob 文件合计 26 passed） |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `506 passed, 1 deselected`（P11 基线 495） |
+| `ruff check .`（开发机） | 0 | 通过 |
+| 四个 Blob 测试文件（目标机 `32e1f0a`） | 0 | `26 passed` |
+
+### 3. 关键事实
+
+- 崩溃点确定：journal 记录 staging/publish_pending/published；rename 已完成而事务未提交时由恢复补提交，未完成上传与孤儿暂存被清理并归还配额。
+- 已发布但不可读（丢失/篡改）→ 转 tombstone/corrupt 且 size 归零，字节回到配额，同 owner 仍得 410。
+- 重启读保护：`instances_running=True` 时全量加 `restart:<boot_id>` 租约；GC 跳过任何租约；只有观察到旧实例 STOPPED 后释放。
+- 保留期起点分离：输入 = 上传成功，输出 = 执行终结，各 24h；tombstone 24h 后清理。
+- 输出与取消共用 `writeback_decision`：异 fence 取消无效，被取消的迟到结果只清理暂存。
+
+### 4. 未执行 / 未解决
+
+- HTTP 路由与 peer UID 身份（P17/P18）、执行终结证据接线（P14）、profile 上限进入 candidate 摘要（P26/P27）。

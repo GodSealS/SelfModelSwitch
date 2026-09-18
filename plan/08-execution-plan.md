@@ -943,10 +943,30 @@ owner 隔离与跨 owner 删除为 missing、lease 期间 DELETE 409 且释放�
 **Description:** 补齐24h生命周期、崩溃恢复、模型未停时的读取保护和晚到输出丢弃。
 **Files likely touched:** `model_scheduler/blob_store.py`、`model_scheduler/blob_metadata.py`、`tests/test_blob_recovery.py`、`tests/test_blob_outputs.py`（后二者新增）。
 **Acceptance criteria:**
-- [ ] C07每个rename/commit/fsync崩溃点恢复结果确定；重启前后owner不变，hash错blob不可读。
-- [ ] GC绝不删活跃lease文件；重启须等旧实例STOPPED才解除旧读取保护；input/output各自24h起点和tombstone正确。
-- [ ] 取消先置不可提交，输出发布与cancel按同一Fence裁决；磁盘满不产生成功结果，预留最终可回收。
+- [x] C07每个rename/commit/fsync崩溃点恢复结果确定；重启前后owner不变，hash错blob不可读。
+- [x] GC绝不删活跃lease文件；重启须等旧实例STOPPED才解除旧读取保护；input/output各自24h起点和tombstone正确。
+- [x] 取消先置不可提交，输出发布与cancel按同一Fence裁决；磁盘满不产生成功结果，预留最终可回收。
 **Verification:** `python -m pytest tests/test_blob_recovery.py tests/test_blob_outputs.py -q`；真实临时SQLite/文件，进程kill后重启测试。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `c541f31`（P11 记录提交）；实现提交 `32e1f0a`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
+`pytest tests/test_blob_recovery.py tests/test_blob_outputs.py -q` = 11 passed（新文件，先 RED）；四个 Blob 测试文件合计 26 passed；
+`pytest tests -m 'not thor' -q` = 506 passed, 1 deselected（P11 基线 495）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增恢复日志（`recovery` 表，步骤 `staging`/`publish_pending`/`published`）与 `BlobStore.recover(instances_running, boot_id)`：
+- `reserve` 但未结束的行 → 删除暂存并归还预留（配额回收）；
+- `publish_pending` 且已发布文件 hash/size 与日志一致 → 补提交发布（rename 已完成但事务未提交的崩溃点，结果确定）；
+- 已发布但文件丢失或 hash 不一致 → `release_missing()`（状态转 tombstone/corrupt、size 归零）→ blob 不可读且字节可回收，同 owner 仍得 410；
+- 无元数据行的 `.part` 暂存孤儿 → 扫描 `.staging`（fd+O_NOFOLLOW）并清理；
+- `instances_running=True` 时对每个已发布 blob 加 `restart:<boot_id>` 租约（读保护），只有 `release_restart_protection(boot_id)`（观察到旧实例 STOPPED 后）才解除；GC/过期继续跳过任何持有租约的文件。
+`publish(..., now, retention_seconds)` 让保留期从各自起点计算：输入 = 上传成功 + 24h，输出 = 执行终结 + 24h；tombstone 24h 后由 `purge_tombstones()` 清理。
+新增执行输出 API：`reserve_output(..., limit_bytes, fence)`（dispatch 前按 profile 上限预留，含磁盘余量检查）、
+`cancel_output(reservation, fence)` 用与执行同一个 `writeback_decision` 裁决（异 fence/旧 fence 无法取消）、
+`write_output(...)`（被取消或迟到的结果只清理暂存，绝不发布）、`abandon_output(...)`（归还预留）。
+测试：rename 未提交的崩溃点补提交且 owner 不变、未完成上传与孤儿暂存被清理且配额归还、文件丢失/被篡改一律不可读且字节回收、重启读保护要等旧实例 STOPPED（有保护时 GC 不删）、
+输入/输出 24h 起点与 tombstone/purge 正确、重启后 owner 不变且其他 owner 仍被拒、输出按上限预留与越限不发布、取消后迟到输出只清理、异 fence 取消被拒、磁盘满不产生成功结果且预留可回收。
+**目标核验**：干净 checkout fast-forward 到 `32e1f0a`；四个 Blob 测试文件在目标机（ext4）26 passed。
+未解决：①`/internal/blobs` 路由与 peer UID 身份属 P17/P18；②执行终结证据（`TerminationEvidence`/attempt）与输出发布的接线属 P14；
+③profile 输出上限进入 candidate 摘要属 P26/P27。
 
 ### P13 — owner身份与幂等仓库（M04）
 
