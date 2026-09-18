@@ -1,11 +1,15 @@
 """Explicit runtime composition for the single scheduler process."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .backend_control import LlamaSwapBackend, ManagedModel
+from .deploy import DeployError
 from .config import AppConfig, model_specs
 from .control_recovery import ControlRecoveryClient
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
@@ -114,3 +118,44 @@ def build_scheduler(config: AppConfig, backend: Any, *, resources: Any | None = 
         recovery=recovery if recovery is not None else ControlRecoveryClient(),
         admission_guard=guard,
     )
+
+def load_lab_manifest(path: str | Path, *, config_path: str | Path | None = None) -> dict[str, Any]:
+    """Load a lab manifest rendered by `deploy render --mode lab` (P06b).
+
+    A lab manifest is a test instance identity: it is marked lab-only and binds
+    the exact configuration digest plus every model's rendered argv, image,
+    runtime and profile. Given `config_path` the digest is re-checked, so a
+    manifest can never be joined to a different configuration.
+    """
+    manifest_path = Path(path)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployError(f"cannot read the lab manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("mode") != "lab" or manifest.get("lab_only") is not True:
+        raise DeployError("the lab manifest must be an explicit lab-only render")
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("models"), dict) or not manifest["models"]:
+        raise DeployError("the lab manifest declares no model")
+    for model_id, entry in manifest["models"].items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("argv"), list) or not entry["argv"]:
+            raise DeployError(f"the lab manifest entry for {model_id!r} has no rendered argv")
+        digest = hashlib.sha256(b"\x00".join(token.encode("utf-8") for token in entry["argv"])).hexdigest()
+        if entry.get("argv_sha256") != digest:
+            raise DeployError(f"the lab manifest entry for {model_id!r} does not match its argv digest")
+    if config_path is not None:
+        try:
+            config_sha256 = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise DeployError(f"cannot read the lab configuration: {exc}") from exc
+        if manifest.get("config_sha256") != config_sha256:
+            raise DeployError("the lab manifest config digest does not match this configuration")
+    return manifest
+
+
+def lab_launch_argv(manifest: Mapping[str, Any], model_id: str) -> list[str]:
+    """The exact rendered argv of one lab model; unknown ids are refused."""
+    models = manifest.get("models") if isinstance(manifest, Mapping) else None
+    entry = models.get(model_id) if isinstance(models, Mapping) else None
+    if not isinstance(entry, Mapping) or not isinstance(entry.get("argv"), list):
+        raise DeployError(f"the lab manifest has no rendered entry for model {model_id!r}")
+    return list(entry["argv"])

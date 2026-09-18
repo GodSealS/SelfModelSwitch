@@ -2,12 +2,156 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
 from model_scheduler.config import load_config
-from model_scheduler.deploy import DeployError, collect_facts, migrate, preflight, render
+from model_scheduler.deploy import DeployError, collect_facts, migrate, preflight, render, render_lab
 from model_scheduler.storage_monitor import StorageSnapshot
+
+
+def lab_v2_config(port: int = 18081) -> dict:
+    """Schema-v2 registration of the M00 model, used by the lab render tests."""
+    return {
+        "schema_version": 2,
+        "registration": {
+            "runtimes": [
+                {
+                    "runtime_id": "llama-cpp-cuda-sm87-4bc272f",
+                    "profile_id": "llama-cpp-gguf-v1",
+                    "image_digest": "sms-llama-cpp@sha256:" + "8" * 64,
+                    "adapter_sha256": "b" * 64,
+                    "lock_sha256": "c" * 64,
+                    "startup_args": [
+                        "--load-mode", "--parallel", "--kv-unified-per-slot", "--image-max-tokens",
+                        "--n-gpu-layers", "--flash-attn", "--no-warmup", "--no-webui", "--host", "--port",
+                    ],
+                }
+            ],
+            "models": [
+                {
+                    "model_id": "qwen25vl-7b-q4",
+                    "runtime_id": "llama-cpp-cuda-sm87-4bc272f",
+                    "capabilities": ["chat", "vision"],
+                    "assets": [
+                        {"role": "model", "path": "qwen25vl-7b-q4/model.gguf", "sha256": "3f" + "0" * 62, "size_bytes": 4683072320},
+                        {"role": "projector", "path": "qwen25vl-7b-q4/mmproj.gguf", "sha256": "d1" + "0" * 62, "size_bytes": 1354162912},
+                    ],
+                    "port": port,
+                    "envelope": {
+                        "ctx_size": 32768, "max_input_tokens": 28672, "max_output_tokens": 4096,
+                        "max_parallel": 2, "max_image_tokens": 1280, "max_image_edge_pixels": 1024, "max_images": 1,
+                    },
+                    "timeout_seconds": 3600,
+                    "reserved_bytes": 6106148045,
+                    "measured": False,
+                    "measurement_ref": None,
+                    "physical_resident_peak_bytes": None,
+                }
+            ],
+        },
+        "server": {"host": "127.0.0.1", "port": 8090, "workers": 1, "max_request_body_bytes": 4194304, "body_timeout_seconds": 30, "shutdown_grace_seconds": 30},
+        "scheduler": {
+            "poll_interval_seconds": 2, "request_queue_timeout_seconds": 1800, "queue_capacity": 128,
+            "priority_aging_seconds": 30, "switch_drain_timeout_seconds": 30, "switch_retry_seconds": 30,
+            "resource_safety_margin": 0.15, "min_free_memory_bytes": 2147483648, "max_evictions_per_request": 8,
+            "memory_reclaim_timeout_seconds": 10,
+            "heat": {"half_life_seconds": 1800, "request_weight": 1.0, "token_weight": 0.0001},
+            "thrash": {"switch_window_seconds": 10, "max_switches_in_window": 3, "cooldown_seconds": 15},
+        },
+        "resources": {"provider": "psutil", "system_reserve_bytes": 8589934592, "sample_interval_seconds": 1, "sample_max_age_seconds": 2, "model_budget_bytes": 16000000000},
+        "storage": {"mount_path": "/media/jtzn/sandisk-ext4", "model_directory": "/media/jtzn/sandisk-ext4/models", "expected_uuid": "0e0a0f2e-1111-2222-3333-444455556666", "filesystem": "ext4"},
+        "gateway": {"connect_timeout_seconds": 5, "pool_timeout_seconds": 5, "read_idle_timeout_seconds": 60, "write_idle_timeout_seconds": 60, "inference_timeout_seconds": 900, "close_timeout_seconds": 5, "max_response_body_bytes": 16777216, "max_sse_event_bytes": 1048576},
+        "control": {"allowed_uids": [1000]},
+        "blobs": {"root": "/home/jtzn/self-model-switch-blobs"},
+    }
+
+
+def test_lab_render_writes_dynamic_scheduler_swap_and_runner_artifacts(tmp_path) -> None:
+    source = tmp_path / "scheduler-v2.json"
+    source.write_text(json.dumps(lab_v2_config()), encoding="utf-8")
+    output = tmp_path / "lab"
+
+    manifest = render_lab(source, output, deployment_id="lab-orin", container_runtime="nvidia")
+
+    assert manifest["mode"] == "lab"
+    assert manifest["lab_only"] is True
+    assert manifest["deployment_id"] == "lab-orin"
+    assert manifest["config_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    entry = manifest["models"]["qwen25vl-7b-q4"]
+    assert entry["container_name"] == "sms-lab-orin-qwen25vl-7b-q4"
+    assert entry["registered_port"] == 18081
+    assert "--runtime=nvidia" in entry["argv"]
+    assert entry["argv_sha256"] == hashlib.sha256("\x00".join(entry["argv"]).encode("utf-8")).hexdigest()
+    assert entry["image_digest"].startswith("sms-llama-cpp@sha256:")
+    assert entry["runtime_id"] == "llama-cpp-cuda-sm87-4bc272f"
+    assert entry["profile_id"] == "llama-cpp-gguf-v1"
+    assert entry["measured"] is False
+
+    assert (output / "manifest.json").is_file()
+    assert (output / "scheduler-v2.json").is_file()
+    swap = (output / "llama-swap.yaml").read_text(encoding="utf-8")
+    assert "${PORT}" in swap
+    assert "sms-lab-orin-qwen25vl-7b-q4" in swap
+
+    with pytest.raises(DeployError, match="empty"):
+        render_lab(source, output, deployment_id="lab-orin", container_runtime="nvidia")
+
+
+def test_lab_render_refuses_production_mode_and_unmeasured_production_branch(tmp_path) -> None:
+    source = tmp_path / "scheduler-v2.json"
+    source.write_text(json.dumps(lab_v2_config()), encoding="utf-8")
+
+    with pytest.raises(DeployError, match="lab"):
+        render_lab(source, tmp_path / "out", deployment_id="lab-orin", container_runtime="nvidia", mode="production")
+
+
+def test_lab_manifest_binds_the_config_and_serves_the_rendered_argv(tmp_path) -> None:
+    from model_scheduler.runtime import load_lab_manifest, lab_launch_argv
+
+    source = tmp_path / "scheduler-v2.json"
+    source.write_text(json.dumps(lab_v2_config()), encoding="utf-8")
+    output = tmp_path / "lab"
+    render_lab(source, output, deployment_id="lab-orin", container_runtime="nvidia")
+
+    manifest = load_lab_manifest(output / "manifest.json", config_path=source)
+    assert lab_launch_argv(manifest, "qwen25vl-7b-q4")[0] == "docker"
+
+    tampered = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    tampered["config_sha256"] = "f" * 64
+    broken = tmp_path / "broken.json"
+    broken.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(DeployError, match="config"):
+        load_lab_manifest(broken, config_path=source)
+
+
+def test_lab_runner_requires_the_manifest_budget_and_contract(tmp_path, monkeypatch) -> None:
+    import importlib.util
+
+    module_path = Path(__file__).resolve().parent.parent / "deploy" / "model-runner.py"
+    spec = importlib.util.spec_from_file_location("deploy_model_runner_lab", module_path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+
+    source = tmp_path / "scheduler-v2.json"
+    source.write_text(json.dumps(lab_v2_config()), encoding="utf-8")
+    output = tmp_path / "lab"
+    render_lab(source, output, deployment_id="lab-orin", container_runtime="nvidia")
+
+    executed: list[list[str]] = []
+    monkeypatch.setattr(runner, "_lab_exec", lambda argv, budget, manifest: executed.append(argv) or 0)
+
+    assert runner.main(["start", "qwen25vl-7b-q4", "--lab-manifest", str(output / "manifest.json"), "--temporary-budget-bytes", "16000000000"]) == 0
+    assert executed and executed[0][0] == "docker"
+
+    with pytest.raises(SystemExit):  # a lab start without a temporary budget is refused
+        runner.main(["start", "qwen25vl-7b-q4", "--lab-manifest", str(output / "manifest.json")])
+    with pytest.raises(SystemExit):  # the legacy entry still refuses a model outside the fixed set
+        runner.main(["start", "dynamic-model"])
+
+
 
 
 def input_data(measured: bool = False) -> dict:

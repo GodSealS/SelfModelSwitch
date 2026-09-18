@@ -1,6 +1,8 @@
 """Deterministic deployment-input validation and manifest rendering."""
 from __future__ import annotations
 
+import shlex
+
 import argparse
 from datetime import datetime
 import hashlib
@@ -15,8 +17,10 @@ from typing import Any
 
 import yaml
 
-from .config import ConfigError, load_config
+from .config import AppConfigV2, ConfigError, load_config
+from .contracts_v2 import ContractError, DeploymentSpec, deployment_digest
 from .migration_v2 import MissingInventory, MigrationError, migrate_v2
+from .runtime_profiles import LaunchRenderError, render_container_launch
 from .storage_monitor import StorageMonitor
 
 
@@ -266,6 +270,89 @@ def render(source: str | Path, mode: str, output: str | Path) -> dict[str, Any]:
     return manifest
 
 
+def render_lab(
+    config_path: str | Path,
+    output: str | Path,
+    *,
+    deployment_id: str,
+    container_runtime: str,
+    mode: str = "lab",
+) -> dict[str, Any]:
+    """Render the isolated lab deployment for one schema-v2 configuration (P06b).
+
+    The lab manifest binds the configuration digest, every registered runtime
+    profile and asset to the argv the P06 renderer produces; its digest is a test
+    instance identity, never a production candidate. Production rendering for
+    schema v2 arrives with P26.
+    """
+    if mode != "lab":
+        raise DeployError("schema v2 production rendering is not available; lab mode only until P26")
+    source, destination = Path(config_path), Path(output)
+    try:
+        config_bytes = source.read_bytes()
+        config = load_config(source)
+    except (ConfigError, OSError) as exc:
+        raise DeployError(f"cannot read the schema-v2 configuration: {exc}") from exc
+    if not isinstance(config, AppConfigV2):
+        raise DeployError("the lab renderer requires a schema_version=2 configuration")
+    if destination.exists() and any(destination.iterdir()):
+        raise DeployError("output directory must be empty")
+    deployment = DeploymentSpec(runtimes=tuple(config.runtimes.values()), models=tuple(config.models.values()))
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "lab",
+        "lab_only": True,
+        "deployment_id": deployment_id,
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "registration_digest": deployment_digest(deployment),
+        "container_runtime": container_runtime,
+        "storage": {"mount_path": str(config.storage.mount_path), "model_directory": str(config.storage.model_directory)},
+        "runtimes": {
+            runtime_id: {"profile_id": runtime.profile_id, "image_digest": runtime.image_digest}
+            for runtime_id, runtime in config.runtimes.items()
+        },
+        "models": {},
+    }
+    swap_models: dict[str, Any] = {}
+    for model_id in sorted(config.models):
+        model = config.models[model_id]
+        try:
+            launch = render_container_launch(
+                deployment,
+                model_id,
+                deployment_id=deployment_id,
+                model_directory=config.storage.model_directory,
+                config_sha256=manifest["config_sha256"],
+                mode="lab",
+                container_runtime=container_runtime,
+                temporary_budget_bytes=model.reserved_bytes,
+            )
+        except (LaunchRenderError, ContractError) as exc:
+            raise DeployError(f"cannot render the lab launch for {model_id!r}: {exc}") from exc
+        probe_argv = [token.replace(f"127.0.0.1:{model.port}:", "127.0.0.1:${PORT}:") for token in launch.argv]
+        manifest["models"][model_id] = {
+            "container_name": launch.container_name,
+            "registered_port": model.port,
+            "argv": list(launch.argv),
+            "argv_sha256": hashlib.sha256("\x00".join(launch.argv).encode("utf-8")).hexdigest(),
+            "probe_argv": probe_argv,
+            "image_digest": launch.image_digest,
+            "runtime_id": launch.runtime_id,
+            "profile_id": launch.profile_id,
+            "measured": model.measured,
+            "assets": [{"role": asset.role, "path": asset.path, "sha256": asset.sha256} for asset in model.assets],
+        }
+        swap_models[model_id] = {"cmd": " ".join(shlex.quote(token) for token in probe_argv)}
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (destination / "scheduler-v2.json").write_bytes(config_bytes)
+    (destination / "llama-swap.yaml").write_text(
+        yaml.safe_dump({"healthCheckTimeout": 900, "logLevel": "info", "models": swap_models}, sort_keys=False),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def _read_hardware_identity(device_tree_root: Path = Path("/proc/device-tree")) -> dict[str, Any]:
     try:
         model_parts = [part.decode("utf-8") for part in (device_tree_root / "model").read_bytes().split(b"\0") if part]
@@ -378,14 +465,21 @@ def migrate(source: str | Path, output: str | Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(); sub = parser.add_subparsers(dest="command", required=True)
-    render_parser = sub.add_parser("render"); render_parser.add_argument("--input", required=True); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True)
+    render_parser = sub.add_parser("render"); render_parser.add_argument("--input"); render_parser.add_argument("--config"); render_parser.add_argument("--mode", choices=("lab", "production"), required=True); render_parser.add_argument("--output", required=True); render_parser.add_argument("--deployment-id", dest="deployment_id"); render_parser.add_argument("--container-runtime", default="nvidia", dest="container_runtime")
     preflight_parser = sub.add_parser("preflight"); preflight_parser.add_argument("--manifest", required=True)
     collect_parser = sub.add_parser("collect"); collect_parser.add_argument("--output", required=True)
     migrate_parser = sub.add_parser("migrate"); migrate_parser.add_argument("--input", required=True); migrate_parser.add_argument("--output", required=True)
     migrate_v2_parser = sub.add_parser("migrate-v2"); migrate_v2_parser.add_argument("--input", required=True); migrate_v2_parser.add_argument("--inventory", required=True); migrate_v2_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "render":
+        if args.command == "render" and args.config:
+            if not args.deployment_id:
+                raise DeployError("--deployment-id is required when rendering a schema-v2 configuration")
+            manifest = render_lab(args.config, args.output, deployment_id=args.deployment_id, container_runtime=args.container_runtime, mode=args.mode)
+            print(json.dumps({"ok": True, "output": args.output, "mode": manifest["mode"], "models": sorted(manifest["models"])}, sort_keys=True))
+        elif args.command == "render":
+            if not args.input:
+                raise DeployError("--input is required when rendering a legacy deployment input")
             render(args.input, args.mode, args.output)
         elif args.command == "preflight":
             print(json.dumps(preflight(args.manifest), sort_keys=True))
