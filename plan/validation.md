@@ -363,3 +363,48 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 未执行：真实模型的峰值测量、最大组合输入、真机内存门槛验收（P20 以后）；本任务不产生任何性能结论。
 - `scheduler.py`/`eviction_policy.py` 仍读 `book.specs` 的 v1 字段；v2 登记接线时需迁移（P14/P16）。
 - 低 F "触发清理"与 10s 重采样的调度动作由 P09/P10 接线。
+
+## P09 记录（2026-09-18）
+
+范围：把 C04 独占会话接入单一调度权威（同一把锁决定交互与会话授予、单一 worker 串行执行生命周期 IO），并补齐队列的会话 waiter 与重试语义。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P09 |
+| status | complete |
+| source_commit | `f55faf5efdfb1b9c35395f246f866f11d5569821`（P08 记录提交，起点） |
+| implementation_commit | `58ab00cae23e967466ec33e6a7320b89e96dc03f` |
+| target_commit | `58ab00cae23e967466ec33e6a7320b89e96dc03f`（fast-forward，工作区为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：三条验收由开发机与目标机测试支撑（软件层 S）。**不**产生 `software_verified` / `device_backend_ready`。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_sessions.py tests/test_queue.py tests/test_scheduler_lifecycle.py -q`（实现前） | 4 | 新模块/新 API 不存在（`session_manager`、`WaitKind`、`requeue`），即 RED |
+| 同上（实现后，开发机） | 0 | `52 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `457 passed, 1 deselected`（P08 基线 436） |
+| `ruff check .` / `run.py --check-config`（开发机） | 0 | 通过 / 旧四 ID |
+| 三个测试文件（目标机 `58ab00c`） | 0 | `52 passed` |
+| `pytest tests -m 'not thor' -q`（目标机） | 1 | `454 passed, 3 failed`（仍为 `tests/test_release.py` 的 `.venv/bin/python` 环境假设，P28） |
+
+### 3. 关键事实
+
+- 会话期限全部来自配置：`wait≤1800s`、`prepare≤900s`、`hard deadline` 为上限，heartbeat 只刷新 30s soft TTL。
+- 一个 worker 串行执行所有会话生命周期 IO，且都在锁外；`status()` 在等待/加载期间仍可读。
+- drain 永不 revoke lease；超时只让步（撤销冻结、保留 waiter、30s 重试，队列 sequence 与 deadline 不变）。
+- 只有确认 STOPPED 才 CLOSED 并释放预算；未确认则 BLOCKED 且每 5s reconcile。
+- pinned/preload 与独占会话冲突时直接拒绝，不修改登记。
+- 时钟统一注入（默认 `time.monotonic`），测试用 fake clock + 有界状态轮询，不依赖长 sleep。
+
+### 4. 未执行 / 未解决
+
+- 未执行：HTTP 状态码映射（P18）、execution/cancel 与 blob 传输（P14）、真机模型加载与会话时长验收（P29 以后）。
+- `/health` 在会话等待期间仍需 P18 证明 200；本任务只保证调度器不阻塞其判据。
+- 会话记录在进程重启后不恢复（随机 boot_id 失效）：由 P10/P13 的重启语义确认。

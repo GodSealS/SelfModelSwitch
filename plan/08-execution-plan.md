@@ -846,10 +846,34 @@ v2 登记的 `reserved_bytes` 已是 R（`ceil(peak*1.15)`）原样使用，v1 l
 **Description:** 将会话队列、冻结、drain、加载和槽管理接入同一调度权威。
 **Files likely touched:** `model_scheduler/session_manager.py`（新增）、`model_scheduler/scheduler.py`、`model_scheduler/request_queue.py`、`tests/test_sessions.py`（新增）、`tests/test_queue.py`。
 **Acceptance criteria:**
-- [ ] preparing phase/优先级aging/128容量/1800s/30s退让符合C04，重试不刷新序列和截止。
-- [ ] 同锁决定交互与session授予；持有交互lease不会被杀；pinned/preload冲突409；等待繁忙health仍200。
-- [ ] 生命周期IO串行且锁外；推理槽按max_parallel；两个客户端竞争不能同时ACTIVE。
+- [x] preparing phase/优先级aging/128容量/1800s/30s退让符合C04，重试不刷新序列和截止。
+- [x] 同锁决定交互与session授予；持有交互lease不会被杀；pinned/preload冲突409；等待繁忙health仍200。
+- [x] 生命周期IO串行且锁外；推理槽按max_parallel；两个客户端竞争不能同时ACTIVE。
 **Verification:** `python -m pytest tests/test_sessions.py tests/test_queue.py tests/test_scheduler_lifecycle.py -q`；用fake clock和barrier重现竞争，不靠sleep碰运气。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `f55faf5`（P08 记录提交）；实现提交 `58ab00c`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
+`pytest tests/test_sessions.py tests/test_queue.py tests/test_scheduler_lifecycle.py -q` = 52 passed（实现前新文件/新 API 不存在，即 RED）；
+`pytest tests -m 'not thor' -q` = 457 passed, 1 deselected（P08 基线 436）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增 `session_manager.SessionManager`（纯同步状态机，时间与队列由调用方传入）：PREPARING/ACTIVE/DRAINING/CLOSED/BLOCKED；
+`create` 取 `wait_deadline=min(now+1800, now+hard)`、`prepare_deadline=min(now+900, now+hard)`、`hard_deadline=now+hard`，并以 `WaitKind.SESSION` 进入同一队列；
+`heartbeat` 只刷新 soft TTL（`expires_at=min(hard, activity+30s)`，永不延长 hard）；`mark_active` 在已有 ACTIVE 时抛 `SessionConflict`（两个客户端不可能同时 ACTIVE）；
+`yield_prepare` 置 `retry_at=now+30s` 且保持 PREPARING；`mark_blocked` 保留记录与槽位、`reconcile_at=now+5s`；`mark_closed` 幂等且是唯一释放槽位的相位；
+`candidate()` 要求无任何持有者（ACTIVE/DRAINING/BLOCKED）且未过准备/等待/hard 期限；`view()` 输出 phase、in_flight、soft/hard 剩余。
+`request_queue` 增加 `WaitKind`、`requeue()`（重试不刷新 sequence/enqueued_at/deadline，只回到 WAITING）与按 kind 过滤的 `head/is_head`；C04 的 `(-priority-floor(wait/30), sequence)` 键对两类 waiter 一致。
+`scheduler` 把交互与会话授予放在同一把 condition 下决定，并新增单一 `_run_session_lifecycle()` worker：所有 load/drain/stop IO 都在锁外、串行执行；
+`open_session/heartbeat_session/close_session/session_view` 是控制 API 的入口（P17/P18 映射 HTTP）；
+授予流程为"冻结交互准入 → 等已有 lease 自然结束（≤30s，绝不 revoke）→ 停其他模型确认 → 加载目标 → ACTIVE"，
+drain 超时则撤销冻结、保留 waiter、30s 后重试；关闭/到期走同一清理路径（取消执行等 10s、stop grace 30s、总 60s），
+未确认则 BLOCKED 并每 5s 重试，只有确认 STOPPED 才 CLOSED 并释放预算；`acquire(..., session_id=…)` 只接受 ACTIVE 会话且按 ledger 的 `max_concurrency` 限槽（槽满立即拒绝），
+`_exclusive_conflict()` 对任何 pinned/preload 登记直接拒绝（不暗中删配置）；`shutdown()` 会把未结束会话置 DRAINING 后交同一 worker 清理；
+`status()` 增加 `sessions`（active_id/frozen/pending views），等待期间不持锁。
+测试用 fake clock + 有界状态轮询（0.01s，最多 3s）断言：会话独占与停其他模型、持有 lease 不被杀 + drain 超时让步且队列位置不变、
+两客户端竞争只有一个 ACTIVE、推理槽按 max_parallel、pinned/preload 拒绝、等待期间 status 可用、stop 未确认 BLOCKED 保预算并 5s 后 reconcile 清账。
+**目标核验**：干净 checkout fast-forward 到 `58ab00c`；P09 三个测试文件 52 passed；全量 454 passed、3 failed（仍是 `tests/test_release.py` 的 `.venv/bin/python` 环境假设，P28 范围）。
+未解决：①`/health` 与 409/503 状态码映射属 HTTP 层（P18），本任务只交付调度器判据与 `SessionConflict/ModelUnavailable`；
+②会话的 execution/cancel 协议与 blob 传输在 P14，本任务只把槽位、lease 归属与生命周期清理打通；
+③为让时钟可注入，`scheduler` 内部"当前时间"统一改用注入 `clock`（默认仍是 `time.monotonic`，生产行为不变）。到 K2。
 
 ### P10 — TTL、关闭、取消与Fence清账（M03）
 
