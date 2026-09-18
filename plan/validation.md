@@ -453,3 +453,46 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - `health503`（BLOCKED 时）与 409/410 状态码映射属 P18 的 HTTP 层；本任务交付调度器判据与 `SessionConflict`/`ModelUnavailable`。
 - execution 级 attempt 与终止证据由 P14 使用同一 `writeback_decision` 与 `TerminationEvidence`。
 - 本任务触碰 8 个文件（多出 `control_protocol_v1.py`、`tests/test_control_protocol_v1.py`、`tests/test_registry.py`），超出"约 5 个"，理由见 08-execution-plan 记录。
+
+## P11 记录（2026-09-18）
+
+范围：可独立验证的 BlobStore 端口（C07 owner/配额/文件规则、原子发布、已核验 fd 读取、租约与过期）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P11 |
+| status | complete |
+| source_commit | `e0e29efef1f9e720b8608fb78abe200f7910c83f`（P10 记录提交，起点） |
+| implementation_commit | `8cdea75ee5312fddc119e9da09ec034b5035aaa5` |
+| target_commit | `8cdea75ee5312fddc119e9da09ec034b5035aaa5`（fast-forward，工作区为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：三条验收由开发机与目标机测试支撑（软件层 S）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_blobs.py tests/test_blob_paths.py -q`（实现前） | 4 | 新模块不存在，即 RED |
+| 同上（实现后，开发机） | 0 | `15 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `495 passed, 1 deselected`（P10 基线 480） |
+| `ruff check .`（开发机） | 0 | 通过 |
+| 同上（目标机 `8cdea75`） | 0 | `15 passed` |
+
+### 3. 关键事实
+
+- 配额是"已发布+暂存+预留"在一个 `BEGIN IMMEDIATE` 事务里的原子判断；并发上传不能各自读配额后超卖。
+- 上传逐块 hash、`O_EXCL|O_NOFOLLOW` 独占暂存、一次 `os.replace` 发布；任何失败都删除暂存并归还配额。
+- 读取先 fstat + 全量重算 hash 再吐字节；换文件/符号链接/FIFO 一律 unreadable，且会标记 corrupt。
+- 目录/文件全部 no-follow；标识符只允许服务生成的严格 ID。
+- 租约期内 DELETE 409；过期后新引用 410；活跃租约在过期后继续保护文件。
+- SQLite 用 `to_thread` + 线程锁，事务不阻塞事件循环（含阻塞事务期间的循环推进测试）。
+
+### 4. 未执行 / 未解决
+
+- 崩溃点恢复日志、启动 GC 与未完成上传隔离属 P12；HTTP 路由与 peer 身份属 P17/P18；配额覆盖进入 candidate 摘要属 P26/P27。
+- macOS 上 `O_NOFOLLOW`/`O_DIRECTORY` 语义与 Linux 一致的部分已覆盖；ext4 上的同一套测试在目标机通过。

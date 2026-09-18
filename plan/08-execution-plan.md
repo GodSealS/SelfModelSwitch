@@ -911,10 +911,31 @@ Fence 与幂等：`control_protocol_v1.writeback_decision()` 是唯一写回判�
 **Description:** 先交付可独立验证的BlobStore端口，应用C07 owner、配额和文件规则。
 **Files likely touched:** `model_scheduler/blob_store.py`、`model_scheduler/blob_metadata.py`、`tests/test_blobs.py`、`tests/test_blob_paths.py`（均新增）。
 **Acceptance criteria:**
-- [ ] 边接收边hash、原子发布、owner隔离；已发布+临时+预留统一原子计费，超限不残留可读半成品。
-- [ ] GET在已核验fd读取，DELETE持有时409；过期410；文件全部父目录no-follow、拒绝TOCTOU换文件。
-- [ ] SQLite事务不阻塞事件循环；cancel/disconnect中止上传并回收临时配额。
+- [x] 边接收边hash、原子发布、owner隔离；已发布+临时+预留统一原子计费，超限不残留可读半成品。
+- [x] GET在已核验fd读取，DELETE持有时409；过期410；文件全部父目录no-follow、拒绝TOCTOU换文件。
+- [x] SQLite事务不阻塞事件循环；cancel/disconnect中止上传并回收临时配额。
 **Verification:** `python -m pytest tests/test_blobs.py tests/test_blob_paths.py -q`；并发两次写入刚好越配额、checksum错、chunked超限、owner伪造。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `e0e29ef`（P10 记录提交）；实现提交 `8cdea75`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
+`pytest tests/test_blobs.py tests/test_blob_paths.py -q` = 15 passed（新文件，先 RED）；
+`pytest tests -m 'not thor' -q` = 495 passed, 1 deselected（P10 基线 480）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增 `blob_metadata.BlobMetadata`：单表 `blobs(blob_id/owner/sha256/size_bytes/media_type/state/created_at/expires_at/path)` + `leases`；
+状态机 reserved→staging→published→deleted(tombstone)/corrupt；`reserve()` 在一个 `BEGIN IMMEDIATE` 事务内按 owner/全局配额与磁盘余量原子检查（失败回滚，不留半成品），
+`publish()` 一个事务完成元数据发布，`delete()` 在有 lease 时返回 held（409）、同 owner 重复删除返回 deleted（204，幂等），
+`expire()` 只清理已过期且无 lease 的行（活跃租约继续保护文件），`purge_tombstones()` 清理 tombstone，`mark_corrupt()` 使 hash 错配的 blob 不可读。
+新增 `blob_store.BlobStore`：上传逐块 sha256、`O_EXCL|O_NOFOLLOW` 独占暂存文件、fsync 后一次 `os.replace` 原子发布；
+目录与文件全部 `O_NOFOLLOW`（owner 目录、staging、发布文件），标识符只接受服务生成的严格 ID（拒绝 `..`/绝对路径/逃逸）；
+读取前用 fd 自身 fstat 校验 regular file 与已发布 size，并对 fd 全量重算 hash 与元数据比对，任何不一致 → 标记 corrupt 且不吐一个字节；
+`lease()` 期间禁止删除（409），过期后新引用 410；所有 SQLite 调用经 `asyncio.to_thread` 且连接 `check_same_thread=False` + 锁串行；
+上传失败/取消/异常（含 checksum 错、超限、断线）都会删除暂存文件并 `abort()` 归还临时配额；
+`verify_published()` 为重启重新校验提供入口（返回 ok/unreadable）。
+测试：边收边 hash 与原子发布、checksum 错与超限不留可读残留且配额归零、两个并发上传不能各自读配额然后超卖（一个 published 一个 quota_exceeded）、
+owner 隔离与跨 owner 删除为 missing、lease 期间 DELETE 409 且释放后可 204 幂等、过期 410 与活跃租约保护、阻塞事务期间事件循环仍在推进、
+取消上传归还预留；路径测试覆盖 `..`/绝对路径、符号链接 owner 目录与 blob 文件、同长度换文件（TOCTOU）、FIFO 非 regular、暂存独占（重复 blob_id 拒绝）。
+**目标核验**：干净 checkout fast-forward 到 `8cdea75`；`tests/test_blobs.py tests/test_blob_paths.py -q` = 15 passed（Linux ext4 上同样通过）。
+未解决：①恢复日志（文件已 rename 但事务未提交、事务已提交但文件丢失两个崩溃点）与启动 GC/隔离清理属 P12；
+②`POST/GET/DELETE /internal/blobs` 的 HTTP 路由与 peer UID 身份属 P17/P18；③配额/余量的部署覆盖字段进入 candidate 摘要是 P26/P27。
 
 ### P12 — Blob重启恢复与执行输出提交（M04）
 
