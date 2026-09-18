@@ -579,6 +579,53 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 - peer credential 注入与 HTTP 错误码映射（P17/P18）；token/幂等接入 session/execution 路由（P14/P18）。
 
+## P14 记录（2026-09-18）
+
+范围：把 session 授权、Blob 读取租约、每 session execution 队列与输出发布接成通用执行纵向切片（服务层，无 HTTP，fake BackendPort 验证）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P14 |
+| status | software_only |
+| source_commit | `f149d37`（P15 目标结果记录提交，起点） |
+| implementation_commit | `c512fcde6c47c9eab03dd6df1e64e29f78c26752` |
+| target_commit | 未复验：开发机与目标机对 github.com:443 连接超时，`c512fcd` 未推送，目标机未同步（AGENTS 禁止 SSH 拷贝绕过共享远端） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`，本轮开发机无 3.12 解释器）/ 3.12.14（目标 lab venv，待复验） |
+| evidence_directory | 无新目录；目标机未运行本轮测试 |
+
+判定 `software_only`：三条验收由开发机 20 项新测试与全量回归支撑；真机复验因网络中断挂起，不宣称设备/远端证据。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_executions.py -q`（实现前） | 4 | 新模块不存在，收集 ImportError，即 RED |
+| `pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q`（实现后，开发机） | 0 | `35 passed`（计划验证命令；test_executions 单独 `20 passed`，重复 3 次无抖动） |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `556 passed, 1 deselected`（P15 基线 536） |
+| `ruff check .`（开发机） | 0 | 通过 |
+| `python run.py --check-config` | 0 | 仍为 v1 四 ID，运行行为未变 |
+| `git push origin main` | 128 | `Failed to connect to github.com port 443`；目标机同测亦超时 |
+
+### 3. 关键事实
+
+- 队列：每 session FIFO（容量常量 128，`queue_full` 拒绝），等待 deadline=`min(enqueue+1800s, session hard deadline)`，到期/关闭的未派发执行以 `not_started` 证据原地终结，视图无容器身份（`dispatch_state=not_started, instance=null`）。
+- 授权：submit 仅 ACTIVE 且 live；token（P13）先验、幂等 `execution.create` 重放返回对象现态、不同 payload 409、并发 `busy`、被拒的创建释放 key；owner 与 BlobRef owner 不符按 404 形拒绝；blob owner 目录安全映射 `uid:1000`→`uid-1000` 为本层唯一约定。
+- dispatch 重验：会话、能力（v1 登记集合）、canonical 字节上限、generation（fence 随 lease 重签，旧代证据必被拒）；一个 execution 恰一个 `scheduler.acquire` lease（`session_slots_exhausted` 保持队位重试）与恰一个 `blobs.lease` 读保护（执行中 delete 返回 held，终结后 deleted）；输出先 `reserve_output` 上限后派发。
+- 终结：succeeded=发布成功 ∧ `writeback_decision` 接受的 `TerminationEvidence`（两半任意顺序；terminal 无结果不假成功；结果无 terminal 不发布）；取消/超时/后端异常 → `cancelling` 持 lease 等证据，无证据不伪造 terminal（会话因此 BLOCKED 是 P10 既有语义）；晚到输出只清理（P12 cancelled 预留）；失败/取消的预留进 `pending_cleanup`，`abandon_output` 成功才移除。
+- 回写：唯一判据 `writeback_decision`；拒绝事件 `writeback_rejected` 携带原 fence；重复终结为幂等 no-op（不重复发布、`total_requests` 不增）。
+- 调度器：新增 `execution_hook`（close/到期/shutdown 在锁外通知，无第二把权威）；服务对调度器的调用只走 `acquire/release/cancel/session` 公开口；`session_manager.py` 未改动。
+- 视图由 `cp.parse_execution_view` 出关校验；"非 terminal 不得带 error"（P02）由 `terminal_code/terminal_message` 在结算时物化实现。
+
+### 4. 未执行 / 未解决
+
+- 推送与目标机复验：网络恢复后按 AGENTS 步骤 4/5 补做（当前两机 443 均超时）。
+- HTTP 路由、`SO_PEERCRED`→owner 注入、`ExecutionError.code`→状态码映射（P17/P18）；`NotDispatched`/晚到 handle 与真实 adapter、observer、账本的完整接线及 StopAck 后不释放（P16）。
+- `book.specs` v1 字段 → v2 登记迁移（P14/P16 遗留说明随 v2 接线处理）。
+- `storage_lost`/重启下的在途执行结算语义由 P16 重放场景确认（当前 fail-closed 预留与 lease 不提前清账）。
+
 ## P15 记录（2026-09-18）
 
 范围：第一个真实 llama.cpp GGUF adapter（C06 输入计数、输出有限值、禁止重定向、HTTP 完成不等于设备静止）。P15 依赖 P06/P03，不依赖未完成的 P14。

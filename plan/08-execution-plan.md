@@ -1005,10 +1005,27 @@ claims 固定为 `boot_id/owner/model_id/session_id/execution_id/expires_at` 的
 **Description:** 把session授权、Blob读取租约、队列和输出发布组成通用执行纵向切片。
 **Files likely touched:** `model_scheduler/execution_service.py`（新增）、`model_scheduler/session_manager.py`、`model_scheduler/scheduler.py`、`tests/test_executions.py`（新增）。
 **Acceptance criteria:**
-- [ ] 每session execution队列容量128，等待deadline=min(enqueue+1800s,session hard deadline)，未dispatch取消无需假身份。
-- [ ] 只有ACTIVE可submit；dispatch前再验Fence/envelope/槽/资源；只获得一个lease、一个Blob引用保护。
-- [ ] succeeded须结果发布和可信terminal同时具备；cancel/超时后晚到输出不发布，失败保留清理跟踪。
+- [x] 每session execution队列容量128，等待deadline=min(enqueue+1800s,session hard deadline)，未dispatch取消无需假身份。
+- [x] 只有ACTIVE可submit；dispatch前再验Fence/envelope/槽/资源；只获得一个lease、一个Blob引用保护。
+- [x] succeeded须结果发布和可信terminal同时具备；cancel/超时后晚到输出不发布，失败保留清理跟踪。
 **Verification:** `python -m pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q`；fake BackendPort做乱序/重复回调测试。
+
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `f149d37`（P15 目标结果记录提交）；实现提交 `c512fcde6c47c9eab03dd6df1e64e29f78c26752`；
+python=3.13.5（开发机 `.venv`，本轮开发机上无 3.12 解释器，如实记录）/3.12.14（目标 lab venv，待复验）。
+`pytest tests/test_executions.py tests/test_sessions.py tests/test_cancellation.py -q` = 35 passed（实现前新模块不存在，收集 ImportError，即 RED）；
+`pytest tests/test_executions.py -q` = 20 passed；`pytest tests -m 'not thor' -q` = 556 passed, 1 deselected（P15 基线 536）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增 `model_scheduler/execution_service.py`：`ExecutionService` 把 P10 会话授权、P11/P12 Blob 端口、P13 身份与幂等接成通用执行纵向切片。
+每 session 一个 FIFO 队列（容量 `EXECUTION_QUEUE_CAPACITY=128`，满则 `queue_full`），等待 deadline=`min(enqueue+1800s, session hard deadline)`；只有 ACTIVE 且 live 可 submit（先 token/幂等/归属，后退避期与容量校验）。
+dispatch 前重验会话、能力、协议字节上限与 generation（fence 随 lease 重签），经 `scheduler.acquire(session_id=…)` 只取一个 lease、Blob 输入只开一个 `blobs.lease` 读保护、输出先 `reserve_output` 登记上限；
+succeeded 必须"发布成功 + `writeback_decision` 接受的 `TerminationEvidence`"同时成立（两半任意顺序，缺一不结算）；未 dispatch 的取消/排队过期用 `not_started` 证据直接终结、不携带容器身份；
+已 dispatch 的取消/超时/后端异常进入 `cancelling` 持有 lease 等证据（不伪造 terminal），晚到输出丢弃不发布，失败/取消的输出预留留在 `pending_cleanup` 直到 `abandon_output` 完成。
+回写以 `writeback_decision` 为唯一判据：旧 boot/generation/operation、foreign execution、attempt 回退全部拒绝且无副作用，重复终结为幂等 no-op（不重复发布/释放）。
+`NotDispatched` 为 adapter"证明未送达后端"的显式断言；P02 规则"非 terminal 视图不得带 error"由 `terminal_code/terminal_message` 延迟物化实现。
+`scheduler.py` 新增 `execution_hook`：`close_session`/到期/`shutdown` 在锁外通知服务，排队执行原地取消、已派发执行走取消-等证据路径（会话清理不再被饿死）；`session_manager.py` 未改（授权判据已足够）。
+**Files touched:** `model_scheduler/execution_service.py`（新增）、`model_scheduler/scheduler.py`、`tests/test_executions.py`（新增），共 3 个（计划 4 个，`session_manager.py` 无需改）。
+**推送/目标复验：** 本轮开发机与目标机对 github.com:443 均连接超时，`c512fcd` 未能推送、目标机未能 fast-forward 复验；不做 SSH 拷贝绕过共享远端。网络恢复后补推并按 AGENTS 步骤 5 同步复验。
+未解决：①HTTP 路由、peer UID 注入与错误码映射（P17/P18）；②真实 adapter/observer 走同一账本的完整接线与 StopAck 后容器仍活不释放（P16，`NotDispatched`/晚到 handle 在此接线）；
+③`scheduler/eviction_policy` 读 v1 `book.specs` 字段的 v2 迁移（P14/P16 遗留，随 v2 登记接线处理）；④`storage_lost`/重启下在途执行的结算由 P16 重放语义确认（当前 fail-closed：预留与 lease 不提前清账）。
 
 ### P15 — llama.cpp能力adapter与可信终结（M04）
 
