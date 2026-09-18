@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 import pytest
 
@@ -123,13 +125,13 @@ def test_chat_acquires_and_releases_lease_after_valid_direct_response() -> None:
     assert response.headers["x-request-id"]
 
 
-def test_chat_rejects_capability_before_acquiring_lease() -> None:
+def test_chat_rejects_capability_with_422_before_acquiring_lease() -> None:
     scheduler = Scheduler()
     app = create_app(scheduler=scheduler, gateway=Gateway())
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json={"model": "embedding", "messages": []})
 
-    assert response.status_code == 400
+    assert response.status_code == 422  # plan/03-api.md §1: capability mismatch is 422
     assert response.json()["error"]["code"] == "unsupported_capability"
     assert scheduler.releases == []
 
@@ -281,3 +283,52 @@ async def test_json_body_limit_stops_reading_after_an_oversized_chunk_without_co
         await _read_json(Request(scope, receive), max_bytes=8, timeout_seconds=1)
     assert error.value.code == "request_too_large"
     assert calls == 1
+
+
+def _load_v2_config(tmp_path: Path):
+    """The shared v2 test registration, loaded through the same YAML the config tests pin."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sms_v2_config", Path(__file__).resolve().parent / "test_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "config.yaml"
+    path.write_text(module.V2, encoding="utf-8")
+    from model_scheduler.config import load_config
+
+    return load_config(path)
+
+
+def test_a_v2_registration_drives_the_same_chat_surface(tmp_path) -> None:
+    config = _load_v2_config(tmp_path)
+    scheduler = Scheduler()
+    app = create_app(config=config, scheduler=scheduler, gateway=Gateway())
+
+    with TestClient(app) as client:
+        unknown = client.post("/v1/chat/completions", json={"model": "missing", "messages": []})
+        mismatch = client.post("/v1/chat/completions", json={"model": "embedding", "messages": []})
+        accepted = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+
+    assert unknown.status_code == 404 and unknown.json()["error"]["code"] == "model_not_found"
+    assert mismatch.status_code == 422 and mismatch.json()["error"]["code"] == "unsupported_capability"
+    assert accepted.status_code == 200 and scheduler.releases == [Outcome.SUCCESS]
+
+
+def test_the_legacy_chat_body_still_passes_unknown_fields_through() -> None:
+    seen: dict = {}
+
+    class RecordingGateway:
+        async def open(self, lease, capability, payload, deadline):
+            seen.update(payload)
+            return Opened()
+
+    app = create_app(scheduler=Scheduler(), gateway=RecordingGateway())
+    payload = {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}],
+               "temperature": 0.3, "custom_extension": {"nested": [1, 2]}}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert seen["temperature"] == 0.3  # C05's strict unknown-field rule belongs to /internal only
+    assert seen["custom_extension"] == {"nested": [1, 2]}

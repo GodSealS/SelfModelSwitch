@@ -104,3 +104,15 @@ def test_rerank_rejects_duplicate_or_non_integer_upstream_indexes() -> None:
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "upstream_protocol_error"
     assert scheduler.outcomes == [Outcome.ABORTED]
+
+
+def test_capability_mismatch_on_the_json_routes_is_422() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=Gateway())) as client:
+        embeddings = client.post("/v1/embeddings", json={"model": "qwen-small", "input": "hello"})
+        rerank = client.post("/v1/rerank", json={"model": "qwen-small", "query": "q", "documents": ["one"]})
+
+    assert embeddings.status_code == 422  # plan/03-api.md §1: capability mismatch is 422
+    assert embeddings.json()["error"]["code"] == "unsupported_capability"
+    assert rerank.status_code == 422 and rerank.json()["error"]["code"] == "unsupported_capability"
+    assert scheduler.outcomes == []  # refused before any lease

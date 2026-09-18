@@ -20,6 +20,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -172,13 +173,83 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
     return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
                          lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
                          recovery=recovery, observers=dict(observers), config=config,
-                         extras={"runtime": runtime, "clients": clients, "idempotency": idempotency})
+                         extras={"runtime": runtime, "clients": clients, "idempotency": idempotency,
+                                 "control": control})
+
+
+def _execution_stats(context: RunContextV2):
+    """What /api/status reports about executions: counts only, never a token."""
+
+    def stats() -> dict[str, int]:
+        service = context.service
+        records = list(service.records().values()) if service is not None else []
+        return {
+            "total": len(records),
+            "active": sum(1 for record in records if not record.settled),
+            "pending_cleanup": len(service.pending_cleanup) if service is not None else 0,
+        }
+
+    return stats
+
+
+def v2_health_checks(context: RunContextV2):
+    """The conservative /health provider for the managed runtime (P19).
+
+    A busy queue never makes health unhealthy (C04); a blocked admission
+    (recovering/shutting down/storage fault) or an unreachable control plane
+    does. It reads scheduler facts and the control client's own health probe.
+    """
+
+    async def checks() -> dict[str, bool]:
+        config = context.config
+        status = await context.scheduler.status()
+        resources = status.get("resources") or {}
+        admission = status.get("admission") or {}
+        models = status.get("models") or {}
+        age = resources.get("sample_age_seconds") if isinstance(resources, dict) else None
+        storage_ready = isinstance(admission, dict) and admission.get("storage_unavailable") is False
+        recovering = not isinstance(admission, dict) or admission.get("recovering") is not False
+        shutting_down = not isinstance(admission, dict) or admission.get("shutting_down") is not False
+        preload_ready = isinstance(models, dict) and all(
+            isinstance(models.get(model_id), dict) and models[model_id].get("state") == "ready"
+            for model_id in config.scheduler.preload_models
+        )
+        control_health = getattr(context.extras.get("control"), "health", None)
+        control_ready = False
+        if callable(control_health):
+            result = control_health()
+            if inspect.isawaitable(result):
+                result = await result
+            control_ready = result is True
+        return {
+            "storage": storage_ready,
+            "resources": type(age) in (int, float) and 0 <= age <= config.resources.sample_max_age_seconds,
+            "preload": preload_ready,
+            "control": control_ready and not recovering and not shutting_down,
+            "llama_swap": control_ready,
+        }
+
+    return checks
+
+
+def build_v2_tcp_app(context: RunContextV2):
+    """The TCP listener of the v2 process (P19): the legacy surface over the managed runtime.
+
+    The control routes stay on the Unix socket: this app never registers
+    `/internal/*`, so the TCP side answers 404 by construction (C08), and
+    /api/status reports this process's own boot id.
+    """
+    from app import create_app
+
+    return create_app(config=context.config, scheduler=context.scheduler, gateway=None,
+                      boot_id=context.boot_id, execution_stats=_execution_stats(context),
+                      health_checks=v2_health_checks(context))
 
 
 def serve_v2(context: RunContextV2) -> None:
     """Reconcile, recover blobs, then run both listeners over ONE lifespan."""
     from model_scheduler.control_api import ControlAPI
-    from model_scheduler.control_server import ControlServer, build_control_app, build_tcp_skeleton_app
+    from model_scheduler.control_server import ControlServer, build_control_app
 
     config = context.config
 
@@ -190,8 +261,7 @@ def serve_v2(context: RunContextV2) -> None:
             # Admission stays closed (Book.recovering) — the process reports instead of serving half-truths.
             raise RuntimeCompositionError(f"startup reconciliation failed: {reconciliation.error_code}")
         await context.blobs.recover(instances_running=False, boot_id=context.boot_id)
-        app = build_tcp_skeleton_app(boot_id=context.boot_id, scheduler=context.scheduler,
-                                      shutdown_grace_seconds=config.server.shutdown_grace_seconds)
+        app = build_v2_tcp_app(context)
         api = ControlAPI(boot_id=context.boot_id, blobs=context.blobs, scheduler=context.scheduler,
                          service=context.service, tokens=context.tokens,
                          idempotency=context.extras.get("idempotency"))

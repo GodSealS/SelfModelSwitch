@@ -1,4 +1,6 @@
 from fastapi.testclient import TestClient
+import json
+from pathlib import Path
 import threading
 
 from app import create_app
@@ -192,3 +194,96 @@ def test_lifespan_starts_and_cancels_storage_monitoring() -> None:
         assert client.get("/live").status_code == 200
     assert scheduler.calls >= 1
     assert scheduler.stopped is True
+
+
+def _load_v2_config(tmp_path: Path):
+    """The shared v2 test registration, loaded through the same YAML the config tests pin."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sms_v2_admin_config", Path(__file__).resolve().parent / "test_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "config.yaml"
+    path.write_text(module.V2, encoding="utf-8")
+    from model_scheduler.config import load_config
+
+    return load_config(path)
+
+
+class CatalogScheduler:
+    """A v2-shaped scheduler stub: listing must never acquire or load."""
+
+    def __init__(self) -> None:
+        self.leases: list[str] = []
+
+    async def status(self):
+        return {
+            "resources": {"source": "psutil", "sample_age_seconds": 0.1},
+            "admission": {"storage_unavailable": False, "recovering": False, "shutting_down": False},
+            "queue_size": 2,
+            "models": {
+                "embedding": {"state": "unloaded", "in_flight": 0, "reserved_bytes": 6106148045},
+                "qwen-small": {"state": "unloaded", "in_flight": 0, "reserved_bytes": 6106148045},
+            },
+        }
+
+    async def acquire(self, model_id, request_id, deadline):
+        self.leases.append(model_id)
+        raise AssertionError("a read-only query must never acquire or load")
+
+
+def test_a_v2_registration_drives_models_status_and_boot_identity(tmp_path) -> None:
+    config = _load_v2_config(tmp_path)
+    scheduler = CatalogScheduler()
+    app = create_app(config=config, scheduler=scheduler, boot_id="boot-v2",
+                     execution_stats=lambda: {"total": 3, "active": 1, "pending_cleanup": 0})
+
+    with TestClient(app) as client:
+        listing = client.get("/v1/models")
+        models = client.get("/api/models")
+        status = client.get("/api/status")
+
+    assert [entry["id"] for entry in listing.json()["data"]] == ["embedding", "qwen-small"]
+    assert set(models.json()) == {"embedding", "qwen-small"}
+    body = status.json()
+    assert body["boot_id"] == "boot-v2"
+    assert body["executions"] == {"total": 3, "active": 1, "pending_cleanup": 0}
+    assert body["readiness_reason"] is None
+    assert body["models"]["embedding"]["reserved_bytes"] == 6106148045  # reserved bytes stay visible
+    assert "token" not in json.dumps(body)  # no credential material is ever serialized
+    assert scheduler.leases == []  # listing models never acquires a lease
+
+
+def test_v2_health_is_conservative_and_ignores_queue_pressure(tmp_path) -> None:
+    config = _load_v2_config(tmp_path)
+
+    class BlockedScheduler:
+        async def status(self):
+            return {
+                "resources": {"sample_age_seconds": 0.1},
+                "admission": {"storage_unavailable": False, "recovering": True, "shutting_down": False},
+                "queue_size": 99,  # queue pressure is not a health failure (C04)
+                "models": {"embedding": {"state": "ready"}, "qwen-small": {"state": "unloaded"}},
+            }
+
+    with TestClient(create_app(config=config, scheduler=BlockedScheduler())) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 503  # a blocked admission answers 503
+    checks = health.json()["checks"]
+    assert checks["control"] is False and checks["llama_swap"] is False
+    assert checks["storage"] is True and checks["preload"] is True and checks["resources"] is True
+
+
+def test_manual_unload_answers_409_while_a_lease_or_session_holds_the_model() -> None:
+    from model_scheduler.model_registry import Conflict
+
+    class BusyScheduler:
+        async def unload(self, model_id, deadline):
+            raise Conflict("model_busy")
+
+    with TestClient(create_app(scheduler=BusyScheduler())) as client:
+        response = client.post("/api/models/qwen-small/unload")
+
+    assert response.status_code == 409  # a lease or session keeps the model: the unload is refused
+    assert response.json()["error"]["code"] == "model_busy"

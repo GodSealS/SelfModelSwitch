@@ -265,6 +265,29 @@ def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) 
     assert context.lifecycle.instance("embedding") is None  # nothing loaded yet, and no guessed identity
 
 
+def test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes(sdir) -> None:
+    from fastapi.testclient import TestClient as _TestClient
+
+    config = _v2_config(sdir)
+    fake_ports = {"control": object(), "resources": None, "recovery": object(),
+                  "observers": {mid: object() for mid in config.models},
+                  "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    context = run_module.build_v2_context(config, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+    app = run_module.build_v2_tcp_app(context)
+
+    with _TestClient(app) as client:
+        assert client.get("/live").status_code == 200
+        listing = client.get("/v1/models")
+        assert [entry["id"] for entry in listing.json()["data"]] == ["embedding", "qwen-small"]
+        status = client.get("/api/status")
+        assert status.json()["boot_id"] == context.boot_id
+        assert status.json()["executions"] == {"total": 0, "active": 0, "pending_cleanup": 0}
+        assert client.get("/internal/peer").status_code == 404  # control routes are Unix-socket only
+        health = client.get("/health")
+        assert health.status_code == 503  # the fake control port has no probe: health stays conservative
+        assert health.json()["checks"]["control"] is False
+
+
 def test_v2_refuses_to_guess_site_inputs(sdir) -> None:
     config = _v2_config(sdir)
     with pytest.raises(Exception) as missing_identity:

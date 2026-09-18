@@ -891,6 +891,40 @@ class ModelScheduler:
             except StaleOperation:
                 pass
 
+    def _model_status(self, model_id: str, runtime, now: float) -> dict[str, object]:
+        """One model's status row, read through the unified ledger (v1 and v2).
+
+        v1 keeps its exact values: its ledger copy carries the registration's
+        roles. A v2 registration has no `priority`/`pinned` attributes on the
+        raw spec, so the ledger is the only correct source for them (P19).
+        """
+        spec = self.book.specs[model_id]
+        entry = self.book.ledger[model_id]
+        return {
+            "state": "active" if runtime.state.value == "ready" and runtime.leases else runtime.state.value,
+            "generation": runtime.generation,
+            "in_flight": len(runtime.leases),
+            "cancelling": len(runtime.cancelling),
+            "waiting_requests": self._queue.waiting_count(model_id),
+            "capabilities": sorted(capability.value if hasattr(capability, "value") else str(capability)
+                                   for capability in spec.capabilities),
+            "reserved_bytes": getattr(spec, "reserved_bytes", entry.effective_reserved_bytes),
+            "effective_reserved_bytes": self.book.required(model_id),
+            "priority": entry.priority,
+            "evictable": entry.evictable,
+            "pinned": entry.pinned,
+            "preload": entry.preload,
+            "max_concurrency": entry.max_concurrency,
+            "ttl_seconds": entry.ttl_seconds,
+            "idle_seconds": None if runtime.leases or runtime.idle_since is None else max(0.0, now - runtime.idle_since),
+            "heat": self.book.heat(model_id, now),
+            "total_requests": runtime.total_requests,
+            "total_tokens": runtime.total_tokens,
+            "usage_unknown_requests": runtime.usage_unknown_requests,
+            "admission_blocked": runtime.admission_blocked,
+            "last_error": runtime.last_error,
+        }
+
     async def status(self) -> dict[str, object]:
         snapshot = await self.resources.snapshot()
         async with self._condition:
@@ -928,30 +962,6 @@ class ModelScheduler:
                         for session_id, record in self.sessions.records.items() if record.phase != CLOSED
                     ],
                 },
-                "models": {
-                    model_id: {
-                        "state": "active" if runtime.state.value == "ready" and runtime.leases else runtime.state.value,
-                        "generation": runtime.generation,
-                        "in_flight": len(runtime.leases),
-                        "cancelling": len(runtime.cancelling),
-                        "waiting_requests": self._queue.waiting_count(model_id),
-                        "capabilities": sorted(capability.value for capability in self.book.specs[model_id].capabilities),
-                        "reserved_bytes": self.book.specs[model_id].reserved_bytes,
-                        "effective_reserved_bytes": self.book.required(model_id),
-                        "priority": self.book.specs[model_id].priority,
-                        "evictable": self.book.specs[model_id].evictable,
-                        "pinned": self.book.specs[model_id].pinned,
-                        "preload": self.book.specs[model_id].preload,
-                        "max_concurrency": self.book.specs[model_id].max_concurrency,
-                        "ttl_seconds": self.book.specs[model_id].ttl_seconds,
-                        "idle_seconds": None if runtime.leases or runtime.idle_since is None else max(0.0, now - runtime.idle_since),
-                        "heat": self.book.heat(model_id, now),
-                        "total_requests": runtime.total_requests,
-                        "total_tokens": runtime.total_tokens,
-                        "usage_unknown_requests": runtime.usage_unknown_requests,
-                        "admission_blocked": runtime.admission_blocked,
-                        "last_error": runtime.last_error,
-                    }
-                    for model_id, runtime in self.book.runtime.items()
-                },
+                "models": {model_id: self._model_status(model_id, runtime, now)
+                           for model_id, runtime in self.book.runtime.items()},
             }

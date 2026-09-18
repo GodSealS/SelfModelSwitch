@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 from contextlib import asynccontextmanager, suppress
 import asyncio
+from dataclasses import dataclass
 import inspect
 import json
 import math
@@ -75,6 +76,65 @@ def _config_path(explicit: str | Path | None) -> Path:
     if explicit is not None:
         return Path(explicit)
     return Path(os.environ.get("MODEL_SCHEDULER_CONFIG", "config.yaml"))
+
+
+@dataclass(frozen=True)
+class _CatalogModel:
+    """The legacy routes' view of one registered model (schema v1 or v2)."""
+
+    model_id: str
+    upstream_url: str
+    capabilities: frozenset
+    preload: bool
+
+
+@dataclass(frozen=True)
+class _LifecycleTimeouts:
+    load_timeout_seconds: float
+    unload_timeout_seconds: float
+
+
+def _model_catalog(config) -> dict[str, _CatalogModel]:
+    """One catalog over either schema (plan/08 P19, plan/03-api.md §1).
+
+    A v2 registration drives the same compatibility surface: the upstream URL is
+    derived from the registered port, `preload` comes from the scheduler policy
+    and the capability tuple is the registration's own. v1 keeps its shape.
+    """
+    if getattr(config, "schema_version", 1) == 2:
+        preload = set(config.scheduler.preload_models)
+        return {
+            model_id: _CatalogModel(model_id=model_id, upstream_url=f"http://127.0.0.1:{model.port}",
+                                    capabilities=frozenset(model.capabilities), preload=model_id in preload)
+            for model_id, model in config.models.items()
+        }
+    return {
+        model_id: _CatalogModel(model_id=model_id, upstream_url=model.upstream_url,
+                                capabilities=frozenset(model.capabilities), preload=model.lifecycle.preload)
+        for model_id, model in config.models.items()
+    }
+
+
+def _lifecycle_timeouts(config) -> _LifecycleTimeouts:
+    """Load/unload budgets for either schema; v2 has no llama-swap section."""
+    if getattr(config, "schema_version", 1) == 2:
+        reclaim = float(config.scheduler.memory_reclaim_timeout_seconds)
+        return _LifecycleTimeouts(load_timeout_seconds=reclaim, unload_timeout_seconds=reclaim)
+    return _LifecycleTimeouts(load_timeout_seconds=config.llama_swap.load_timeout_seconds,
+                              unload_timeout_seconds=config.llama_swap.unload_timeout_seconds)
+
+
+def _readiness_reason(document: dict) -> str | None:
+    """Why /api/status is not ready, from its own admission facts only."""
+    admission = document.get("admission")
+    if isinstance(admission, dict):
+        if admission.get("shutting_down"):
+            return "shutting_down"
+        if admission.get("storage_unavailable"):
+            return "storage_unavailable"
+        if admission.get("recovering") is not False:
+            return "recovery_incomplete"
+    return None
 
 
 def _error(status: int, code: str, message: str, request_id: str, param: str | None = None, extra_headers: dict[str, str] | None = None) -> JSONResponse:
@@ -176,11 +236,19 @@ async def _require_empty_body(request: Request, *, timeout_seconds: float) -> No
         raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
 
 
-def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
-    """Create a listener that remains diagnostically live while dependencies recover."""
+def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
+    """Create a listener that remains diagnostically live while dependencies recover.
+
+    The same surface serves schema v2 (plan/08 P19): the catalog derives the
+    upstream URL and the preload flag from the dynamic registration, `boot_id`
+    and `execution_stats` enrich /api/status, and the load/unload budgets fall
+    back to the memory-reclaim timeout because v2 has no llama-swap section.
+    """
     if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
         raise ValueError("preload_retry_delays must contain positive values")
     config = config or load_config(_config_path(config_path))
+    catalog = _model_catalog(config)
+    timeouts = _lifecycle_timeouts(config)
     owned_client = None
     if scheduler is None and backend is not None:
         scheduler = build_scheduler(config, backend, resources=resources, storage_guard=storage_guard, recovery=recovery)
@@ -188,7 +256,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
         timeout = httpx.Timeout(config.gateway.inference_timeout_seconds, connect=config.gateway.connect_timeout_seconds, read=config.gateway.read_idle_timeout_seconds, write=config.gateway.write_idle_timeout_seconds, pool=config.gateway.pool_timeout_seconds)
         owned_client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
         gateway = DirectInferenceGateway(
-            {model_id: model.upstream_url for model_id, model in config.models.items()},
+            {model_id: model.upstream_url for model_id, model in catalog.items()},
             owned_client,
             max_response_body_bytes=config.gateway.max_response_body_bytes,
         )
@@ -204,7 +272,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             async def watch_storage() -> None:
                 while not app.state.shutting_down:
                     try:
-                        await app.state.scheduler.monitor_storage_once(monotonic() + config.llama_swap.unload_timeout_seconds)
+                        await app.state.scheduler.monitor_storage_once(monotonic() + timeouts.unload_timeout_seconds)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -218,7 +286,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
                 attempt = 0
                 while not app.state.shutting_down:
                     try:
-                        await app.state.scheduler.preload(monotonic() + config.llama_swap.load_timeout_seconds)
+                        await app.state.scheduler.preload(monotonic() + timeouts.load_timeout_seconds)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -253,11 +321,14 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
 
     app = FastAPI(title="AGX Model Scheduler", version="1.0", lifespan=lifespan)
     app.state.config = config
+    app.state.catalog = catalog
     app.state.ready = False
     app.state.scheduler = scheduler
     app.state.gateway = gateway
     app.state.owned_client = owned_client
     app.state.health_checks = health_checks
+    app.state.boot_id = boot_id
+    app.state.execution_stats = execution_stats
 
     async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
         try:
@@ -301,7 +372,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
                 storage_ready = isinstance(admission, dict) and admission.get("storage_unavailable") is False
                 recovering = not isinstance(admission, dict) or admission.get("recovering") is not False
                 shutting_down = not isinstance(admission, dict) or admission.get("shutting_down") is not False
-                preload_models = [model_id for model_id, model in config.models.items() if model.lifecycle.preload]
+                preload_models = [model_id for model_id, model in catalog.items() if model.preload]
                 preload_ready = isinstance(models, dict) and all(
                     isinstance(models.get(model_id), dict) and models[model_id].get("state") == "ready"
                     for model_id in preload_models
@@ -330,18 +401,30 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, object]:
-        return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "self-model-switch"} for model_id in sorted(config.models)]}
+        return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "self-model-switch"} for model_id in sorted(catalog)]}
 
     @app.get("/api/status")
     async def status():
         if app.state.scheduler is None:
-            return {"ready": False, "resources": None, "queue_size": 0, "models": {}}
-        return await app.state.scheduler.status()
+            document: dict[str, object] = {"ready": False, "resources": None, "queue_size": 0, "models": {}}
+        else:
+            document = dict(await app.state.scheduler.status())
+        stats = app.state.execution_stats
+        if callable(stats):
+            result = stats()
+            if inspect.isawaitable(result):
+                result = await result
+            document["executions"] = result
+        else:
+            document["executions"] = None
+        document["boot_id"] = app.state.boot_id
+        document["readiness_reason"] = _readiness_reason(document)
+        return document
 
     @app.get("/api/models")
     async def models():
         if app.state.scheduler is None:
-            return {model_id: {"state": "unknown", "in_flight": 0} for model_id in sorted(config.models)}
+            return {model_id: {"state": "unknown", "in_flight": 0} for model_id in sorted(catalog)}
         return (await app.state.scheduler.status())["models"]
 
     @app.post("/api/models/{model_id}/unload")
@@ -351,12 +434,12 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             await _require_empty_body(request, timeout_seconds=config.server.body_timeout_seconds)
         except BodyError as exc:
             return _error(exc.status, exc.code, str(exc), request_id)
-        if model_id not in config.models:
+        if model_id not in catalog:
             return _error(404, "model_not_found", "Unknown model", request_id, "model")
         if app.state.scheduler is None:
             return _error(503, "service_unavailable", "Service is not ready", request_id)
         try:
-            await app.state.scheduler.unload(model_id, monotonic() + config.llama_swap.unload_timeout_seconds)
+            await app.state.scheduler.unload(model_id, monotonic() + timeouts.unload_timeout_seconds)
             return JSONResponse(content={"ok": True, "model": model_id}, headers={"X-Request-ID": request_id})
         except Conflict as exc:
             code = str(exc)
@@ -372,7 +455,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
         if not callable(recovery):
             return _error(503, "recovery_unavailable", "Storage recovery is unavailable", request_id)
         try:
-            preloaded = await recovery(monotonic() + config.llama_swap.load_timeout_seconds)
+            preloaded = await recovery(monotonic() + timeouts.load_timeout_seconds)
             return JSONResponse(
                 content={"ok": True, "preloaded": list(preloaded)},
                 headers={"X-Request-ID": request_id},
@@ -392,11 +475,11 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid chat request", request_id)
-        model = config.models.get(body.model)
+        model = catalog.get(body.model)
         if model is None:
             return _error(404, "model_not_found", "Unknown model", request_id, "model")
         if "chat" not in model.capabilities:
-            return _error(400, "unsupported_capability", "Model does not support chat", request_id, "model")
+            return _error(422, "unsupported_capability", "Model does not support chat", request_id, "model")
         if app.state.scheduler is None or app.state.gateway is None:
             return _error(503, "service_unavailable", "Service is not ready", request_id)
         lease = None
@@ -463,11 +546,11 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(503, "service_unavailable", "Service is not ready", request_id)
 
     async def acquire_json(model_id: str, capability: Capability, payload: dict, request_id: str):
-        model = config.models.get(model_id)
+        model = catalog.get(model_id)
         if model is None:
             return None, _error(404, "model_not_found", "Unknown model", request_id, "model")
         if capability.value not in model.capabilities:
-            return None, _error(400, "unsupported_capability", "Model does not support this operation", request_id, "model")
+            return None, _error(422, "unsupported_capability", "Model does not support this operation", request_id, "model")
         if app.state.scheduler is None or app.state.gateway is None:
             return None, _error(503, "service_unavailable", "Service is not ready", request_id)
         deadline = monotonic() + config.gateway.inference_timeout_seconds
