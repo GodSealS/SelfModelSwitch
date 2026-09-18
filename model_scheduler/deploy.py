@@ -626,8 +626,9 @@ def render_service_units(*, inputs: ServiceInputs, output: str | Path,
                             f"RuntimeDirectory={inputs.service_user} {Path(inputs.socket_path).parent.name}")
         text = text.replace("127.0.0.1:8080", inputs.listen)
         extras = [
+            # [Unit] already carries RequiresMountsFor (rewritten below with the site mount
+            # path); systemd-analyze rejects a second copy inside [Service].
             f"ReadOnlyPaths={inputs.model_directory}",
-            f"RequiresMountsFor={inputs.model_directory}",
             f"Environment=SMS_CONTROL_SOCKET={inputs.socket_path}",
             f"Environment=SMS_CONTROL_SOCKET_MODE={inputs.socket_mode}",
             f"Environment=SMS_CLIENT_UID={inputs.client_uid}",
