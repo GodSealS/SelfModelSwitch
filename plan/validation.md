@@ -816,3 +816,47 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 1 GiB 上限以常量与 413 断言锁定；真实传输验证到 5 MiB（流式路径），未做 1 GiB 实传。
 - 断连：路由层证明"上传中断零发布"；GPU/实例释放不误判由 P16 的 `awaiting_quiescence` 语义与其测试覆盖，本任务未重复。
 - CP2 的最终里程碑确认仍需 P19/P20 之后的端到端验收（本记录只覆盖 M04 的控制闭环）。
+
+## P19 记录（2026-09-18）
+
+范围：旧 HTTP/SSE 与动态模型兼容——让 v2 运行接线承载既有兼容 API（/live、/health、/v1/*、/api/*），保留消息、错误、SSE 与取消约定。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P19 |
+| status | complete |
+| source_commit | `125f87f`（P18 记录提交，起点） |
+| implementation_commits | `74b5009`（v2 兼容面接线） |
+| target_commit | `74b50099a7ce667f9f9a4459e6ef4b6b73f02d19`（经裸仓 origin fast-forward，目标树前后为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机跑既有测试套件（兼容面 44 passed、控制面回归 53 passed） |
+
+判定 `complete`：三条 AC 均有测试支撑（v2 注册驱动同一兼容面、422/404/409/503 语义、SSE/disconnect/透传），并在目标 Linux 上复验。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_chat_api.py tests/test_admin_api.py tests/integration/test_http_disconnect.py tests/integration/test_direct_socket.py -q`（Verification） | 0 | `37 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `628 passed, 1 skipped, 1 deselected`（P18 基线 621） |
+| `ruff check .` | 0 | 通过 |
+| 目标机（Linux，`74b5009`）兼容面（+embedding_rerank） | 0 | `44 passed` |
+| 目标机（Linux，`74b5009`）控制面回归（control_api+roundtrip+control_socket+instance_lock） | 0 | `53 passed`；树前后为空 |
+
+### 3. 关键事实
+
+- 一套路由两种 schema：catalog 适配层让 `/v1/models`、`/api/models`、chat/embeddings/rerank 的模型与能力、unload 存在性、health 的 preload 集全部来自当前 schema 的登记；v2 的 upstream 由 `port` 派生、load/unload 预算取 `memory_reclaim_timeout_seconds`。列表查询不 acquire、不加载（有测试断言）。
+- `/api/status` 增加 boot_id（同进程 boot）、executions（total/active/pending_cleanup）与 readiness_reason；不序列化任何 token（测试断言 `"token" not in json.dumps(status)`）。
+- 能力不符统一 422（chat 与 json 路由两处；既有 400 断言按 AC 更新）；未知模型 404；卸载在持有 lease/session 时 409（`model_busy`）；health 的 checks 不含队列压力，BLOCKED（recovering/shutting_down/storage fault）或 control 不可达 → 503。
+- `build_v2_tcp_app` 承接 P17 的 TCP 骨架位：旧 API 全量、`/internal/*` 永不注册（TCP 404 by construction）、lifespan 唯一（serve_v2 原样）；v2 health 用 scheduler 事实 + control 探针的保守 provider。
+- 缺陷修复（本任务暴露）：`ModelScheduler.status()` 假定 capabilities 为枚举且有 priority 等字段，v2 路径首调即 `AttributeError`——重构为经 `book.ledger` 的统一读取（v1 输出逐值不变，控制面 53 项回归通过）。
+- SSE 顺序、错误不伪造 DONE、disconnect 走 C04 清理由既有测试继续保护（`test_chat_api` SSE 系列、`test_http_disconnect` 真实 uvicorn 断连）；legacy chat 的 `extra=allow` 透传有新增测试，未被 C05 严格未知字段规则误伤。
+
+### 4. 未执行 / 未解决
+
+- v2 的 `pinned_models`/`preload_models` 未落入账本（`_exclusive_conflict` 与 C04 独占会话的共存规则需单独定形，与 P27 一并）；当前 v2 health 因此保守 503（fail-closed）。
+- vision/embedding/rerank 的 parameters 闭集与 envelope 检查（P20）；status 的 executions 计数为内存账本、无持久化。
+- 真实 llama-swap/模型在线的兼容面端到端（K5/CP3）仍待 P20 之后的目标机联调。

@@ -1164,10 +1164,19 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Description:** 用新运行接线承载旧API，保留既有消息、错误、SSE和取消约定。
 **Files likely touched:** `app.py`、`model_scheduler/api_models.py`、`model_scheduler/gateway.py`、`tests/test_chat_api.py`、`tests/test_admin_api.py`。
 **Acceptance criteria:**
-- [ ] /v1/models、/api/models来自动态配置且查询不加载；status含boot/state/execution/预留/reason，无token。
-- [ ] 未知模型404、能力不符422、有lease/session卸载409；普通队列忙不影响health，BLOCKED503。
-- [ ] SSE保持顺序、错误不伪造DONE；disconnect走C04清理；原chat透传兼容不被新control未知字段规则误伤。
+- [x] /v1/models、/api/models来自动态配置且查询不加载；status含boot/state/execution/预留/reason，无token。
+- [x] 未知模型404、能力不符422、有lease/session卸载409；普通队列忙不影响health，BLOCKED503。
+- [x] SSE保持顺序、错误不伪造DONE；disconnect走C04清理；原chat透传兼容不被新control未知字段规则误伤。
 **Verification:** `python -m pytest tests/test_chat_api.py tests/test_admin_api.py tests/integration/test_http_disconnect.py tests/integration/test_direct_socket.py -q`。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `125f87f`（P18 记录提交）；实现提交 `74b5009`（v2 兼容面接线）；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+`app.py`：新增 `_CatalogModel`/`_model_catalog`（v1 直用登记；v2 由注册 port 派生 upstream、capabilities 与 `scheduler.preload_models`）与 `_lifecycle_timeouts`（v2 无 llama-swap 段，load/unload 预算取 `scheduler.memory_reclaim_timeout_seconds`）；所有路由改读 catalog（`/v1/models`、`/api/models`、chat/embeddings/rerank 的模型与能力、unload 存在性、health 的 preload 集）——列表查询从不 acquire/加载；**能力不符 400→422**（chat 与 json 路由两处，对齐 03-api §1）；`/api/status` 增补 `boot_id`（可注入）、`executions`（可注入计数 total/active/pending_cleanup，绝不含 token）与 `readiness_reason`（由 admission 事实导出）；`create_app` 新增 `boot_id`/`execution_stats` 注入点。
+`run.py`：`build_v2_context` 的 extras 增加 `control`（llama-swap 客户端）；新增 `_execution_stats`、`v2_health_checks`（队列压力不影响 health；recovering/shutting_down/storage fault 或 control 不可达 → 503）与 `build_v2_tcp_app`（旧 API 全量 + `/internal/*` 永不注册 → TCP 404 by construction）；`serve_v2` 用它替换 P17 的骨架 app（双入口仍共享唯一 lifespan）。
+`model_scheduler/scheduler.py`：`status()` 的逐模型行重构为 `_model_status`，经**统一账本**（`book.ledger`）读 priority/evictable/pinned/preload/max_concurrency/ttl_seconds 并兼容字符串 capabilities——修复 v2 路径首次调用 `/api/status` 即 `AttributeError` 的真实接线缺陷（v1 输出逐值不变）。
+测试：`test_chat_api.py`（v2 注册驱动同一 chat 面：未知 404、能力 422、正常 200；legacy chat 未知字段仍透传，未被 C05 严格规则误伤）、`test_admin_api.py`（v2 的 /v1/models、/api/models 与 boot_id/executions/reason、无 token；BLOCKED 503 且队列压力不入 checks；卸载持有时 409）、`test_embedding_rerank_api.py`（json 路由能力不符 422 且不取租约）、`test_control_socket.py`（`build_v2_tcp_app` 真实 context：动态模型列表、boot_id、executions=0、`/internal/*` 404、无探针时 health 保守 503）。
+开发机：`pytest tests/test_chat_api.py tests/test_admin_api.py tests/integration/test_http_disconnect.py tests/integration/test_direct_socket.py -q` = 37 passed；全量 `pytest tests -m 'not thor' -q` = 628 passed, 1 skipped, 1 deselected（P18 基线 621）；`ruff check .` exit 0。
+目标机（Linux aarch64，`74b50099a7ce667f9f9a4459e6ef4b6b73f02d19`）兼容面（含 embedding_rerank）= `44 passed`；控制面回归 = `53 passed`；树为空。
+未解决：①v2 的 `pinned_models`/`preload_models` 仍只在配置层与 app/health 读取、**未落入 `book.ledger`**——`_exclusive_conflict` 会把任何 pinned/preload 判为与 C04 独占会话冲突，落地与共存规则需单独定形（与 P27 部署/会话语义一并处理）；因此当前 v2 health 会因 preload 未满足而保守 503（fail-closed）；②vision/embedding/rerank 的 parameters 闭集与 envelope 检查属 P20；③`/api/status` 的 executions 计数来自内存账本（无持久化），重启后归零。
 
 ### P20 — vision输入与embedding/rerank能力envelope（M05）
 
