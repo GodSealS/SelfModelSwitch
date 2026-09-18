@@ -1226,11 +1226,21 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Description:** 固定policy/fixtures/测量后生成candidate；实现与executor解耦的collector。
 **Files likely touched:** `model_scheduler/acceptance/candidate.py`、`model_scheduler/acceptance/collector.py`、`tests/test_candidate.py`、`tests/test_collector.py`（均新增）、`model_scheduler/acceptance/__main__.py`。
 **Acceptance criteria:**
-- [ ] C09摘要可重算、同输入可重现；无hash循环；未测/runtime缺fixture/evaluator/policy缺值拒绝。
-- [ ] `acceptance source --root REPO --output SOURCE_TAR` 独立生成纯源码归档；脏的允许清单文件拒绝，计划文档变化不改变源码hash。
-- [ ] 事件包含monotonic和UTC、run/case/attempt/Fence/instance/设备归属；原始采样非布尔gpu_verified。
-- [ ] 文件逐项size/hash；失败材料不删除；collector版本/hash固定进入candidate。
+- [x] C09摘要可重算、同输入可重现；无hash循环；未测/runtime缺fixture/evaluator/policy缺值拒绝。
+- [x] `acceptance source --root REPO --output SOURCE_TAR` 独立生成纯源码归档；脏的允许清单文件拒绝，计划文档变化不改变源码hash。
+- [x] 事件包含monotonic和UTC、run/case/attempt/Fence/instance/设备归属；原始采样非布尔gpu_verified。
+- [x] 文件逐项size/hash；失败材料不删除；collector版本/hash固定进入candidate。
 **Verification:** `python -m pytest tests/test_candidate.py tests/test_collector.py tests/test_evidence_contracts.py -q`。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `d3cbb79`（P21 记录提交）；实现提交 `3fc27fa`；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/acceptance/candidate.py`：`source` 用**显式白名单**（`app.py`、`run.py`、`model_scheduler/`、`scripts/`、`deploy/`、`tests/`、`pyproject.toml`、requirements 四件）只收 `git ls-files` 的已跟踪 regular 文件，脏的白名单文件直接拒绝，`.env`/权重/凭据/`__pycache__` 排除并**列在 `excluded` 里可见**；tar.gz 固定 `source/` 前缀、字典序、uid/gid/mtime=0、gzip mtime=0，不嵌 commit 时间或自身摘要 → 源码字节不变则 hash 不变。
+`candidate` 冻结 facts/measurements/policy/fixtures/source：facts 重解析、模型资产在 `storage.model_directory` 下逐个 size+sha256 复验、fixture 与 evaluator 文件复验、**measurement manifest digest 必须等于登记的 `measurement_ref`**、物理峰值必须等于测量值、collector sha256 取自**源码归档成员**；未测/缺 fixture 能力/evaluator 缺值/policy 缺值/被阻塞测量全部拒绝；`candidate_sha256=sha256(canonical(body))`，body 不含自身摘要，回填配置后 `config_digest` 不变（`V2_DERIVED_KEYS` 已排除 `candidate_sha256`）→ 无 hash 环。
+`collector.py`：`FileCollector` 实现 `EventSink`，事件行带 `persisted_monotonic/persisted_utc` + run/case/attempt/instance/candidate/device + 完整 fence；`sequence` 每 boot 严格递增（乱序/重复拒绝、不重排）；无 case 上下文的事件拒绝；原始采样按 kind 落 `samples/<kind>.jsonl`（保留原文），设备归属**只从原始采样推导**（GR3D 峰值、CUDA 库映射），无原始采样时拒绝而不是断言布尔；失败材料只追加不删除；`close()` 写逐项 size/sha256 manifest（不含自身）。
+CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 P21 规则）。**刻意偏离 §5 示例一处**：`candidate` 新增必填 `--deployment-id`——`CandidateV3.deployment_id` 是身份字段，示例命令行无法提供它，而本计划禁止猜测；`run/merge/verify` 仍显式 exit 2（属 P23—P25）。
+测试：`tests/test_collector.py` 7 项（事件双时钟/上下文/实例、乱序与缺上下文拒绝、失败保留、原始归属非布尔、无采样拒绝、EventSink 协议、collector 自身 hash）；`tests/test_candidate.py` 14 项（归档确定性/元数据/脏文件拒绝/缺 collector 成员、候选可重现+可解析+无自摘要、回填后 config digest 不变、未测/阻塞测量/measurement_ref 不符/缺 fixture 能力/缺 evaluator/坏 fixture hash/资产不符各自拒绝、CLI 端到端与不可覆盖）。
+开发机：P22 Verification = 38 passed；全量 `pytest tests -m 'not thor' -q` = 685 passed, 1 skipped, 1 deselected（P21 基线 664）；`ruff check .` exit 0。
+目标机（Linux aarch64，`3fc27fa807633a34c18be7ca96e604915650dc0f`，真实仓库真实材料）：`source` 两次构建 → **同一 sha256**（`a8f39ad9…90b35`）、118 个成员、含 collector、含 tests、**不含 plan**；`candidate`（配置 `measured: false`）→ exit **2**"a model that is not measured cannot enter a production candidate"；`candidate`（配置声称已测 + P21 真实 blocked 材料）→ exit **2**"the measurement does not prove a physical bound … (C02)"；两次均未产出候选文件，目标树为空。
+未解决：①本任务只交付工具与依赖注入测试（计划 §3：P22—P28 用 test-only 材料，不生成可发布通过记录）；真实 `acceptance run --layers B/O` 属 P23/P24，最终 source/candidate 在 P28 后由 P29 重做；②多模型测量材料需按模型分别提供（当前工具在多个 `measured=true` 时显式拒绝并说明）；③fresh 校准（P21 遗留）仍待受控 runner/镜像，故真实候选在 P29 之前不可能生成——这正是 C02 的预期阻塞。
 
 ### P23 — 每模型B场景真实执行器（M06）
 

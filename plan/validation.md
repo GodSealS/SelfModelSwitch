@@ -951,3 +951,50 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - AC3 前半（目标统一内存纳入 `system_nonfree_upper_bound_v1` 口径的确认）随 fresh 校准一并完成；在此之前该模型的 `physical_resident_peak_bytes` 保持 null、生产候选不含它。
 - p95/p99/冷加载/最大输入等 policy 阈值属 P22 的显式 `--policy` 输入；P21 只产出可追溯观测，不发明阈值。
 - probe 材料口径（缺 MemFree/窗口）已在 `plan/m00-envelope.md` 第 11 节追加说明，未修改既有失败/证据材料。
+
+## P22 记录（2026-09-18）
+
+范围：候选构建与原始事件采集——交付 `acceptance source`（纯源码归档）、`acceptance candidate`（冻结体）、`collector.py`（事件/原始采样/失败材料落盘），以及无 hash 环的可重算摘要。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P22 |
+| status | complete（工具 + 依赖注入测试 + 目标真实 source/candidate 拒绝路径） |
+| source_commit | `d3cbb79`（P21 记录提交，起点） |
+| implementation_commits | `3fc27fa` |
+| target_commit | `3fc27fa807633a34c18be7ca96e604915650dc0f`（经裸仓 origin fast-forward，目标树空） |
+| candidate_sha256 | null（本任务不产出可发布候选；真实候选在 P29 生成） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p22/`（source-a/-b.tar.gz、source-a.log、policy.json、fixtures.json、fixtures/、scheduler-v2-claims-measured.yaml）与 `…/p21-calibration/`（测量/事实材料） |
+
+判定 `complete`：四条 AC 均有单测覆盖并在目标机以真实仓库/真实材料执行到可判定状态；本阶段按计划 §3 只交付工具与 test-only 材料测试，**不生成可发布通过记录**（真实 `run`/最终 `candidate` 属 P23—P25、P29）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_candidate.py tests/test_collector.py tests/test_evidence_contracts.py -q`（Verification） | 0 | `38 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `685 passed, 1 skipped, 1 deselected`（P21 基线 664） |
+| `ruff check .` | 0 | 通过 |
+| 目标机 `acceptance source --root . --output …/source-a.tar.gz`（及 `-b`） | 0 | 两次构建 **同一 sha256** `a8f39ad9…90b35`；118 成员、含 collector、含 tests、不含 plan |
+| 目标机 `acceptance candidate …`（`measured: false`） | **2** | "a model that is not measured cannot enter a production candidate"；未写出候选 |
+| 目标机 `acceptance candidate …`（配置声称已测 + P21 blocked 材料） | **2** | "the measurement does not prove a physical bound … (C02)"；未写出候选 |
+
+（首轮读取退出码时脚本写法有误——`$?` 被同命令内的 `$(basename …)` 覆盖，故一度显示 0；用变量立即保存后复核为 2，命令被拒时确实不产生候选文件。）
+
+### 3. 关键事实
+
+- `source` 只收白名单内的**已跟踪 regular 文件**（`git ls-files`），脏的白名单文件（未提交修改）直接拒绝；`.env`/权重/凭据/`__pycache__` 被排除且列在 `excluded` 中可见；`plan/` 不在白名单，故计划文档变化**不可能**改变源码 hash（测试覆盖）。
+- 归档确定性：`source/` 前缀、字典序、uid/gid/mtime=0、uname/gname 空、gzip mtime=0、不嵌 commit 时间或自身摘要；目标机 118 成员两次构建字节一致。
+- candidate 的每一处输入都被重新派生而非信任：facts 重解析、模型资产在 `storage.model_directory` 下逐个 size+sha256 复验、fixture/evaluator 文件复验、`measurement_ref` 必须等于测量材料的 manifest digest、物理峰值必须等于测量值、`collector_sha256` 取自源码归档成员（缺成员即拒绝）。
+- `candidate_sha256 = sha256(canonical(body))`，body 键集恰好等于 `CANDIDATE_KEYS`（无自身摘要、无 report、无时间）；把摘要回填配置后 `config_digest` 不变（`V2_DERIVED_KEYS` 排除 `candidate_sha256`），验证无 hash 环。
+- collector：事件行同时带 `persisted_monotonic`/`persisted_utc`、run/case/attempt/instance/candidate/device 与完整 fence；sequence 严格递增（乱序/重复拒绝）；无 case 上下文的事件拒绝；原始采样按 kind 保存原文；设备归属只由原始采样推导（GR3D 峰值、CUDA 库映射），无采样时拒绝而非断言布尔；失败材料只追加；manifest 逐项 size/sha256（不含自身，避免自哈希）。
+- CLI 偏差一处并已记录：`candidate` 需要显式 `--deployment-id`（§5 示例未给，但 `CandidateV3.deployment_id` 是必填身份且禁止猜测）；`run/merge/verify` 保持显式 exit 2。
+
+### 4. 未执行 / 未解决
+
+- 真实 `acceptance run --layers B/O`（P23/P24）与生产 evaluator（P25）未实现，故 P22 的 fixture/evaluator 在测试中为 **test-only 标记材料**；P28 后由 P29 重做 source/candidate 并真实执行全集。
+- 多模型测量的材料需按模型分别提供；当前工具在多个 `measured=true` 时显式拒绝并说明原因（单一测量材料无法证明每个模型的物理上界）。
+- P21 遗留的 fresh 校准（受控 runner/镜像）仍未执行，因此**真实候选在 P29 前不可能生成**——这是 C02 的预期阻塞，不是本任务的缺陷。
