@@ -1330,10 +1330,19 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 部署单一调度进程、双listener和Blob元数据，记录可执行安装/停机/回滚步骤。
 **Files likely touched:** `deploy/model-scheduler.service.in`、`deploy/llama-swap.service.in`、`deploy/INSTALL.md`、`docs/operations.md`、`tests/test_deploy_render.py`。
 **Acceptance criteria:**
-- [ ] service用户、客户端UID/组、socket0660、Blob盘配额/UUID、只读模型映射均可从部署输入渲染；不生成video unit。
-- [ ] stop准入→排空→证明旧实例停止→切独立release/venv→preflight→启动→冒烟；未停止不切current。
-- [ ] rollback恢复已验收旧代码/配置及相容Blob元数据；元数据升级前备份，downgrade不相容则恢复备份；无可用旧候选则停机修复。
+- [x] service用户、客户端UID/组、socket0660、Blob盘配额/UUID、只读模型映射均可从部署输入渲染；不生成video unit。
+- [x] stop准入→排空→证明旧实例停止→切独立release/venv→preflight→启动→冒烟；未停止不切current。
+- [x] rollback恢复已验收旧代码/配置及相容Blob元数据；元数据升级前备份，downgrade不相容则恢复备份；无可用旧候选则停机修复。
 **Verification:** `python -m pytest tests/test_deploy_render.py -q`；目标隔离lab空载安装/停止/元数据恢复演练，记录systemd/PID/socket状态；正式安装在P31。
+
+**本轮执行记录（2026-09-19）:** status=complete（渲染 + 切换/回滚序列 + 目标 `systemd-analyze` 校验；隔离 lab 安装演练与正式安装在 P31）；起点 commit `cb3cc34`（P26 记录提交）；实现提交 `203720f`、`36c4f2e`（systemd 段修正）、`d21b5e2`（测试期望修正）；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+`deploy.py` 新增 `ServiceInputs` + `render_service_units`：service 用户/组、客户端 UID/组、控制 socket 路径与 **0660**（`SMS_CONTROL_SOCKET*` 环境）、Blob 根/盘 UUID/配额、模型盘 mount 与挂载单元、release 根、配置路径全部来自显式输入；模板里的 `@SSD_MOUNT_UNIT@`、`/mnt/model-ssd`、`/opt/self-model-switch/current`、`User=/Group=`、`RuntimeDirectory=`、监听地址逐一改写；模型目录以 `ReadOnlyPaths=` **只读**挂载；`sudoers.model-scheduler` 以 **0440** 落盘；`service-facts.json` 记录 `video_units=0`。**视频/媒体单元永不生成**：`video_unit=True` 输入直接拒绝，模板目录里出现 `video*/media*/transcode*/av1*/nvenc*` 的 `.service.in` 也拒绝，写盘前再次按名单过滤。输入校验：socket 非 0660、相对路径、非法盘 UUID、非正配额/UID、非空输出目录全部拒绝。
+同一文件新增 `OpsPort` + `switch_release`：**准入关闭 → 排空（queue/leases/sessions 必须为 0）→ 证明旧实例停止 → 新 release preflight → 才切 `current` → 启动 → 冒烟 → 重开准入**；任何一步未证明即中止且**绝不移动 `current`**（测试断言 `switch_current` 从未被调用），并重开准入；切换之后失败则返回 `switched=True` + `repair_required=True` + 可回滚的上一 release 与元数据备份名。`rollback_release`：恢复已验收旧 release 与配置；downgrade 与元数据不兼容时必须用**升级前备份**恢复，缺失则在切换前中止；**无可用旧候选 → `stopped_for_repair`**（不猜、不切换、不启动）。
+文档：`deploy/INSTALL.md` 增渲染示例与切换/回滚顺序，`docs/operations.md` 增升级/回滚/元数据操作步骤（均要求记录 systemd/PID/socket 状态）。
+测试：`tests/test_deploy_render.py` **追加** 8 项（单元渲染逐值、视频单元双重拒绝、输入校验 5 例与非空输出、切换顺序与"未证明不切 current"、排空未空/preflight 拒绝即中止、切换后冒烟失败报修复、回滚恢复旧 release 与元数据/相容时不动备份、无旧候选停机修复与缺备份拒绝）。
+开发机：P27 Verification = 31 passed（该文件）；全量 `pytest tests -m 'not thor' -q` = 755 passed, 1 skipped, 1 deselected（P26 基线 747）；`ruff check .` exit 0。
+目标机（Linux aarch64，`203720f`，真实文件系统）：渲染真实服务单元（client_uid=1000/jtzn、模型盘 `/media/jtzn/sandisk-ext4`、Blob 盘 UUID `25e77400-…`、quota 17179869184）→ 三个产物 + `video_units=0`，只读挂载/0660/盘 UUID/挂载单元四项逐一核对存在；`systemd-analyze verify` exit 0，但**发现真实缺陷**：渲染器把 `RequiresMountsFor` 又写进 `[Service]` 段（systemd 报 "Unknown key name ... ignoring"）——该键属 `[Unit]`（模板原本就有），已删除多余行（`36c4f2e`）并修正测试期望为挂载点（`d21b5e2`）；目标树为空。
+未解决：①目标隔离 lab 的**空载安装/停止/元数据恢复演练**（systemd/PID/socket 状态记录）与正式安装在 P31，本轮只做渲染 + `systemd-analyze` 静态校验；②`OpsPort` 的真实实现（systemctl/切换软链/备份恢复）待 P31/P27 现场接线；③Blob 元数据备份的具体载体（sqlite/json 快照）由 P27 现场步骤确定，接口已固定为 `restore_blob_metadata(backup)`。
 
 ### P28 — 发布归档、Python3.12/ARM64锁与CI门禁（M06）
 

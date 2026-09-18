@@ -1178,3 +1178,46 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 - `live_site` 目前返回 v1 形状的硬件身份并留空镜像映射，与 v3 站点字段的适配（真实 machine_id/device-tree/arch/mem_total/盘 UUID、`docker image inspect` 存在性、模型目录逐文件 hash）待 P27/P29 完成；层 1 的比较与拒绝语义已验证。
 - 生产完整通过（真实 S/B/O 全集）在 P31；O05 使用层 1 与 gate 的拒绝路径，不用依赖自身报告的完整 gate。
+
+## P27 记录（2026-09-19）
+
+范围：服务部署、优雅停机与回滚——交付 `ServiceInputs`/`render_service_units`（服务单元与 sudoers 渲染）、`OpsPort`/`switch_release`/`rollback_release`（切换与回滚序列），以及 INSTALL/operations 的可执行步骤。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P27 |
+| status | complete（渲染 + 序列逻辑 + 目标 `systemd-analyze` 校验；隔离 lab 安装演练与正式安装在 P31） |
+| source_commit | `cb3cc34`（P26 记录提交，起点） |
+| implementation_commits | `203720f`、`36c4f2e`（systemd 段修正）、`d21b5e2`（测试期望修正） |
+| target_commit | `d21b5e273e3e0b8783d7418d5584b1cd4148126e`（经裸仓 origin fast-forward；渲染核验于 `203720f` + 修正后同步） |
+| candidate_sha256 | P29 生成真实候选 |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 开发机 pytest 报告 + 目标机 `/home/jtzn/self-model-switch-evidence/p27/units/`（渲染产物与 service-facts.json） |
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_deploy_render.py -q`（Verification） | 0 | `31 passed` |
+| `pytest tests/test_deploy_render.py tests/test_preflight_v3.py -q` | 0 | `38 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `755 passed, 1 skipped, 1 deselected`（P26 基线 747） |
+| `ruff check .` | 0 | 通过 |
+| 目标机渲染真实单元 | 0 | 三产物 + `video_units=0`；只读挂载/0660/盘 UUID/挂载单元逐项在位 |
+| 目标机 `systemd-analyze verify` | 0 | 通过；并暴露 `RequiresMountsFor` 误置于 `[Service]`（已修） |
+
+### 3. 关键事实
+
+- **一切来自部署输入**：service 用户/组、客户端 UID/组、socket 路径与 **0660**、Blob 根/盘 UUID/配额、模型盘 mount 与挂载单元、release 根、配置路径均为显式参数；模板占位与旧路径（`@SSD_MOUNT_UNIT@`、`/mnt/model-ssd`、`/opt/self-model-switch/current`）逐一改写，无硬编码回退。
+- **只读与权限**：模型目录以 `ReadOnlyPaths` 只读挂载；`sudoers` 以 0440 落盘；socket 组契约写入单元环境（`SMS_CLIENT_UID/GROUP`）。
+- **视频单元永不生成**：输入拒绝 + 模板目录扫描 + 写盘前名单过滤三重保障，`service-facts.json` 记录 `video_units=0`。
+- **未停止不切 current**：`switch_release` 的固定顺序把"准入关闭→排空（三项为零）→实例已证明停止→preflight"全部放在 `current` 移动之前；任何未证明即中止且不移动 `current`（测试断言从未调用切链），随后重开准入。切换后失败返回 `repair_required` + 上一 release + 备份名供回滚。
+- **回滚语义**：相容降级直接恢复旧 release/配置；不兼容降级必须使用**升级前备份**（缺失则在切换前中止）；无可用旧候选时 `stopped_for_repair`，绝不猜一个旧版。
+- **目标机真实反馈驱动修正**：`systemd-analyze verify` 报出 `RequiresMountsFor` 在 `[Service]` 段被忽略（该键属 `[Unit]`，模板本来就有），已删除多余行并同步修正测试期望为挂载点（`/media/jtzn/sandisk-ext4`）。
+
+### 4. 未执行 / 未解决
+
+- 目标隔离 lab 的**空载安装/停止/元数据恢复演练**（systemd 单元状态、PID、socket owner/mode 记录）与正式安装在 P31；本轮只做渲染与 `systemd-analyze` 静态校验。
+- `OpsPort` 的真实实现（systemctl 操作、`current` 软链切换、Blob 元数据备份/恢复）待现场接线；接口与拒绝语义已固定。
+- Blob 元数据备份的载体（sqlite/json 快照）由现场步骤确定，接口固定为 `restore_blob_metadata(backup)`。
