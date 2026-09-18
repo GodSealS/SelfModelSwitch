@@ -905,3 +905,49 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - compat 的 token 计数依赖模型运行时在线（失败 → 503）；真实 llama-server 联调属 K5。
 - Envelope 契约未新增 batch 字段（若 P22 的 candidate 需要独立登记 batch 上限再按 C09 扩展）。
 - 输出侧校验（NaN embeddings / rank shape / 上游 shape）仍由 app 与 adapter 各自持有（P17/P15 已测），本轮只共享输入侧。
+
+## P21 记录（2026-09-18）
+
+范围：现场 facts、校准与物理内存口径——交付 `model_scheduler.acceptance collect|calibrate`，在目标设备采 C09 facts，并从原始采样重算 §5 判据与 C02 物理上界。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P21 |
+| status | partial（工具完成；AC2/AC3 的 fresh 重算待受控 runner/镜像；AC3 的阻塞语义与 AC1/AC4 已在目标实测） |
+| source_commit | `557baf5`（P20 记录提交，起点） |
+| implementation_commits | `152c1e8`（collect + CLI）、`92d6c07`（calibrate 核心）、`6e58313`（blocked 退出码/facts 归一化）、`d925a15`（§5 缺口判据 + ≤100 ms 采样器） |
+| target_commit | `d925a150190dcc6a648f09f670cbfa7473934480`（经裸仓 origin fast-forward，目标树前后为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/`（facts.json、scheduler-v2.yaml、maintenance.json、calibration-final/{measurements.json, raw/run1..3/}） |
+
+判定 `partial`：AC1 与 AC4 已由目标真实运行证明；AC2/AC3 的判据实现与拒绝路径已测试并在目标材料上演示（blocked + exit 3 + 材料保留），但"从原始样本重算窗口判据与物理上界"这一步因保存材料缺 MemFree/单调窗口而**未能证明**，需 fresh 校准（受控 runner/镜像）后复验。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_calibration.py tests/test_m00_envelope_probe.py -q`（Verification，开发机） | 0 | `43 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `664 passed, 1 skipped, 1 deselected`（P20 基线 642） |
+| `ruff check .` | 0 | 通过 |
+| 目标机 `python -m model_scheduler.acceptance collect --output …/facts.json --model-disk /media/jtzn/sandisk-ext4/models --scratch-disk /var/lib` | 0 | 16 条 facts 带来源写盘（真实 Orin 值） |
+| 目标机 `… calibrate --config …/scheduler-v2.yaml --facts … --maintenance … --budget-bytes 16000000000 --runs 3 --from-evidence …/m00-qwen25vl-envelope-20260917T055502Z` | 3 | `verdict=blocked`（3 轮 unverified；材料保留）；`verified_target_sha=d925a15…`，目标树为空 |
+
+### 3. 关键事实
+
+- collect：每个 fact 都带 `file:`/`command:`/`platform:` 来源与读值 sha256（16/16 条可追溯）；缺失读取（空 nv_tegra、空 UUID、非法 MemTotal、空 governor）一律 exit 2，不猜；`--config` 从 v2 的 `storage.model_directory`/`blobs.root` 派生盘路径，无输入则拒绝。
+- calibrate 的维护前置是**实时复核**而非信记录：取单实例锁、`docker ps` 无受管容器、控制 socket 不存在、登记端口无监听；记录只声明 `production_admission_closed/instances_stopped` 时仍逐个重验（测试含"声明不等于放行"）。
+- §5 判据全部从**原始行**重算：基线中位数（前 10 s）、运行窗最小、post 中位数（后 10 s）、delta>0、前后基线差 ≤256 MiB、>500 ms 缺口计数、swap 出现即失败；cadence 作为**协议事实**报告（真实 0.101 s），不当作缺口。
+- C02 物理上界：逐轮 `system_nonfree_upper_bound_v1`（`MemTotal − MemFree` 的窗口最大值）、三轮再取最大；缺 MemFree 一律 null + `bound_note`，绝不换成 MemAvailable（那只是下界）。
+- 目标阻塞结论由两条独立原因给出：材料无 MemFree（物理上界）与材料无单调窗口（§5 窗口判据）；两者都属"不能证明"，按 C02/P21 AC3 阻塞生产并保留软件结果（exit 3，`measured_peak_bytes/reserved_bytes/physical_resident_peak_bytes` 全为 null 而非 0）。
+- AC4：正式判据 `image_tokens ≤ envelope.max_image_tokens` 为**精确**比较（1280 通过 / 1281 拒绝有测试），probe 的 1.05 放宽不被携带；目标实测 1227 ≤ 1280。
+- 采样器（`MemorySampler`）按 C02 记录 7 列（含 MemFree），修复了 M00 probe 只留 MemAvailable 的材料缺口；既有 M00 证据不回改。
+
+### 4. 未执行 / 未解决
+
+- **fresh 校准未执行**：`calibrate` 的新采集路径需要受控 runtime runner/镜像（计划 §6）；当前该路径显式 exit 3，不产出"看似完成"的校准。
+- AC3 前半（目标统一内存纳入 `system_nonfree_upper_bound_v1` 口径的确认）随 fresh 校准一并完成；在此之前该模型的 `physical_resident_peak_bytes` 保持 null、生产候选不含它。
+- p95/p99/冷加载/最大输入等 policy 阈值属 P22 的显式 `--policy` 输入；P21 只产出可追溯观测，不发明阈值。
+- probe 材料口径（缺 MemFree/窗口）已在 `plan/m00-envelope.md` 第 11 节追加说明，未修改既有失败/证据材料。

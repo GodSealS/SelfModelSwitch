@@ -1204,12 +1204,21 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Description:** 将M00输入转为可追溯measurement，补C02物理上界，不能只用summary复制一个数。
 **Files likely touched:** `model_scheduler/acceptance/collect.py`、`model_scheduler/acceptance/calibrate.py`、`model_scheduler/acceptance/__main__.py`、`tests/test_calibration.py`（均新增）、`plan/m00-envelope.md`（追加，不抹失败）。
 **Acceptance criteria:**
-- [ ] collect记录C09设备/栈/盘事实；calibrate关闭生产准入、独占、显式临时budget，所有出口均记录停止或UNKNOWN。
+- [x] collect记录C09设备/栈/盘事实；calibrate关闭生产准入、独占、显式临时budget，所有出口均记录停止或UNKNOWN。
 - [ ] 3轮采样间隔<=100ms、gap<=500ms、前后10s、基线中位数、delta>0、基线差<=256MiB；swap/OOM不通过。
+  *判据已实现并单测（含 501ms 缺口、300MiB 移位、swap、稀疏采样各例）；目标保存材料只保留 MemAvailable 且无单调窗口，因此基线/delta/前后窗**无法从原始样本重算**——该项待 fresh 校准（见下）才能全勾。*
 - [ ] 按C02 `system_nonfree_upper_bound_v1` 原始MemTotal/MemFree重算物理上界，并确认目标GPU统一内存纳入口径；
   不扣估计背景、不与CUDA字节重复相加；不能证明则阻塞生产、保留软件任务结果。
-- [ ] 当前probe image-token允许1.05误差不沿用为正式验收放宽；正式fixture须证明不超过登记envelope。
+  *后半句已在目标实测：材料缺 MemFree → 工具保持 null、exit 3、生产保持关闭且逐轮原因落盘；前半句的重算路径已实现并单测（合成材料 + 精确 MemTotal−MemFree），待新采集复核。*
+- [x] 当前probe image-token允许1.05误差不沿用为正式验收放宽；正式fixture须证明不超过登记envelope。
 **Verification:** `python -m pytest tests/test_calibration.py tests/test_m00_envelope_probe.py -q`；目标calibrate按第5节，保存全部原始材料。
+
+**本轮执行记录（2026-09-18）:** status=partial（工具完成 + 目标阻塞验证；新采集校准待受控 runner/镜像）；起点 commit `557baf5`（P20 记录提交）；实现提交 `152c1e8`（collect + CLI）、`92d6c07`（calibrate 核心）、`6e58313`（blocked 退出码与 facts 归一化）、`d925a15`（§5 缺口判据 + ≤100ms 采样器）；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/acceptance/`：`collect.py`（C09 设备/栈/盘 facts，16 条皆带 `file:`/`command:`/`platform:` 来源与读值 sha256；缺项 exit 2 不猜；`--config` 可派生 model/scratch 盘路径）、`calibrate.py`（维护前置实时复核：单实例锁、受管容器、登记端口、控制 socket；§5 判据从**原始行**重算；C02 `system_nonfree_upper_bound_v1` 逐轮取最大、三轮再取最大；`--from-evidence` 重算既有材料；缺 MemFree/缺窗口 → 该轮 unverified、结论 blocked、exit 3，材料保留；`MemorySampler` 以 ≤100 ms 记录 MemTotal/MemFree/MemAvailable/SwapFree 的 7 列 CSV）、`__main__.py`（§5 CLI 合同：collect/calibrate，未实现的 candidate/run/merge/verify 显式拒绝；0/2/3 退出码；拒绝覆盖非空输出）。
+测试：`tests/test_calibration.py` 21 项（facts 逐字段与来源、严格解析回环、缺项/空 UUID/坏 MemTotal 拒绝、CLI 输入错误、§5 各失败例、无窗口/无 MemFree → blocked 且 exit 3、AC4 精确边界 1280 通过 1281 拒绝、维护记录的"声明不等于放行"、采样器 7 列原始行、端到端 measurements + raw 复制）。
+开发机：P21 Verification（test_calibration + test_m00_envelope_probe）= 43 passed；全量 `pytest tests -m 'not thor' -q` = 664 passed, 1 skipped, 1 deselected（P20 基线 642）；`ruff check .` exit 0。
+目标机（Linux aarch64，`d925a150190dcc6a648f09f670cbfa7473934480`）：`collect` 成功（exit 0，真实 Orin facts）；`calibrate --from-evidence m00-…055502Z` = **exit 3 / blocked**（3 轮各 6087—6091 原始样本；cadence 0.101 s、0 缺口、无 swap、三轮 stop quiescent、图像 token 1227 ≤ 1280 精确通过；物理上界 null、§5 窗口判据不可重算）；材料与逐轮理由见 `…/p21-calibration/calibration-final/measurements.json`，`plan/m00-envelope.md` 第 11 节已追加（不抹失败）。
+未解决：①**fresh 校准未执行**——需要 §6 的受控 runtime 镜像/runner 接线（当前 `calibrate` 在新采集路径显式 exit 3，不假装已校准）；②目标统一内存纳入口径的确认（AC3 前半）随 fresh 校准一并完成；③probe 保存材料缺 MemFree 与单调窗口属 M00 harness 的材料口径问题，已由 P21 采样器修正，不回改既有证据；④p95/p99/冷加载等 policy 阈值属 P22 的显式 policy 输入，本任务只产出可追溯观测。
 
 ### P22 — 候选构建和原始事件采集（M06）
 

@@ -161,3 +161,37 @@ M01/M02 模型登记 envelope 与 `reserved_bytes` 的输入；未通过前不�
 
 M00 五项验收均有目标设备真实证据且 runtime 身份已裁定，可标记 M00 完成。
 M01/M02 的登记输入见第 8 与 9.2 节；本轮不进入 M01 实施。
+
+## 11. P21 校准工具与物理上界复核（2026-09-18）
+
+P21 交付 `model_scheduler.acceptance collect|calibrate`（M06 校准工具，目标 commit `d925a15`）。本轮目标设备动作与结论：
+
+- `collect`：读到 C09 现场 facts（13 个设备字段 + 3 个栈字段，16 条均带来源摘要），落盘
+  `/home/jtzn/self-model-switch-evidence/p21-calibration/facts.json`
+  （mem_total=65893224448、power_mode="NV Power Mode: MAXN 0"、gpu=Orin UUID e6c84ee6-…、model disk UUID 16d53274-…）。
+- `calibrate`：在独占维护窗口（实例锁获取成功、0 个受管容器、登记端口无监听）中**从原始采样重算**第 9 节的 3 轮材料；
+  结论 **blocked（exit 3）**，材料与逐轮理由保留在 `…/p21-calibration/calibration-final/measurements.json`。
+
+| 轮 | 原始样本 | 采样 cadence | >500ms 缺口 | swap | 图像 token | 停止 | §5 判据 | C02 物理上界 |
+|---|---|---|---|---|---|---|---|---|
+| run1 | 6091 | 0.101 s | 0 | 无 | 1227 | quiescent | 不可重算 | null |
+| run2 | 6087 | 0.101 s | 0 | 无 | 1227 | quiescent | 不可重算 | null |
+| run3 | 6089 | 0.101 s | 0 | 无 | 1227 | quiescent | 不可重算 | null |
+
+**为什么 blocked（两处都拒绝估算）**
+
+1. 本轮 probe 的 `sampling/meminfo.csv` 只保留 `MemAvailable/MemTotal`，**没有 MemFree**；C02 的
+   `system_nonfree_upper_bound_v1` 定义在 `MemTotal − MemFree`（含 OS/page cache/其他进程、不减基线）。
+   用 MemAvailable 代替只会得到**下界**，所以工具保持 null 并阻塞，而不是填一个"看起来合理"的数。
+2. probe 材料没有单调时钟窗口（`run.json` 只有进程内算出的 memory 摘要），§5 的基线中位数/delta/前后窗
+   **无法从原始样本重算**；工具拒绝把摘要当作重算结果（"不能只用 summary 复制一个数"）。
+
+**已经由原始材料证实的子项**：cadence 0.101 s（采样器配置 ≤100 ms 协议）、无 >500 ms 缺口、无 swap、
+三轮 stop 均 quiescent、图像 token 实测 1227 ≤ 登记 1280（**精确判据**，未沿用 probe 的 1.05 放宽，见 P21 AC4）。
+
+**恢复路径**：P21 的采样器已按 C02 记录 `MemFree`（7 列 `meminfo.csv`）。待受控 runner/镜像就绪后，用同一 CLI 做一次
+**新采集**的 3 轮校准（`--from-evidence` 只用于重算既有材料），即可把 `physical_resident_peak_bytes` 从 null 升级为实测值；
+在此之前生产候选不包含该模型（C02 的阻塞语义）。
+
+**本轮未做**：未重跑 E0—E3 推理矩阵（避免与本文件第 9 节已保留的原始材料重复消耗设备时间）；`calibrate` 的 fresh-run 模式在
+受控 runner 就位前保持显式 exit 3（不假装已校准）。
