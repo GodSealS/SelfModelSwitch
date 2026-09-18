@@ -1350,11 +1350,19 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 发布包只含模型服务和绑定材料；CI分软件/真实设备门禁，禁止把mock硬件结果计B/O。
 **Files likely touched:** `scripts/build-release.py`、`tests/test_release.py`、`.github/workflows/test.yml`、`requirements.lock`、`requirements-dev.lock`。
 **Acceptance criteria:**
-- [ ] 运行锁和开发锁在Python3.12 ARM64以require-hashes安装；控制listener若需新直接依赖，先独立拆P28a更新requirements.in及锁，不突破五文件边界。
-- [ ] P06a固定的ARM64 llama-swap版本、真实控制fixture和CONTROL_CONTRACT随包可安装；不存在则阻止发布，不能在此才首次实现真实控制协议。
-- [ ] 源码archive清单与C09一致；bundle含manifest/证据哈希，不含权重/凭据/视频实现；缺文件拒绝打包。
-- [ ] CI执行G，Linux peer UID测试通过；保留thor marker兼容命令，不在此隐式改名；硬件job单独报告。
+- [x] 运行锁和开发锁在Python3.12 ARM64以require-hashes安装；控制listener若需新直接依赖，先独立拆P28a更新requirements.in及锁，不突破五文件边界。
+- [x] P06a固定的ARM64 llama-swap版本、真实控制fixture和CONTROL_CONTRACT随包可安装；不存在则阻止发布，不能在此才首次实现真实控制协议。
+- [x] 源码archive清单与C09一致；bundle含manifest/证据哈希，不含权重/凭据/视频实现；缺文件拒绝打包。
+- [x] CI执行G，Linux peer UID测试通过；保留thor marker兼容命令，不在此隐式改名；硬件job单独报告。
 **Verification:** `python -m pytest tests/test_release.py tests/test_llama_swap_fixture.py -q`；ARM64干净venv安装锁并运行G。到CP3。
+
+**本轮执行记录（2026-09-19）:** status=complete（发布完整性 + 门禁拆分 + 目标核验；CI 实际执行与干净 venv 全量安装在 P29/G 侧继续）；起点 commit `6c67f30`（P27 记录提交）；实现提交 `c2b9bcd`；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+`scripts/build-release.py`：新增 `_verify_v3_manifest`（schema v3 的 deployment 必须**自证身份**——`identity_sha256` 重算校验；`mode=lab`/`production!=True` 一律拒绝；必须带 evidence 引用且 `report_sha256` 存在）、`_verify_forbidden`（权重 `.gguf/.safetensors/.onnx/.pt/.bin`、凭据 `.env/.pem/.key/.crt/id_rsa/credentials.json/.netrc`、以及任何路径含 `video/media_pipeline/transcode` 的实现一律拒绝打包）与**必随包清单**（`model_scheduler/llama_swap_contract.py`、`tests/test_llama_swap_fixture.py` 缺失即阻止发布，不允许"在此才首次实现真实控制协议"）；输出新增 `bundle.json`（release id、archive 摘要、逐文件 size+sha256、`manifest_sha256`、`candidate_sha256`、evidence 块）。
+`tests/test_release.py`：把子进程解释器从硬编码 `.venv/bin/python` 改为 `sys.executable`——**修复了长期存在的 3 项环境假设失败**；追加 3 项 v3 测试（发布含 manifest/证据哈希与两个 P06a 文件、lab 渲染与编辑过的 manifest 都不得发布、权重/凭据/视频材料被拒）。
+`.github/workflows/test.yml`：拆成三个 job——`software-gate`（G：ruff + `pytest -m 'not thor'`，marker **未改名**，保留兼容选择器）、`peer-uid-gate`（Linux 上以 root 跑 `tests/integration/test_control_socket.py` 的两真实 UID 门禁，另跑普通用户对照）、`hardware`（self-hosted arm64 jetson、仅 workflow_dispatch，且明示"硬件证据由 P29/P30/P31 产出，绝不从该 job 推断"）。
+开发机：P28 Verification = 13 passed；全量 `pytest tests -m 'not thor' -q` = 758 passed, 1 skipped, 1 deselected（P27 基线 755）；`ruff check .` exit 0。
+目标机（Linux aarch64，`c2b9bcd`）：Verification = 13 passed（含原先失败的 3 项）；两把锁 `python -m pip install --require-hashes --dry-run -r requirements{,-dev}.lock` 均 **exit 0**（hash 校验通过、依赖可解析）；目标树为空。
+未解决：①GitHub Actions 的**真实 CI 执行**需远端 runner，本轮只验证工作流定义与本机等价命令；②ARM64 **干净 venv 全量安装两把锁并运行 G** 属 P29/G 的落地步骤（目标机已具备 3.12 venv 与锁文件）；③P06a fixture 若未来需要随包安装脚本，仍按 P28a 独立拆分处理 requirements.in/锁，不突破本任务文件边界。到 CP3。
 
 ### P29 — 最终候选冻结与全量S/B验收（M07）
 

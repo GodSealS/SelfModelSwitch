@@ -1221,3 +1221,46 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 目标隔离 lab 的**空载安装/停止/元数据恢复演练**（systemd 单元状态、PID、socket owner/mode 记录）与正式安装在 P31；本轮只做渲染与 `systemd-analyze` 静态校验。
 - `OpsPort` 的真实实现（systemctl 操作、`current` 软链切换、Blob 元数据备份/恢复）待现场接线；接口与拒绝语义已固定。
 - Blob 元数据备份的载体（sqlite/json 快照）由现场步骤确定，接口固定为 `restore_blob_metadata(backup)`。
+
+## P28 记录（2026-09-19）
+
+范围：发布归档、Python 3.12/ARM64 锁与 CI 门禁——交付发布完整性检查（v3 身份、禁止物、随包清单、bundle 哈希）、锁解析核验与三 job CI 工作流。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P28 |
+| status | complete（发布完整性 + 门禁拆分 + 目标锁核验；CI 实跑与干净 venv 全量安装在 P29/G） |
+| source_commit | `6c67f30`（P27 记录提交，起点） |
+| implementation_commits | `c2b9bcd` |
+| target_commit | `c2b9bcd57d9595f1570f073f1315762323179863`（经裸仓 origin fast-forward，目标树空） |
+| candidate_sha256 | P29 生成真实候选 |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv，aarch64） |
+| evidence_directory | 开发机 pytest 报告 + 目标机锁解析日志（未落盘长期材料） |
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_release.py tests/test_llama_swap_fixture.py -q`（Verification，开发机） | 0 | `13 passed`（含修复后的 3 项） |
+| `pytest tests -m 'not thor' -q` | 0 | `758 passed, 1 skipped, 1 deselected`（P27 基线 755） |
+| `ruff check .` | 0 | 通过 |
+| 目标机同 Verification | 0 | `13 passed` |
+| 目标机 `pip install --require-hashes --dry-run -r requirements.lock` | 0 | hash 校验与解析通过（aarch64/3.12） |
+| 目标机 `pip install --require-hashes --dry-run -r requirements-dev.lock` | 0 | 同上 |
+
+### 3. 关键事实
+
+- **v3 身份先行**：打包前必须通过 `require_manifest_identity`；`mode=lab` 或 `production!=True` 一律拒绝（lab 渲染永不作为生产发布）；缺少 evidence 引用（`report_sha256`）拒绝。
+- **禁止物**：权重、凭据、视频/媒体实现（路径含 `video/media_pipeline/transcode`）在打包前被拒；测试用 `tests/test_release.py` 直接验证 `_verify_forbidden` 的三类样本。
+- **P06a 随包**：`model_scheduler/llama_swap_contract.py` 与 `tests/test_llama_swap_fixture.py` 缺失即阻止发布——固定 ARM64 llama-swap 版本、真实控制 fixture 与 CONTROL_CONTRACT 已是既有材料（7 项 fixture 测试通过），本任务只负责"不随包就不许发"。
+- **bundle 可审计**：`bundle.json` 含 release id、archive 摘要、逐文件 size+sha256、manifest 摘要、candidate 摘要与 evidence 块；与 `SHA256SUMS` 并列。
+- **长期失败被修复**：`tests/test_release.py` 原先硬编码 `.venv/bin/python`，在目标机必然失败（P08 起记录在案）；改为 `sys.executable` 后开发机与目标机均 13 passed。
+- **门禁拆分**：`software-gate`（G，`-m 'not thor'` 兼容选择器不改名）、`peer-uid-gate`（root 跑 C08 两真实 UID 门禁 + 普通用户对照）、`hardware`（self-hosted aarch64/jetson、仅手动触发，明示硬件证据不由该 job 推断）。
+
+### 4. 未执行 / 未解决
+
+- GitHub Actions 的**真实执行**需要远端 runner；本轮验证的是工作流定义与目标机上的等价命令（Verification + 锁解析）。
+- ARM64 **干净 venv 全量安装两把锁并运行 G** 属 P29/G 步骤（目标机已具备 3.12 venv 与锁文件，dry-run 已证明可解析）。
+- 控制 listener 若需新直接依赖，仍按计划走独立的 P28a 更新 `requirements.in` 与锁，不突破本任务文件边界。到 CP3。
