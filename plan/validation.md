@@ -254,3 +254,67 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 开发机：`git branch -vv` 为 `main c99e2ca [origin/main]` 且无 ahead；`git status --short` 仅未跟踪 `plan/video-analysis/`；`origin/main...HEAD` = 0/0。
 - 目标机：本记录写入前 `/home/jtzn/SelfModelSwitch` 位于 `c99e2ca`、工作区干净；本记录提交后按 [AGENTS.md](../AGENTS.md)
   流程 fast-forward 同步到本记录所在提交，同步前后核对工作区为空。
+
+## P07 记录（2026-09-18）
+
+范围：把 C03 停止条件接入独立 observer、启动恢复与组合入口，并在目标设备用真实 Docker/真实模型实例采集停止材料；不改旧 v1 运行路径。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P07 |
+| status | complete |
+| source_commit | `22934b413fcd7ebdefeef0193d6339dd698a4a93`（P06b 记录提交，起点） |
+| implementation_commit | `296577ac44c4fcf5350a152e04a49a1da13a786b` |
+| target_commit | `296577ac44c4fcf5350a152e04a49a1da13a786b`（`git status --porcelain --untracked-files=all` 为空，`git pull --ff-only` fast-forward） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv `/home/jtzn/self-model-switch-build/venv312`） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p07-20260918T0140Z/` |
+
+本任务判定为 `complete`：三条验收均由本轮命令、开发机/目标机测试和真机材料支撑；**不**产生 `software_verified` / `device_backend_ready` 结论（那是 P29—P31 的范围）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `python -m pytest tests/test_process_observer.py tests/test_control_recovery_port.py tests/integration/test_process_lifecycle.py -q`（实现前） | 2 | 3 个文件收集失败（`ImportError: DockerProcessObserver/DeploymentRecovery/CONFIG_LABEL`），即 RED |
+| 同上（实现后，开发机） | 0 | `36 passed` |
+| `python -m pytest tests -m 'not thor' -q`（开发机） | 0 | `421 passed, 1 deselected, 2 warnings`（P06b 基线 397） |
+| `python -m ruff check .`（开发机） | 0 | `All checks passed!` |
+| `python run.py --check-config`（开发机） | 0 | `schema_version=1 models=embedding,qwen-large,qwen-small,reranker`（旧四 ID 未迁移） |
+| 三个测试文件（目标机） | 0 | `36 passed` |
+| `python -m pytest tests -m 'not thor' -q`（目标机） | 1 | `418 passed, 3 failed`；失败全在 `tests/test_release.py`，原因是该测试硬编码 `.venv/bin/python`，目标 checkout 的 3.12 环境不在该路径（P28 范围，非本任务回归） |
+
+### 3. 目标机材料
+
+设备 `jtzn-desktop`，`Linux 5.15.148-tegra` aarch64，L4T `R36.4.7`；证据目录
+
+```text
+/home/jtzn/self-model-switch-evidence/p07-20260918T0140Z/
+  probe.py                         # 本轮探测脚本（从开发机写入证据目录，非 tracked 文件）
+  p07-evidence.json                # 全部步骤、端口/进程/退出/内存事实
+  exited-inspect.json              # deployment A：退出后保留的容器
+  running-inspect-after-stop.json  # deployment B：真实实例 stop 后的容器
+  container-logs.txt               # 真实实例的 llama-server 日志（模型加载完成、listening）
+```
+
+| 场景 | 实测 |
+|---|---|
+| 已退出容器（未删除） | 容器 `5a77ca2edb22cbb55be4dd2871fc2f8fa5550d00b383d81710a90eda528baa8e`，`Status=exited`、`ExitCode=0`，宿主端口 18097 `closed` → 观察 `stopped`（`subprocess_state=absent`） |
+| 真实实例 | 容器 `5d2e3c92ca4fd14100fb7a10b4a6506299687824281ce8ff52f04d85064a95ec`，镜像 `sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8`，`StartedAt=2026-09-18T01:44:54.625625682Z`，18098→8080；模型 `Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` 加载完成并 listening → 观察 `running` 且 identity 完整 |
+| 旧 identity | 同容器 ID、`StartedAt=2026-09-18T00:00:00Z` → `stale_identity`、`accepted=false`，容器仍在运行，未发出 stop |
+| 精确停止 | 真实 identity → 仅按容器 ID `docker stop --time 30`，前台启动者退出 143（SIGTERM），容器保留 `exited (143)`，18098 释放 → 再观察 `stopped` |
+| 启动恢复 | `reconcile` `ok=true`、`stopped_container_ids=[5d2e3c92…]`、`remaining=[]`、关准入先于 docker；另一 deployment 的 `5a77ca2e…` 未被触碰（Id 不变、不在停止集合） |
+| 收尾 | `docker ps -q` 为空、`docker info ContainersRunning=0`；MemAvailable 52576829440 → 52582227968 B（+5.4 MiB） |
+
+`readiness_observations` 首项为 `stopped`：探测脚本在容器创建前未登记任何启动操作，此时"无容器 + 端口 closed"确实成立。
+受管路径由 P06 `SupervisedLaunch` 消除该窗口，`tests/integration/test_process_lifecycle.py::test_a_timed_out_launch_never_clears_the_books_early`
+以真实子进程证明启动者未终结时不得 STOPPED；启动期另有 deployment 独占（P17 `instance_lock`）兜底。
+
+### 4. 未执行 / 未解决
+
+- 未执行：真实候选模型、envelope、30 分钟混合负载、故障注入与最终验收（P20 以后）；本任务只覆盖停止观察与启动恢复。
+- 模型加载只用于产生一个可观察、可精确停止的真实实例，不构成任何能力/性能结论。
+- 未解决：①`tests/test_release.py` 在目标 checkout 因硬编码 `.venv/bin/python` 失败（P28）；②目标 lab venv 依赖（含 pytest/ruff）仍是本轮环境供给，尚未由锁文件安装（P28）；
+  ③新 observer/recovery 尚未接入 HTTP/控制路由与 v2 composition（P17/P18）；④本任务触碰 6 个文件（含 `tests/test_control_recovery_port.py`），略超"约 5 个"。

@@ -768,10 +768,45 @@ gateway/adapter 接线保证，本任务不生成任何自动换模参数，未�
 **Description:** 将C03停止条件接入observer/recovery和组合入口，消除启动时盲目bootstrap。
 **Files likely touched:** `model_scheduler/process_observer.py`、`model_scheduler/control_recovery.py`、`model_scheduler/runtime.py`、`tests/test_process_observer.py`、`tests/integration/test_process_lifecycle.py`。
 **Acceptance criteria:**
-- [ ] stopped容器未删除也可凭exit/启动者退出/空端口证明；Docker失败、未知占端口返回UNKNOWN。
-- [ ] 启动先关准入、核验旧deployment实例并以container ID清理；跨deployment不触碰；旧identity不能停止新实例。
-- [ ] 人为延迟启动到超时之后：停止证据不得提前成功；后续观察实际停止才能清账。
+- [x] stopped容器未删除也可凭exit/启动者退出/空端口证明；Docker失败、未知占端口返回UNKNOWN。
+- [x] 启动先关准入、核验旧deployment实例并以container ID清理；跨deployment不触碰；旧identity不能停止新实例。
+- [x] 人为延迟启动到超时之后：停止证据不得提前成功；后续观察实际停止才能清账。
 **Verification:** `python -m pytest tests/test_process_observer.py tests/test_control_recovery_port.py tests/integration/test_process_lifecycle.py -q`；目标保留容器ID、PID、端口和退出材料。到CP1。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `22934b4`（P06b 记录提交）；实现提交 `296577a`；
+python=3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`）/3.12.14（目标 lab venv）。
+`pytest tests/test_process_observer.py tests/test_control_recovery_port.py tests/integration/test_process_lifecycle.py -q` = 36 passed（实现前三个文件收集即失败）；
+`pytest tests -m 'not thor' -q` = 421 passed, 1 deselected（P06b 基线 397）；`ruff check .` exit 0；`run.py --check-config` 仍输出 `schema_version=1` 与旧四 ID。
+新增 `process_observer.DockerProcessObserver`：按 `deployment`+`model` 双 label 过滤 `docker ps --all --quiet --no-trunc`，逐 id `docker inspect` 严格解析
+（`parse_inspect_payload` 拒绝非数组、缺 id、缺 image、非字符串 label、非 bool Running、缺 Status/ExitCode/StartedAt）；
+RUNNING 需容器 running、登记标签齐全（deployment/model/runtime/config-sha256 等）且固定 loopback 端口 listening；
+STOPPED 只来自 `ports_v3.stopped_is_proven`（容器已退出或不存在、启动操作终结、启动者进程不再存在、端口 closed）；
+docker 列举/解析失败、重复实例、端口 listening 或 unknown、启动操作仍 starting 一律保持 UNKNOWN，`container_absent` 只由成功列举得出。
+`canonical_utc` 将 docker 的纳秒 `StartedAt` 规范化成同一 UTC 拼写（`…Z`、去尾零；`+08:00` 等价实例同值），供 `InstanceIdentity` 比较。
+新增 `control_recovery.DeploymentRecovery`：`reconcile(close_admission, deadline)` **先**调用关准入回调再执行任何 docker I/O，
+按 deployment label 列举本 deployment 容器，逐个核对 inspect 的 `Id` 与 deployment label 后才 `docker stop --time 30 <完整容器ID>`（从不按名字），
+再 inspect 复核 not-running；跨 deployment（label 不符）或 stop 失败/无法复核一律进 `remaining_container_ids` 且 `ok=False`；
+`stop_instance(identity)` 仅在容器 ID、deployment/model label、`StartedAt` 全部匹配时停止，旧 identity 返回 `stale_identity` 且不发 stop，
+`No such object` 结构化 not-found 才算"已不存在"，其他 docker 失败返回 `docker_unavailable`。
+新增 `runtime.reconcile_startup(book, recovery, observers, deadline)`：`book.begin_recovery()` 关闭准入 → reconcile 旧实例 → 逐模型观察，
+仅当容器级清理成功且每个模型都被独立观察为 STOPPED 时才 `finish_recovery` 清账；`build_scheduler(confirmed_stopped=…)` 取代盲目 bootstrap
+（`None` 保留 v1 行为；传入集合时只 bootstrap 有停止证据的模型，其余保持 UNKNOWN，任何 load 都无法准入）。
+**目标核验（`jtzn-desktop`，L4T R36.4.7，干净 checkout fast-forward 到 `296577a`）**：证据目录 `/home/jtzn/self-model-switch-evidence/p07-20260918T0140Z/`
+（`p07-evidence.json`、`exited-inspect.json`、`running-inspect-after-stop.json`、`container-logs.txt`、探测脚本）：
+1. deployment `p07-evidence-exited` 的容器 `5a77ca2e…`（`docker run --runtime=nvidia … --version`，不 `--rm`）以 ExitCode 0 退出后保留 → 观察 `stopped`（port closed、启动者 absent）；
+2. deployment `p07-evidence-live` 的真实实例 `5d2e3c92…`（镜像 `sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8`，StartedAt `2026-09-18T01:44:54.625625682Z`，18098→8080）
+   加载 `Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`（sha256 `3f451333…`，与本记录前核对一致）后 → 观察 `running`（port listening），instance identity 完整（container/started_at/runtime/candidate_digest/image_digest）；
+3. 同容器 ID 但 `StartedAt` 提前的旧 identity → `stale_identity`、`accepted=false`，容器仍在运行（未发 stop）；
+4. 真实 identity `stop_instance` → 只按容器 ID `docker stop`，前台启动者退出 143（SIGTERM），容器保留为 `exited (143)`、18098 端口释放 → 再观察 `stopped`；
+5. `reconcile` → `ok=true`、`stopped_container_ids=[5d2e3c92…]`、关准入回调先于 docker 调用，另一 deployment 的容器 `5a77ca2e…` 未被触碰（不在停止集合，Id 不变）；
+6. 收尾 `docker info ContainersRunning=0`、`docker ps -q` 为空；MemAvailable 52576829440 B → 52582227968 B（+5.4 MiB，未泄漏）。
+目标全量 `pytest tests -m 'not thor' -q` = 418 passed、3 failed：均为 `tests/test_release.py` 硬编码 `.venv/bin/python`
+（目标 checkout 的 3.12 环境在 `/home/jtzn/self-model-switch-build/venv312`），属 P28 的发布/CI 范围，与 P07 无关。
+未解决/边界：①目标探测脚本未登记启动操作，因此容器创建前的首个采样读作 `stopped`（`readiness_observations` 首项为 `stopped`）；
+受管路径由 P06 `SupervisedLaunch` 消除，`tests/integration/test_process_lifecycle.py::test_a_timed_out_launch_never_clears_the_books_early`
+以真实子进程证明"超时后仍 starting → 不得 STOPPED"，启动期另有 deployment 独占（P17 instance_lock）兜底；
+②本任务触碰 6 个文件（多出 `tests/test_control_recovery_port.py`，因为 `DeploymentRecovery` 的单元测试落在其既有文件），略超"约 5 个"；
+③v1 `ProcessObserver` 与根 helper `ControlRecoveryClient` 保留未改，旧四 ID 运行行为不变；新 observer/recovery 尚未接入 HTTP/控制路由与 v2 composition（P17/P18）。到 CP1。
 
 ### P08 — 动态模型账本和双内存准入（M03）
 
