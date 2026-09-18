@@ -535,3 +535,198 @@ def test_the_deploy_cli_routes_the_v3_render_and_requires_the_model_directory(tm
                            "--mode", "production", "--output", str(tmp_path / "cli-2")])
     assert missing == EXIT_INPUT
     assert "model-directory" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# P27: service rendering, the switch sequence and the rollback
+# ---------------------------------------------------------------------------
+
+
+def _p27_inputs(**overrides):
+    base = dict(service_user="model-scheduler", service_group="model-scheduler", client_uid=1003,
+                client_group="sms-client", socket_path="/run/self-model-switch/control.sock",
+                model_mount="/media/jtzn/sandisk-ext4", model_directory="/media/jtzn/sandisk-ext4/models",
+                mount_unit="media-jtzn-sandisk\\x2dext4.mount", blob_root="/var/lib/self-model-switch/blobs",
+                blob_disk_uuid="25e77400-6e42-470b-bf06-1a5e6dd2b548", blob_quota_bytes=17179869184,
+                release_root="/opt/self-model-switch/releases",
+                config_path="/etc/self-model-switch/config.yaml",
+                swap_config_path="/etc/self-model-switch/llama-swap.yaml")
+    base.update(overrides)
+    return deploy_module.ServiceInputs(**base)
+
+
+class FakeOps:
+    """A scripted site: every step can be broken and every call is recorded."""
+
+    def __init__(self, **overrides) -> None:
+        self.calls: list[str] = []
+        self.release: str | None = "release-old"
+        self.closed = {"closed": True}
+        self.drained = {"queue_depth": 0, "leases": 0, "sessions": 0}
+        self.stopped = {"stopped": True, "instances": []}
+        self.preflight = {"accepted": True}
+        self.started = {"running": True}
+        self.smoke_ok = {"ok": True}
+        self.restored = {"restored": True}
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+    def current_release(self):
+        self.calls.append("current_release")
+        return self.release
+
+    def close_admission(self):
+        self.calls.append("close_admission")
+        return self.closed
+
+    def drain(self):
+        self.calls.append("drain")
+        return self.drained
+
+    def prove_instances_stopped(self):
+        self.calls.append("prove_instances_stopped")
+        return self.stopped
+
+    def preflight_release(self, release):
+        self.calls.append("preflight_release")
+        return self.preflight
+
+    def switch_current(self, release):
+        self.calls.append("switch_current")
+        self.release = release
+        return {"current": release}
+
+    def start(self):
+        self.calls.append("start")
+        return self.started
+
+    def smoke(self):
+        self.calls.append("smoke")
+        return self.smoke_ok
+
+    def reopen_admission(self):
+        self.calls.append("reopen_admission")
+        return {"closed": False}
+
+    def restore_blob_metadata(self, backup):
+        self.calls.append(f"restore_blob_metadata:{backup}")
+        return self.restored
+
+
+def test_the_service_units_render_every_site_value_from_the_inputs(tmp_path) -> None:
+    result = deploy_module.render_service_units(inputs=_p27_inputs(), output=tmp_path / "units")
+
+    scheduler = (tmp_path / "units" / "model-scheduler.service").read_text(encoding="utf-8")
+    assert result["video_units"] == 0 and result["socket_mode"] == "0660"
+    assert "@SSD_MOUNT_UNIT@" not in scheduler and "/mnt/model-ssd" not in scheduler
+    assert "media-jtzn-sandisk\\x2dext4.mount" in scheduler
+    assert "User=model-scheduler" in scheduler and "Group=model-scheduler" in scheduler
+    assert "ReadOnlyPaths=/media/jtzn/sandisk-ext4/models" in scheduler
+    assert "RequiresMountsFor=/media/jtzn/sandisk-ext4/models" in scheduler
+    assert "SMS_CONTROL_SOCKET_MODE=0660" in scheduler and "SMS_CLIENT_UID=1003" in scheduler
+    assert "SMS_CLIENT_GROUP=sms-client" in scheduler and "SMS_BLOB_QUOTA_BYTES=17179869184" in scheduler
+    assert "SMS_BLOB_DISK_UUID=25e77400-6e42-470b-bf06-1a5e6dd2b548" in scheduler
+    assert "/opt/self-model-switch/releases/current/.venv/bin/python" in scheduler
+    sudoers = tmp_path / "units" / "sudoers.model-scheduler"
+    assert sudoers.is_file() and (sudoers.stat().st_mode & 0o777) == 0o440
+    facts = json.loads((tmp_path / "units" / "service-facts.json").read_text(encoding="utf-8"))
+    assert facts["video_units"] == 0 and facts["socket_mode"] == "0660"
+
+
+def test_a_video_unit_is_never_rendered(tmp_path) -> None:
+    with pytest.raises(deploy_module.DeployError, match="never renders a video unit"):
+        deploy_module.render_service_units(inputs=_p27_inputs(video_unit=True), output=tmp_path / "units")
+
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    for name in ("model-scheduler.service.in", "llama-swap.service.in", "sudoers.model-scheduler"):
+        (templates / name).write_text((Path("deploy") / name).read_text(encoding="utf-8"), encoding="utf-8")
+    (templates / "video.service.in").write_text("[Unit]\nDescription=nope\n", encoding="utf-8")
+    with pytest.raises(deploy_module.DeployError, match="forbidden unit template"):
+        deploy_module.render_service_units(inputs=_p27_inputs(), output=tmp_path / "units-2",
+                                           template_root=templates)
+
+
+def test_the_service_inputs_are_validated(tmp_path) -> None:
+    for override, message in (({"socket_mode": "0664"}, "client group contract"),
+                              ({"model_directory": "relative/models"}, "absolute path"),
+                              ({"blob_disk_uuid": "not-a-uuid"}, "filesystem UUID"),
+                              ({"blob_quota_bytes": 0}, "positive integer"),
+                              ({"client_uid": 0}, "positive integer")):
+        with pytest.raises(deploy_module.DeployError, match=message):
+            deploy_module.render_service_units(inputs=_p27_inputs(**override), output=tmp_path / "never")
+
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    (occupied / "keep").write_text("x", encoding="utf-8")
+    with pytest.raises(deploy_module.DeployError, match="non-empty"):
+        deploy_module.render_service_units(inputs=_p27_inputs(), output=occupied)
+
+
+def test_the_switch_sequence_proves_stopped_before_touching_current() -> None:
+    ops = FakeOps()
+
+    result = deploy_module.switch_release(ops=ops, release="release-new", metadata_backup="blob-backup-1")
+
+    assert result["ok"] is True and result["switched"] is True
+    assert ops.release == "release-new"
+    assert ops.calls.index("prove_instances_stopped") < ops.calls.index("switch_current")
+    assert ops.calls.index("preflight_release") < ops.calls.index("switch_current")
+    assert "reopen_admission" in ops.calls
+
+
+def test_a_switch_aborts_before_current_when_anything_is_unproven() -> None:
+    blocked = FakeOps(stopped={"stopped": False, "instances": ["sms-lab-qwen-small"]})
+    result = deploy_module.switch_release(ops=blocked, release="release-new")
+    assert result["ok"] is False and result["switched"] is False
+    assert "switch_current" not in blocked.calls  # current was never touched
+    assert "reopen_admission" in blocked.calls
+
+    busy = FakeOps(drained={"queue_depth": 1, "leases": 0, "sessions": 0})
+    assert deploy_module.switch_release(ops=busy, release="release-new")["switched"] is False
+    assert "switch_current" not in busy.calls
+
+    refused = FakeOps(preflight={"accepted": False})
+    result = deploy_module.switch_release(ops=refused, release="release-new")
+    assert result["switched"] is False and "switch_current" not in refused.calls
+    assert any("preflight" in problem for problem in result["problems"])
+
+
+def test_a_failure_after_the_switch_is_reported_for_repair() -> None:
+    ops = FakeOps(smoke_ok={"ok": False})
+
+    result = deploy_module.switch_release(ops=ops, release="release-new", metadata_backup="blob-backup-1")
+
+    assert result["switched"] is True and result["ok"] is False and result["repair_required"] is True
+    assert result["rollback_release"] == "release-old" and result["metadata_backup"] == "blob-backup-1"
+
+
+def test_a_rollback_restores_the_accepted_release_and_compatible_metadata() -> None:
+    ops = FakeOps()
+
+    result = deploy_module.rollback_release(ops=ops, accepted_release="release-old", metadata_backup="blob-backup-1",
+                                            downgrade_compatible=False)
+
+    assert result["ok"] is True and result["rolled_back"] is True and ops.release == "release-old"
+    assert "restore_blob_metadata:blob-backup-1" in ops.calls
+
+    compatible = FakeOps()
+    deploy_module.rollback_release(ops=compatible, accepted_release="release-old", metadata_backup=None,
+                                   downgrade_compatible=True)
+    assert not any(call.startswith("restore_blob_metadata") for call in compatible.calls)
+
+
+def test_a_rollback_without_an_accepted_release_or_backup_is_refused() -> None:
+    ops = FakeOps()
+
+    result = deploy_module.rollback_release(ops=ops, accepted_release=None, metadata_backup=None,
+                                            downgrade_compatible=True)
+
+    assert result["status"] == "stopped_for_repair" and result["rolled_back"] is False
+    assert "switch_current" not in ops.calls and "start" not in ops.calls
+
+    incompatible = FakeOps()
+    result = deploy_module.rollback_release(ops=incompatible, accepted_release="release-old", metadata_backup=None,
+                                            downgrade_compatible=False)
+    assert result["ok"] is False and any("backup" in problem for problem in result["problems"])
+    assert "switch_current" not in incompatible.calls

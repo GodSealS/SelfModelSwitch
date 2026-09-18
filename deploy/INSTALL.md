@@ -31,3 +31,41 @@ rendered manifest.
    all A01–A20 marked `passed` permits a production-ready declaration.
 
 For recovery and rollback, see `docs/operations.md` in the release archive.
+
+## Service units, switching and rollback (P27)
+
+Render the two units and the sudoers rule from **explicit deployment inputs**
+(`ServiceInputs`): service user/group, client UID/group, control socket path with
+mode `0660`, blob root + disk UUID + quota, the model-disk mount unit and the
+read-only model directory. Nothing falls back to a template default, the model
+directory is mounted read-only, and no video/media unit is ever generated (the
+renderer refuses a `video_unit=True` input or a stray `video*.service.in`
+template).
+
+```python
+from pathlib import Path
+from model_scheduler.deploy import ServiceInputs, render_service_units, switch_release, rollback_release
+
+render_service_units(output=Path("build/units"), inputs=ServiceInputs(
+    service_user="model-scheduler", service_group="model-scheduler",
+    client_uid=1003, client_group="sms-client",
+    socket_path="/run/self-model-switch/control.sock",
+    model_mount="/media/<disk>", model_directory="/media/<disk>/models",
+    mount_unit="media-...mount", blob_root="/var/lib/self-model-switch/blobs",
+    blob_disk_uuid="<uuid>", blob_quota_bytes=17179869184,
+    release_root="/opt/self-model-switch/releases",
+    config_path="/etc/self-model-switch/config.yaml",
+    swap_config_path="/etc/self-model-switch/llama-swap.yaml"))
+```
+
+Switch order (enforced by `switch_release`): close admission → drain (queue,
+leases, sessions all zero) → **prove the old instances stopped** → preflight the
+new release → move `current` → start → smoke → reopen admission. A failure before
+the `current` move leaves the running release untouched; a failure after it is
+returned with `repair_required` plus the previous release to roll back to.
+
+Rollback (`rollback_release`): restore the accepted older release and config; if
+the downgrade cannot read the upgraded blob metadata, restore the backup taken
+**before** the upgrade; with no accepted older candidate the site stops for a
+manual repair instead of guessing one. Units are reviewed with
+`systemd-analyze verify` before installation.

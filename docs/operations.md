@@ -105,3 +105,19 @@ failure leaves models accounted as errors. To roll back, stop the services,
 repointer `current` to the previously verified release, run `daemon-reload`,
 then start services and recheck `/health`. Never roll back model files or modify
 unrelated Docker containers as part of this procedure.
+
+## Upgrade, rollback and blob metadata (P27)
+
+1. Render the new release's units from the deployment inputs (see
+   `deploy/INSTALL.md`); the model directory stays read-only and the control
+   socket stays `0660` with the registered client group.
+2. Take the blob-metadata backup **before** switching — a downgrade that cannot
+   read the upgraded metadata restores this backup.
+3. Run the switch sequence (`deploy.switch_release`): admission closed → drained
+   → instances proven stopped → preflight → `current` switch → start → smoke.
+   Anything unproven aborts before `current` moves.
+4. On a failed smoke after the switch, roll back (`deploy.rollback_release`) to
+   the accepted release recorded in the switch result; without an accepted older
+   candidate the site stops for repair.
+5. Record the resulting systemd/PID/socket state (unit states, `current` target,
+   socket owner/mode) with the release id.

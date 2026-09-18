@@ -13,7 +13,8 @@ import platform
 import re
 import subprocess
 import sys
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any, Mapping, Protocol
 
 import yaml
 
@@ -536,6 +537,257 @@ def migrate(source: str | Path, output: str | Path) -> dict[str, Any]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(yaml.safe_dump(migrated, sort_keys=False), encoding="utf-8")
     return migrated
+
+
+SERVICE_TEMPLATES = ("model-scheduler.service.in", "llama-swap.service.in")
+FORBIDDEN_UNIT_NAMES = ("video", "media", "transcode", "av1", "nvenc")
+_SOCKET_MODE = "0660"
+_UUIDISH = re.compile(r"[0-9A-Fa-f][0-9A-Fa-f-]{7,}\Z")
+
+
+@dataclass(frozen=True)
+class ServiceInputs:
+    """Every value the service units are rendered from (no site path is hardcoded)."""
+
+    service_user: str
+    service_group: str
+    client_uid: int
+    client_group: str
+    socket_path: str
+    model_mount: str
+    model_directory: str
+    mount_unit: str
+    blob_root: str
+    blob_disk_uuid: str
+    blob_quota_bytes: int
+    release_root: str
+    config_path: str
+    swap_config_path: str
+    listen: str = "127.0.0.1:8080"
+    socket_mode: str = _SOCKET_MODE
+    video_unit: bool = False
+
+    def validate(self) -> None:
+        if self.video_unit:
+            raise DeployError("this deployment never renders a video unit: the video project has its own release flow")
+        for label, value in (("model_mount", self.model_mount), ("model_directory", self.model_directory),
+                             ("release_root", self.release_root), ("config_path", self.config_path),
+                             ("swap_config_path", self.swap_config_path), ("socket_path", self.socket_path)):
+            if not isinstance(value, str) or not value.startswith("/"):
+                raise DeployError(f"{label} must be an absolute path")
+        if self.socket_mode != _SOCKET_MODE:
+            raise DeployError(f"the control socket must be {_SOCKET_MODE}; it carries the client group contract")
+        if isinstance(self.client_uid, bool) or not isinstance(self.client_uid, int) or self.client_uid <= 0:
+            raise DeployError("client_uid must be a positive integer")
+        if not self.client_group or not self.service_user or not self.service_group:
+            raise DeployError("service user/group and client group are required")
+        if not _UUIDISH.fullmatch(self.blob_disk_uuid):
+            raise DeployError("blob_disk_uuid must be a filesystem UUID: the blob store never lands on an unverified disk")
+        if isinstance(self.blob_quota_bytes, bool) or not isinstance(self.blob_quota_bytes, int) \
+                or self.blob_quota_bytes <= 0:
+            raise DeployError("blob_quota_bytes must be a positive integer")
+        for name in FORBIDDEN_UNIT_NAMES:
+            if name in Path(self.swap_config_path).name.lower() or name in Path(self.config_path).name.lower():
+                raise DeployError(f"the configuration names a {name!r} unit: this deployment renders none")
+
+
+def render_service_units(*, inputs: ServiceInputs, output: str | Path,
+                         template_root: str | Path | None = None) -> dict[str, Any]:
+    """Render the scheduler and llama-swap units plus the sudoers rule (P27).
+
+    Every site value comes from `inputs`; the model directory is mounted
+    read-only and the control socket contract (0660 + client group) is recorded
+    in the unit environment. No video/media unit is ever produced.
+    """
+    inputs.validate()
+    target = Path(output)
+    if target.exists() and any(target.iterdir()):
+        raise DeployError("refusing to render service units into a non-empty directory")
+    templates = Path(template_root) if template_root is not None else Path(__file__).resolve().parent.parent / "deploy"
+    stray = [path.name for path in templates.iterdir()
+             if path.name.endswith(".service.in") and any(word in path.name.lower() for word in FORBIDDEN_UNIT_NAMES)]
+    if stray:
+        raise DeployError(f"a forbidden unit template is present: {', '.join(sorted(stray))}")
+
+    rendered: dict[str, str] = {}
+    for name in SERVICE_TEMPLATES:
+        path = templates / name
+        if not path.is_file():
+            raise DeployError(f"the service template {name} is missing")
+        text = path.read_text(encoding="utf-8")
+        text = text.replace("@SSD_MOUNT_UNIT@", inputs.mount_unit)
+        text = text.replace("/mnt/model-ssd", inputs.model_mount)
+        text = text.replace("/opt/self-model-switch/current", f"{inputs.release_root}/current")
+        text = text.replace("/etc/self-model-switch/config.yaml", inputs.config_path)
+        text = text.replace("/etc/self-model-switch/llama-swap.yaml", inputs.swap_config_path)
+        text = text.replace("User=model-scheduler", f"User={inputs.service_user}")
+        text = text.replace("Group=model-scheduler", f"Group={inputs.service_group}")
+        text = text.replace("RuntimeDirectory=model-scheduler self-model-switch",
+                            f"RuntimeDirectory={inputs.service_user} {Path(inputs.socket_path).parent.name}")
+        text = text.replace("127.0.0.1:8080", inputs.listen)
+        extras = [
+            f"ReadOnlyPaths={inputs.model_directory}",
+            f"RequiresMountsFor={inputs.model_directory}",
+            f"Environment=SMS_CONTROL_SOCKET={inputs.socket_path}",
+            f"Environment=SMS_CONTROL_SOCKET_MODE={inputs.socket_mode}",
+            f"Environment=SMS_CLIENT_UID={inputs.client_uid}",
+            f"Environment=SMS_CLIENT_GROUP={inputs.client_group}",
+            f"Environment=SMS_BLOB_ROOT={inputs.blob_root}",
+            f"Environment=SMS_BLOB_DISK_UUID={inputs.blob_disk_uuid}",
+            f"Environment=SMS_BLOB_QUOTA_BYTES={inputs.blob_quota_bytes}",
+        ]
+        marker = "\n[Install]"
+        text = text.replace(marker, "\n" + "\n".join(extras) + marker) if marker in text else text + "\n" + "\n".join(extras) + "\n"
+        rendered[name.removesuffix(".in")] = text
+
+    sudoers = templates / "sudoers.model-scheduler"
+    if not sudoers.is_file():
+        raise DeployError("the sudoers template is missing")
+    rendered["sudoers.model-scheduler"] = sudoers.read_text(encoding="utf-8").replace("model-scheduler",
+                                                                                      inputs.service_user)
+
+    target.mkdir(parents=True, exist_ok=True)
+    for name, text in sorted(rendered.items()):
+        path = target / name
+        if any(word in name.lower() for word in FORBIDDEN_UNIT_NAMES):
+            raise DeployError(f"refusing to write a forbidden unit {name!r}")
+        path.write_text(text, encoding="utf-8")
+        if name == "sudoers.model-scheduler":
+            path.chmod(0o440)
+    facts = {"schema_version": 1, "service_user": inputs.service_user, "service_group": inputs.service_group,
+             "client_uid": inputs.client_uid, "client_group": inputs.client_group,
+             "socket_path": inputs.socket_path, "socket_mode": inputs.socket_mode,
+             "model_mount": inputs.model_mount, "model_directory": inputs.model_directory,
+             "mount_unit": inputs.mount_unit, "blob_root": inputs.blob_root,
+             "blob_disk_uuid": inputs.blob_disk_uuid, "blob_quota_bytes": inputs.blob_quota_bytes,
+             "release_root": inputs.release_root, "video_units": 0}
+    (target / "service-facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {"ok": True, "output": str(target), "units": [name for name in sorted(rendered)],
+            "socket_mode": inputs.socket_mode, "video_units": 0}
+
+
+class OpsPort(Protocol):
+    """The site operations the switch/rollback sequences are allowed to perform."""
+
+    def current_release(self) -> str | None: ...
+
+    def close_admission(self) -> Mapping[str, Any]: ...
+
+    def drain(self) -> Mapping[str, Any]: ...
+
+    def prove_instances_stopped(self) -> Mapping[str, Any]: ...
+
+    def preflight_release(self, release: str) -> Mapping[str, Any]: ...
+
+    def switch_current(self, release: str) -> Mapping[str, Any]: ...
+
+    def start(self) -> Mapping[str, Any]: ...
+
+    def smoke(self) -> Mapping[str, Any]: ...
+
+    def reopen_admission(self) -> Mapping[str, Any]: ...
+
+    def restore_blob_metadata(self, backup: str) -> Mapping[str, Any]: ...
+
+
+def _ops_step(document: list[dict], failures: list[str], label: str, action) -> Mapping[str, Any]:
+    try:
+        result = dict(action() or {})
+    except Exception as exc:  # noqa: BLE001 - a crashed step blocks the sequence, it never passes it
+        failures.append(f"{label}: {type(exc).__name__}: {exc}")
+        document.append({"step": label, "ok": False, "error": str(exc)})
+        return {}
+    document.append({"step": label, "ok": True, "facts": result})
+    return result
+
+
+def switch_release(*, ops: OpsPort, release: str, metadata_backup: str | None = None) -> dict[str, Any]:
+    """admission closed → drained → stopped proven → preflight → switch → start → smoke.
+
+    `current` is switched **only** after the old instances are proven stopped; a
+    failure before that point leaves the running release untouched.
+    """
+    steps: list[dict] = []
+    failures: list[str] = []
+    previous = ops.current_release()
+    admission = _ops_step(steps, failures, "close_admission", ops.close_admission)
+    if admission.get("closed") is not True:
+        failures.append("admission was not closed")
+    drained = _ops_step(steps, failures, "drain", ops.drain)
+    for key in ("queue_depth", "leases", "sessions"):
+        if drained.get(key) != 0:
+            failures.append(f"the drain still reports {key}={drained.get(key)!r}")
+    stopped = _ops_step(steps, failures, "prove_instances_stopped", ops.prove_instances_stopped)
+    if stopped.get("stopped") is not True:
+        failures.append("the running instances were not proven stopped: current is not switched")
+    preflight = _ops_step(steps, failures, "preflight_release", lambda: ops.preflight_release(release))
+    if preflight.get("accepted") is not True:
+        failures.append(f"the new release {release!r} did not pass preflight")
+    if failures:
+        _ops_step(steps, [], "reopen_admission", ops.reopen_admission)
+        return {"ok": False, "switched": False, "previous_release": previous, "steps": steps,
+                "problems": failures, "repair_required": False}
+
+    switched = _ops_step(steps, failures, "switch_current", lambda: ops.switch_current(release))
+    started = _ops_step(steps, failures, "start", ops.start)
+    smoke = _ops_step(steps, failures, "smoke", ops.smoke)
+    problems: list[str] = list(failures)
+    if switched.get("current") != release:
+        problems.append("current does not point at the new release")
+    if started.get("running") is not True:
+        problems.append("the scheduler did not start")
+    if smoke.get("ok") is not True:
+        problems.append("the smoke check failed")
+    if problems:
+        # the switch already happened: the site is left in a known, repairable state
+        return {"ok": False, "switched": True, "previous_release": previous, "release": release, "steps": steps,
+                "problems": problems, "repair_required": True, "rollback_release": previous,
+                "metadata_backup": metadata_backup}
+    _ops_step(steps, [], "reopen_admission", ops.reopen_admission)
+    return {"ok": True, "switched": True, "previous_release": previous, "release": release, "steps": steps,
+            "problems": [], "repair_required": False}
+
+
+def rollback_release(*, ops: OpsPort, accepted_release: str | None, metadata_backup: str | None,
+                     downgrade_compatible: bool) -> dict[str, Any]:
+    """Restore the accepted release (and compatible metadata) or stop for repair.
+
+    Without an accepted older candidate the site does **not** guess one: it stops
+    and asks for a repair. Metadata is restored from the backup taken before the
+    upgrade whenever the downgrade cannot read the upgraded format.
+    """
+    if accepted_release is None:
+        stopped = _ops_step([], [], "stop_for_repair", ops.close_admission)
+        return {"ok": False, "rolled_back": False, "status": "stopped_for_repair",
+                "problems": ["no accepted older candidate exists: the site stops and is repaired by hand"],
+                "admission": stopped}
+    steps: list[dict] = []
+    failures: list[str] = []
+    _ops_step(steps, failures, "close_admission", ops.close_admission)
+    _ops_step(steps, failures, "prove_instances_stopped", ops.prove_instances_stopped)
+    if not downgrade_compatible:
+        if metadata_backup is None:
+            failures.append("the downgrade is not metadata-compatible and no pre-upgrade backup exists")
+        else:
+            restored = _ops_step(steps, failures, "restore_blob_metadata",
+                                 lambda: ops.restore_blob_metadata(metadata_backup))
+            if restored.get("restored") is not True:
+                failures.append("the blob metadata backup was not restored")
+    if failures:
+        # an incompatible downgrade without its backup must not touch the running release
+        return {"ok": False, "rolled_back": False, "release": accepted_release, "steps": steps,
+                "problems": failures, "status": "repair_required"}
+    switched = _ops_step(steps, failures, "switch_current", lambda: ops.switch_current(accepted_release))
+    started = _ops_step(steps, failures, "start", ops.start)
+    smoke = _ops_step(steps, failures, "smoke", ops.smoke)
+    if switched.get("current") != accepted_release:
+        failures.append("current does not point at the accepted release")
+    if started.get("running") is not True:
+        failures.append("the restored scheduler did not start")
+    if smoke.get("ok") is not True:
+        failures.append("the smoke check after the rollback failed")
+    return {"ok": not failures, "rolled_back": not failures, "release": accepted_release, "steps": steps,
+            "problems": failures, "status": "running" if not failures else "repair_required"}
 
 
 def _is_v3_manifest(manifest_path: str | Path) -> bool:
