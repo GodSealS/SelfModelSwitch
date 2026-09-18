@@ -520,3 +520,29 @@ async def test_a_malformed_blob_id_never_matches_a_route(api) -> None:
     response = await _call(api, "GET", "/internal/blobs/BAD_ID", headers=(VERSION,))
 
     assert response.status == 404 and _error(response).code == "not_found"
+
+
+async def test_a_missing_peer_credential_is_403_peer_forbidden(api) -> None:
+    response = _Response()
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response.status = int(message["status"])
+        elif message["type"] == "http.response.body":
+            response.body += bytes(message.get("body", b""))
+
+    await api(_scope("GET", "/internal/blobs/x", (VERSION,), peer=None), receive, send)
+
+    assert response.status == 403 and _error(response).code == "peer_forbidden"
+
+
+async def test_a_json_body_over_the_inline_cap_is_413(sessions) -> None:
+    api, _, _ = sessions
+    chunks = [b"x" * (1024 * 1024)] * 5  # 5 MiB against the 4 MiB inline cap
+
+    response = await _call(api, "POST", "/internal/sessions", headers=(VERSION,), chunks=chunks)
+
+    assert response.status == 413 and _error(response).code == "payload_too_large"
