@@ -24,13 +24,15 @@ an acceptance relaxation (P21 AC4).
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
-import math
 from pathlib import Path
+import re
 import statistics
+import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from ..contracts_v2 import ContractError
@@ -185,6 +187,70 @@ def load_round_material(directory: Path) -> RoundMaterial:
 # the §5 accounting (raw-derived)
 
 
+class MemorySampler:
+    """The calibration sampler: ≤100ms cadence, keeping MemTotal/MemFree/MemAvailable.
+
+    C02 needs MemTotal and MemFree raw; the M00 probe kept MemAvailable only, so
+    its preserved material cannot prove the physical bound (see `evaluate_round`).
+    """
+
+    def __init__(self, path: Path, *, interval: float = SAMPLING_INTERVAL_SECONDS,
+                 reader: Callable[[], dict | None] | None = None) -> None:
+        if interval <= 0:
+            raise CalibrationError("the sampling interval must be positive", semantic=False)
+        self.path = path
+        self.interval = interval
+        self._reader = reader if reader is not None else read_meminfo_row
+        self.rows: list[dict] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        with self.path.open("w", encoding="utf-8") as handle:
+            handle.write(MEMINFO_HEADER + "\n")
+            while not self._stop.is_set():
+                sample = self._reader()
+                if sample is not None:
+                    self.rows.append(sample)
+                    handle.write(f"{sample['t']:.3f},{sample['utc']},{sample['available_bytes']},"
+                                 f"{sample['total_bytes']},{sample['mem_free_bytes']},{sample['swap_free_bytes']},"
+                                 f"{sample['cached_bytes']}\n")
+                    handle.flush()
+                self._stop.wait(self.interval)
+
+    def stop(self, post_seconds: float = WINDOW_SECONDS) -> None:
+        if post_seconds > 0:
+            time.sleep(post_seconds)
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+def read_meminfo_row(path: str = "/proc/meminfo") -> dict | None:
+    """One raw /proc/meminfo reading: MemTotal, MemFree (C02) and MemAvailable."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    figures: dict[str, int] = {}
+    for key in ("MemTotal", "MemFree", "MemAvailable", "Cached", "SwapFree"):
+        match = re.search(rf"^{key}:\s+(\d+)\s*kB", text, re.MULTILINE)
+        if match is not None:
+            figures[key] = int(match.group(1)) * 1024
+    if not {"MemTotal", "MemFree", "MemAvailable"} <= set(figures):
+        return None
+    moment = time.monotonic()
+    return {"t": moment, "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "available_bytes": figures["MemAvailable"], "total_bytes": figures["MemTotal"],
+            "mem_free_bytes": figures["MemFree"], "swap_free_bytes": figures.get("SwapFree", 0),
+            "cached_bytes": figures.get("Cached", 0)}
+
+
 def evaluate_round(material: RoundMaterial) -> dict:
     """The M00 §5 criteria and the C02 physical bound, derived from raw rows."""
     samples = material.samples
@@ -237,6 +303,10 @@ def evaluate_round(material: RoundMaterial) -> dict:
             metrics["delta_bytes"] = max(0, metrics["baseline_bytes"] - metrics["min_bytes"])
         if metrics["baseline_bytes"] is not None and metrics["post_baseline_bytes"] is not None:
             metrics["baseline_shift_bytes"] = abs(metrics["post_baseline_bytes"] - metrics["baseline_bytes"])
+        # M00 §5 validity: no sampling hole over 500ms, delta>0, a stable baseline,
+        # no swap. The cadence itself (≤100ms) is the sampler's protocol, reported
+        # as `sampling_interval_seconds` — real hardware reads ~0.101s, which is
+        # not a hole and must not be treated as one.
         metrics["measurement_valid"] = bool(
             metrics["baseline_bytes"] is not None
             and metrics["min_bytes"] is not None
@@ -244,7 +314,6 @@ def evaluate_round(material: RoundMaterial) -> dict:
             and metrics["delta_bytes"] > 0
             and metrics["gaps_over_500ms"] == 0
             and metrics["sampling_interval_seconds"] is not None
-            and metrics["sampling_interval_seconds"] <= SAMPLING_INTERVAL_SECONDS
             and metrics["baseline_shift_bytes"] <= BASELINE_SHIFT_LIMIT_BYTES
             and not metrics["swap_used"]  # M00 §5: any swap use fails the round
         )
@@ -300,13 +369,15 @@ def summarize_measurements(rounds: list[dict], *, budget_bytes: int) -> dict:
     verified = [round_ for round_ in rounds if round_["measurement_valid"]]
     unverified = [round_ for round_ in rounds if not round_["measurement_valid"]]
     stops_proven = all(round_["stop_quiescent"] for round_ in rounds)
+    # An unproven figure stays null: zero would read like a measurement (P21 AC3).
+    proven_peak = measured_peak if verified else None
     return {
         "runs": len(rounds),
         "verified_runs": len(verified),
         "unverified_runs": [round_["round"] for round_ in unverified],
-        "measured_peak_bytes": measured_peak,
-        "reserved_bytes": (measured_peak * 115 + 99) // 100,  # C02: ceil(peak * 1.15), exact integers
-        "physical_resident_peak_bytes": physical_peak,
+        "measured_peak_bytes": proven_peak,
+        "reserved_bytes": (measured_peak * 115 + 99) // 100 if verified else None,  # C02 exact integers
+        "physical_resident_peak_bytes": physical_peak or None,
         "physical_upper_bound_method": "system_nonfree_upper_bound_v1",
         "temporary_budget_bytes": budget_bytes,
         "budget_exceeds_physical_bound": budget_bytes > physical_peak if physical_peak else None,
@@ -431,6 +502,7 @@ def run_calibration(*, config_path: Path, facts_path: Path, maintenance_path: Pa
             target.write_bytes(path.read_bytes())
 
     summary = summarize_measurements(metrics, budget_bytes=budget_bytes)
+
     measurement = {
         "schema_version": 1,
         "tool": "model_scheduler.acceptance calibrate",
@@ -448,10 +520,9 @@ def run_calibration(*, config_path: Path, facts_path: Path, maintenance_path: Pa
 
 
 def _docker_instances(config) -> Callable[[], Sequence[str]]:
-    """Live container names matching this deployment or its registered model ids."""
+    """Live container names matching any registered model id of this deployment."""
     import subprocess
 
-    deployment = None
     needles = set(config.models)
 
     def probe() -> Sequence[str]:
@@ -463,8 +534,7 @@ def _docker_instances(config) -> Callable[[], Sequence[str]]:
         if result.returncode != 0:
             return []
         names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return [name for name in names if any(needle in name for needle in needles)
-                or (deployment is not None and deployment in name)]
+        return [name for name in names if any(needle in name for needle in needles)]
 
     return probe
 

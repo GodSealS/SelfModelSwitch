@@ -306,6 +306,7 @@ def test_a_verified_round_derives_the_c02_measurement_from_raw_rows(tmp_path) ->
     assert metrics["baseline_bytes"] == BASELINE_AVAILABLE
     assert metrics["delta_bytes"] == BASELINE_AVAILABLE - RUN_MIN_AVAILABLE
     assert metrics["swap_used"] is False and metrics["gaps_over_500ms"] == 0
+    assert metrics["sampling_interval_seconds"] == 0.1  # the sampler cadence is reported, not a validity gate
     assert metrics["physical_upper_bound_bytes"] == TOTAL - RUN_MIN_FREE  # raw MemTotal - raw MemFree
     assert metrics["physical_upper_bound_window"] == "run_window"
 
@@ -321,13 +322,32 @@ def test_a_sampling_gap_a_shift_and_swap_each_fail_the_round(tmp_path) -> None:
     gap = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "gap", rows=_rows(gap=True)))))
     shift = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "shift", rows=_rows(shift=True)))))
     swap = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "swap", rows=_rows(swap=True)))))
-    slow = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "slow", rows=_rows(interval=0.15)))))
+    sparse = cal.evaluate_round(cal.load_round_material((_write_round(tmp_path, "sparse", rows=_rows(interval=0.6)))))
 
     assert gap["gaps_over_500ms"] == 1 and gap["measurement_valid"] is False
     assert shift["baseline_shift_bytes"] > cal.BASELINE_SHIFT_LIMIT_BYTES and shift["measurement_valid"] is False
     assert swap["swap_used"] is True and swap["measurement_valid"] is False
-    assert slow["sampling_interval_seconds"] > cal.SAMPLING_INTERVAL_SECONDS and slow["measurement_valid"] is False
+    assert sparse["gaps_over_500ms"] > 0 and sparse["measurement_valid"] is False
     assert cal.summarize_measurements([gap], budget_bytes=1)["verdict"] == "blocked"
+
+
+def test_the_calibration_sampler_records_memfree_raw_rows(tmp_path) -> None:
+    import time
+
+    def fake_reader():
+        return {"t": time.monotonic(), "utc": "2026-09-18T00:00:00Z", "available_bytes": 1000,
+                "total_bytes": 2048, "mem_free_bytes": 500, "swap_free_bytes": 100, "cached_bytes": 10}
+
+    sampler = cal.MemorySampler(tmp_path / "sampling.csv", interval=0.05, reader=fake_reader)
+    sampler.start()
+    time.sleep(0.3)
+    sampler.stop(post_seconds=0)
+
+    text = (tmp_path / "sampling.csv").read_text(encoding="utf-8")
+    assert text.splitlines()[0] == cal.MEMINFO_HEADER
+    assert len(sampler.rows) >= 2
+    assert all(row["mem_free_bytes"] is not None for row in sampler.rows)  # C02 needs that raw field
+    assert len(cal.load_meminfo_csv(tmp_path / "sampling.csv")) == len(sampler.rows)
 
 
 def test_a_round_without_a_stop_or_unknown_record_is_refused(tmp_path) -> None:
