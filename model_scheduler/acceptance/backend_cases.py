@@ -87,7 +87,7 @@ class Attempt:
                 "problems": list(self.problems)}
 
 
-def _capability_output_problems(capability: str, output: Mapping[str, Any]) -> list[str]:
+def capability_output_problems(capability: str, output: Mapping[str, Any]) -> list[str]:
     """Protocol/shape/finite/range of one capability's real output."""
     problems: list[str] = []
     if capability == "chat" or capability == "vision":
@@ -124,7 +124,7 @@ def _capability_output_problems(capability: str, output: Mapping[str, Any]) -> l
     return problems
 
 
-def _attribution_problems(kind: str, facts: Mapping[str, Any]) -> list[str]:
+def attribution_problems(kind: str, facts: Mapping[str, Any]) -> list[str]:
     """Provider + attributable device activity + real output (plan/06 §4)."""
     problems: list[str] = []
     if not facts.get("provider"):
@@ -236,7 +236,7 @@ class CaseExecutor:
                 failure = str(result["error"])
                 status = "failed"
             else:
-                problems = _attribution_problems(kind, result)
+                problems = attribution_problems(kind, result)
                 if kind == "envelope" and fixture is not None:
                     observed = result.get("observed")
                     shortfalls = boundary_shortfalls(fixture, observed if isinstance(observed, Mapping) else {})
@@ -246,7 +246,7 @@ class CaseExecutor:
                 if capability is not None:
                     output = result.get("output")
                     if isinstance(output, Mapping):
-                        problems.extend(_capability_output_problems(capability, output))
+                        problems.extend(capability_output_problems(capability, output))
                 if not problems:
                     status = "passed"
                 else:

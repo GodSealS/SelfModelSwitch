@@ -170,6 +170,89 @@ def build_o01_plan(*, models: Sequence[str], duration_seconds: float, requests: 
 # O02 — O06
 
 
+# The recomputation table: the evaluator (P25) applies these to a *document* of
+# collected facts, so an operational conclusion is derived from material and
+# never read back from a stored verdict. The orchestrator's step checks below
+# use the same predicates, and the tests cross-check both paths.
+_O_REQUIREMENTS: dict[str, tuple[tuple[str, Any], ...]] = {
+    "O02": (("isolation.private_mount_namespace", True), ("model_disk.model_disk_unavailable", True),
+            ("model_disk.root_disk_writes", 0), ("scratch.dedicated_quota_fs", True),
+            ("scratch.scratch_full", True), ("scratch.root_disk_writes", 0), ("recovery.recovered", True),
+            ("recovery.rehashed", True)),
+    "O03": (("docker_unreachable.health_status", 503), ("docker_unreachable.budget_kept", True),
+            ("docker_unreachable.other_containers_untouched", True), ("unknown_instance.unknown_recorded", True),
+            ("unknown_instance.health_status", 503), ("unknown_instance.other_containers_untouched", True),
+            ("stop_timeout.stop_timeout_recorded", True), ("stop_timeout.budget_kept", True),
+            ("stop_timeout.health_status", 503)),
+    "O04": (("restart.restarted", True), ("restart.residual_instances_cleaned", True),
+            ("restart.inference_replay", False), ("old_token.accepted", False), ("admission.admitted", True)),
+    "O06": (("shutdown.graceful", True), ("shutdown.exit_code", 0), ("logs.capacity_ok", True),
+            ("logs.redaction_ok", True), ("restore.restored", True), ("rollback.applied", True),
+            ("rollback_refused.applied", False)),
+}
+
+
+def _dotted(facts: Mapping[str, Any], path: str) -> Any:
+    current: Any = facts
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def recompute_objections(case_id: str, facts: Mapping[str, Any]) -> list[str]:
+    """Recompute one O0x conclusion from collected facts; unknown cases are refused."""
+    if case_id == "O05":
+        problems: list[str] = []
+        correct = facts.get("correct")
+        if not isinstance(correct, Mapping) or correct.get("accepted") is not True:
+            problems.append("the untampered candidate was not accepted")
+        if isinstance(correct, Mapping) and correct.get("production_gate") is True:
+            problems.append("the production gate was invoked: O05 must use the primitive only")
+        tampered = facts.get("tampered")
+        if not isinstance(tampered, list) or not tampered:
+            problems.append("no tamper scenario material is present")
+        else:
+            for entry in tampered:
+                name = entry.get("name") if isinstance(entry, Mapping) else None
+                result = entry.get("facts") if isinstance(entry, Mapping) else None
+                if not isinstance(result, Mapping) or result.get("accepted") is not False:
+                    problems.append(f"the tampered scenario {name!r} was not rejected")
+                    continue
+                if not str(result.get("reason") or "").strip():
+                    problems.append(f"the tampered scenario {name!r} was rejected without a reason")
+                if result.get("loaded") is True:
+                    problems.append(f"the tampered scenario {name!r} reached the load step")
+        return problems
+
+    requirements = _O_REQUIREMENTS.get(case_id)
+    if requirements is None:
+        return [f"no recomputation rule exists for case {case_id!r}: a conclusion cannot be derived from this material"]
+    problems = []
+    for path, expected in requirements:
+        seen = _dotted(facts, path)
+        if seen != expected:
+            problems.append(f"{path}={seen!r} but {expected!r} is required")
+    if case_id == "O02" and _dotted(facts, "isolation.unmounted_shared_disk") is True:
+        problems.append("a machine-wide disk was unmounted")
+    if case_id == "O04":
+        leftovers = facts.get("residual_after_restart")
+        if leftovers:
+            problems.append(f"instances survived the restart: {leftovers}")
+        if not str(_dotted(facts, "old_token.reason") or "").strip():
+            problems.append("the old token was refused without a reason")
+    if case_id == "O06":
+        digest = _dotted(facts, "backup.snapshot_sha256")
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            problems.append("the backup snapshot digest is missing or malformed")
+        if _dotted(facts, "restore.snapshot_sha256") != digest:
+            problems.append("the restored snapshot digest does not match the backup")
+        if not str(_dotted(facts, "rollback_refused.reason") or "").strip():
+            problems.append("the refused rollback carries no reason")
+    return problems
+
+
 def run_o02(port: DiskFaultPort, *, deployment_id: str, quota_bytes: int) -> CaseResult:
     problems: list[str] = []
     failures: list[str] = []

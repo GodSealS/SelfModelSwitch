@@ -17,7 +17,7 @@ import sys
 from . import EXIT_FAILED, EXIT_INPUT, EXIT_OK
 from .collect import FactsError, collect_facts
 
-_NOT_YET = ("merge", "verify")
+_NOT_YET: tuple[str, ...] = ()
 ACCEPTANCE_LAYERS = frozenset({"S", "B", "O"})
 
 
@@ -117,6 +117,29 @@ def _run(args) -> int:
     return EXIT_FAILED
 
 
+def _merge(args) -> int:
+    from .verify import VerifyError, merge_runs
+
+    require_fresh_output(args.output / "report.json")
+    try:
+        result = merge_runs(candidate_path=args.candidate, run_dirs=args.runs, output=args.output)
+    except VerifyError as exc:
+        print(f"merge: {exc}", file=sys.stderr)
+        return exc.exit_code
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+def _verify(args) -> int:
+    from .verify import verify_evidence
+
+    code, document = verify_evidence(candidate_path=args.candidate, evidence_dir=args.evidence)
+    print(json.dumps(document, indent=2, sort_keys=True))
+    if code != EXIT_OK:
+        print(f"verify: {document.get('error')}", file=sys.stderr)
+    return code
+
+
 def _candidate(args) -> int:
     from .candidate import CandidateError, build_candidate
 
@@ -173,6 +196,15 @@ def build_parser() -> argparse.ArgumentParser:
                                   help="deployment identity; it is an explicit input and is never derived or guessed")
     candidate_parser.add_argument("--output", type=Path, required=True)
 
+    merge_parser = sub.add_parser("merge", help="merge runs of one candidate/device into final evidence")
+    merge_parser.add_argument("--candidate", type=Path, required=True)
+    merge_parser.add_argument("--runs", type=Path, nargs="+", required=True)
+    merge_parser.add_argument("--output", type=Path, required=True)
+
+    verify_parser = sub.add_parser("verify", help="offline recomputation of evidence; never starts a model")
+    verify_parser.add_argument("--candidate", type=Path, required=True)
+    verify_parser.add_argument("--evidence", type=Path, required=True)
+
     for name in _NOT_YET:
         stub = sub.add_parser(name, help=f"{name} is delivered by a later plan task and refuses to pretend")
         stub.add_argument("rest", nargs=argparse.REMAINDER)
@@ -192,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
             return _candidate(args)
         if args.command == "run":
             return _run(args)
+        if args.command == "merge":
+            return _merge(args)
+        if args.command == "verify":
+            return _verify(args)
         raise InputError(f"`{args.command}` is not implemented yet: the plan assigns it to a later task")
     except (InputError, FactsError) as exc:
         print(f"{args.command}: {exc}", file=sys.stderr)

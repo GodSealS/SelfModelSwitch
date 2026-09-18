@@ -222,13 +222,6 @@ def test_the_cli_derives_disk_locations_from_a_v2_config(tmp_path, monkeypatch) 
     assert seen["paths"] == ("/mnt/model-ssd/models", "/var/lib/self-model-switch/blobs")
 
 
-def test_a_command_without_an_implementation_refuses_with_exit_2(capsys) -> None:
-    from model_scheduler.acceptance.__main__ import main
-
-    assert main(["merge"]) == EXIT_INPUT  # `merge`/`verify` arrive with P25
-    assert "not implemented yet" in capsys.readouterr().err
-
-
 # ---------------------------------------------------------------------------
 # calibrate: the §5 accounting, C02 physical bound, maintenance and CLI
 
