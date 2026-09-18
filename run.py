@@ -1,22 +1,208 @@
-"""Supported single-worker process entry point."""
+"""Supported single-worker process entry point.
+
+Two explicit branches (P17 AC2), one order for both:
+
+    parse -> the single instance lock -> ONE runtime context -> reconcile old
+    instances -> Blob recovery -> open the entries
+
+v1 keeps the shipped llama-swap path exactly as the existing tests pin it.
+v2 is the managed composition: it never touches `build_backend` (the v1
+four-model manifest join), it imports the pinned `CONTROL_CONTRACT` only when
+a registered profile really needs llama-swap, and both listeners share ONE
+scheduler/Book/BlobStore/boot_id (C08). The TCP entry (uvicorn) owns the
+process lifespan — it starts and cleans up exactly once — while the control
+entry is the peer-credential Unix listener from `control_server`, which
+removes its socket before the shared cleanup completes.
+"""
 from __future__ import annotations
 
 import argparse
+import asyncio
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import sys
+from time import monotonic
+from uuid import uuid4
 
 import uvicorn
 
 from app import create_app
-from model_scheduler.config import ConfigError, load_config
+from model_scheduler.config import AppConfigV2, ConfigError, load_config
+from model_scheduler.control_identity import TokenAuthority
+from model_scheduler.idempotency import IdempotencyStore
 from model_scheduler.instance_lock import InstanceLocked, acquire
-from model_scheduler.runtime import RuntimeCompositionError, build_backend
-
+from model_scheduler.runtime import (
+    RuntimeCompositionError,
+    build_backend,
+    build_managed_execution,
+    ledger_specs_from,
+    reconcile_startup,
+)
 
 _MANIFEST_PATH = Path("/etc/self-model-switch/manifest.json")
+_V1_LOCK_PATH = Path("/run/model-scheduler/scheduler.lock")
+_V2_DEPLOYMENT_ENV = "SELFMODEL_SWITCH_DEPLOYMENT_ID"
+_V2_SWAP_CONTROL_ENV = "SELFMODEL_SWITCH_SWAP_CONTROL_URL"
+
+
+@dataclass(frozen=True)
+class StartupPlan:
+    """What the config alone decides before anything is built."""
+
+    schema_version: int
+    needs_swap_control: bool
+    lock_path: Path
+
+
+@dataclass
+class RunContextV2:
+    """The ONE managed runtime context shared by both listeners."""
+
+    boot_id: str
+    scheduler: object
+    service: object
+    lifecycle: object
+    book: object
+    blobs: object
+    tokens: TokenAuthority
+    recovery: object
+    observers: dict
+    config: object
+    extras: dict = field(default_factory=dict)
+
+
+def startup_plan(config) -> StartupPlan:
+    from model_scheduler.contracts_v2 import GGUF_PROFILE
+    if config.schema_version == 2:
+        needs_swap = any(runtime.profile_id == GGUF_PROFILE for runtime in config.runtimes.values())
+        return StartupPlan(2, needs_swap, Path(config.control.socket_path).parent / "scheduler.lock")
+    return StartupPlan(1, True, _V1_LOCK_PATH)
+
+
+def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None) -> RunContextV2:
+    """Join one v2 registration to the managed composition with fail-closed site inputs.
+
+    `ports` injects the external boundaries (resources/blobs/recovery/control/
+    clients/observers) for tests and for the P20 production wiring; every
+    default is the real implementation. A v2 process refuses to start without
+    the site identity, and without a swap endpoint when a profile needs one —
+    it never silently guesses.
+    """
+    import httpx
+
+    from model_scheduler.blob_store import BlobStore
+    from model_scheduler.contracts_v2 import GGUF_PROFILE, DeploymentSpec
+    from model_scheduler.control_recovery import DeploymentRecovery
+    from model_scheduler.model_registry import Book
+    from model_scheduler.process_observer import DockerProcessObserver
+    from model_scheduler.resource_monitor import ResourceMonitor
+    from model_scheduler.session_manager import SessionManager
+
+    env = os.environ if env is None else env
+    ports = {} if ports is None else ports
+    deployment_id = env.get(_V2_DEPLOYMENT_ENV)
+    if not isinstance(deployment_id, str) or not deployment_id:
+        raise RuntimeCompositionError(f"v2 startup needs the site deployment identity in {_V2_DEPLOYMENT_ENV}")
+    registration = DeploymentSpec(runtimes=tuple(config.runtimes.values()), models=tuple(config.models.values()))
+    specs = ledger_specs_from(registration=registration)
+    book = ports.get("book") or Book(
+        specs, model_budget=config.resources.model_budget_bytes,
+        free_floor=config.scheduler.min_free_memory_bytes, margin=0,
+        max_sample_age=config.resources.sample_max_age_seconds,
+        half_life=config.scheduler.heat.half_life_seconds,
+        request_weight=config.scheduler.heat.request_weight,
+        token_weight=config.scheduler.heat.token_weight,
+    )
+    for model_id in specs:
+        book.bootstrap_stopped(model_id)  # P07 keeps UNKNOWN for unobserved models; reconcile confirms below
+    boot_id = uuid4().hex
+    tokens = TokenAuthority(boot_id=boot_id)
+    blobs = ports.get("blobs") or BlobStore(
+        config.blobs.root, owner_quota_bytes=config.blobs.owner_quota_bytes,
+        global_quota_bytes=config.blobs.total_quota_bytes, min_free_bytes=config.blobs.min_free_disk_bytes,
+        chunked_reserve_bytes=config.blobs.chunk_reserve_bytes,
+    )
+    needs_swap = any(runtime.profile_id == GGUF_PROFILE for runtime in config.runtimes.values())
+    control = ports.get("control")
+    if control is None and needs_swap:
+        base_url = env.get(_V2_SWAP_CONTROL_ENV)
+        if not isinstance(base_url, str) or not base_url:
+            raise RuntimeCompositionError(
+                f"a llama-swap profile is registered but {_V2_SWAP_CONTROL_ENV} is not set")
+        from model_scheduler.llama_swap_contract import CONTROL_CONTRACT  # only when the profile needs it
+        from model_scheduler.llama_swap_client import LlamaSwapClient
+        control = LlamaSwapClient(base_url, contract=CONTROL_CONTRACT)
+    observers = ports.get("observers") or {
+        model_id: DockerProcessObserver(deployment_id, model_id, model.port)
+        for model_id, model in config.models.items()
+    }
+    inference_base_urls = {model_id: f"http://127.0.0.1:{model.port}" for model_id, model in config.models.items()}
+    clients = ports.get("clients") or {
+        model_id: httpx.AsyncClient(base_url=url, follow_redirects=False)
+        for model_id, url in inference_base_urls.items()
+    }
+    resources = ports.get("resources") or ResourceMonitor()
+    recovery = ports.get("recovery") or DeploymentRecovery(deployment_id)
+    policy = config.scheduler.sessions
+    sessions = SessionManager(
+        max_sessions=policy.queue_capacity, wait_seconds=policy.queue_timeout_seconds,
+        hard_deadline_seconds=policy.hard_timeout_seconds, heartbeat_seconds=policy.heartbeat_seconds,
+        ttl_seconds=policy.ttl_seconds, prepare_seconds=policy.prepare_limit_seconds,
+        stop_grace_seconds=policy.stop_grace_seconds, cleanup_seconds=policy.cleanup_limit_seconds,
+    )
+    runtime = build_managed_execution(
+        boot_id=boot_id, deployment=registration, deployment_id=deployment_id, book=book,
+        resources=resources, control=control, clients=clients, observers=observers,
+        inference_base_urls=inference_base_urls, blobs=blobs, sessions=sessions,
+        tokens=tokens, idempotency=IdempotencyStore(),
+        scheduler_kwargs={
+            "queue_capacity": config.scheduler.queue_capacity,
+            "priority_aging_seconds": config.scheduler.priority_aging_seconds,
+            "poll_interval_seconds": config.scheduler.poll_interval_seconds,
+            "switch_drain_timeout_seconds": config.scheduler.switch_drain_timeout_seconds,
+            "switch_retry_seconds": config.scheduler.switch_retry_seconds,
+            "max_evictions": config.scheduler.max_evictions_per_request,
+        },
+        execution_kwargs={"queue_capacity": policy.queue_capacity, "wait_seconds": policy.queue_timeout_seconds},
+    )
+    return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
+                         lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
+                         recovery=recovery, observers=dict(observers), config=config,
+                         extras={"runtime": runtime, "clients": clients})
+
+
+def serve_v2(context: RunContextV2) -> None:
+    """Reconcile, recover blobs, then run both listeners over ONE lifespan."""
+    from model_scheduler.control_server import ControlServer, build_control_app, build_tcp_skeleton_app
+
+    config = context.config
+
+    async def main() -> None:
+        reconciliation = await reconcile_startup(
+            context.book, context.recovery, context.observers,
+            deadline=monotonic() + config.scheduler.memory_reclaim_timeout_seconds)
+        if not reconciliation.ok:
+            # Admission stays closed (Book.recovering) — the process reports instead of serving half-truths.
+            raise RuntimeCompositionError(f"startup reconciliation failed: {reconciliation.error_code}")
+        await context.blobs.recover(instances_running=False, boot_id=context.boot_id)
+        app = build_tcp_skeleton_app(boot_id=context.boot_id, scheduler=context.scheduler,
+                                      shutdown_grace_seconds=config.server.shutdown_grace_seconds)
+        control = ControlServer(build_control_app(boot_id=context.boot_id),
+                                socket_path=config.control.socket_path,
+                                allowed_uids=config.control.allowed_uids,
+                                peer_group=config.control.peer_group)
+        server = uvicorn.Server(uvicorn.Config(app, host=config.server.host, port=config.server.port,
+                                               log_level="info"))
+        await control.start()
+        try:
+            await server.serve()  # the TCP app owns the one shared lifespan
+        finally:
+            await control.stop()
+
+    asyncio.run(main())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +222,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_config:
         print(f"schema_version={config.schema_version} models={','.join(sorted(config.models))}")
         return 0
+    plan = startup_plan(config)
+    if plan.schema_version == 2:
+        try:
+            with acquire(plan.lock_path):
+                serve_v2(build_v2_context(config))
+        except RuntimeCompositionError as exc:
+            print(f"configuration error: {exc}", file=sys.stderr)
+            return 78
+        except InstanceLocked:
+            print("scheduler instance already running", file=sys.stderr)
+            return 73
+        return 0
     try:
         try:
             from model_scheduler.llama_swap_contract import CONTROL_CONTRACT
@@ -45,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         config_digest = hashlib.sha256(config_bytes).hexdigest()
         manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
         backend = build_backend(config, manifest, config_digest, CONTROL_CONTRACT)
-        with acquire(Path("/run/model-scheduler/scheduler.lock")):
+        with acquire(plan.lock_path):
             uvicorn.run(create_app(path, config=config, backend=backend), host=config.server.host, port=config.server.port, workers=1, reload=False)
     except (OSError, ValueError, json.JSONDecodeError, RuntimeCompositionError) as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

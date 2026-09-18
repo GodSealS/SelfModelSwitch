@@ -32,6 +32,7 @@ import os
 import socket
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 from uuid import uuid4
@@ -64,6 +65,42 @@ def peer_uid_of(sock: socket.socket) -> int:
         raw = sock.getsockopt(sol_local, socket.LOCAL_PEERCRED, 84)
         return int(struct.unpack_from("<I", raw, 4)[0])
     raise ControlServerError("peer credentials are only supported on Linux and macOS")
+
+
+def build_tcp_skeleton_app(*, boot_id: str, scheduler: Any = None, shutdown_grace_seconds: float = 30.0):
+    """The loopback TCP entry while P19 restores the full legacy surface.
+
+    It owns the ONE process lifespan (uvicorn runs it; the control listener
+    never does) and proves the P17 sharing contract: /live and /health report
+    the same boot the control socket reports, and no /internal route is ever
+    registered here, so `/internal/*` is a 404 on TCP by construction.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    state = {"started": 0, "cleanups": 0, "shutting_down": False}
+
+    async def lifespan(app):  # noqa: ANN001 - Starlette app instance
+        state["started"] += 1
+        try:
+            yield
+        finally:
+            state["cleanups"] += 1
+            state["shutting_down"] = True
+            if scheduler is not None:
+                with suppress(Exception):
+                    await scheduler.shutdown(time.monotonic() + shutdown_grace_seconds)
+
+    async def live(_request):
+        return JSONResponse({"ok": True})
+
+    async def health(_request):
+        return JSONResponse({"ok": not state["shutting_down"], "boot_id": boot_id, "lifespan_started": state["started"]})
+
+    app = Starlette(routes=[Route("/live", live), Route("/health", health)], lifespan=lifespan)
+    app.state.sms = state
+    return app
 
 
 def build_control_app(*, boot_id: str) -> Callable[..., Awaitable[None]]:

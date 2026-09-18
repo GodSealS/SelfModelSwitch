@@ -33,6 +33,7 @@ from model_scheduler.control_server import (
     CONTROL_APP_NAME,
     ControlServer,
     build_control_app,
+    build_tcp_skeleton_app,
     peer_uid_of,
 )
 
@@ -190,6 +191,142 @@ def test_peer_uid_on_a_socketpair_is_this_process() -> None:
     finally:
         first.close()
         second.close()
+
+
+# -- P17 AC1/AC2: one boot shared by both listeners, one lifespan, explicit branches --------
+
+import importlib.util  # noqa: E402
+
+import run as run_module  # noqa: E402
+import yaml  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "sms_test_config", str(Path(__file__).resolve().parents[1] / "test_config.py"))
+_config_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_config_module)
+V2_YAML = _config_module.V2
+
+
+def _v2_config(tmp_path, *, mutate=None):
+    document = yaml.safe_load(V2_YAML)
+    document["blobs"]["root"] = str(tmp_path / "blobs")
+    document["control"]["socket_path"] = str(tmp_path / "run" / "self-model-switch" / "control.sock")
+    (tmp_path / "run" / "self-model-switch").mkdir(parents=True)
+    os.chmod(tmp_path / "run" / "self-model-switch", 0o750)
+    if mutate is not None:
+        mutate(document)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    from model_scheduler.config import load_config
+    return load_config(path)
+
+
+def test_startup_plan_keeps_v1_and_locks_v2_before_any_build(sdir) -> None:
+    v2 = _v2_config(sdir)
+    plan = run_module.startup_plan(v2)
+    assert plan.schema_version == 2 and plan.needs_swap_control is True
+    assert plan.lock_path == sdir / "run" / "self-model-switch" / "scheduler.lock"
+    v1_plan = run_module.startup_plan(type("C", (), {"schema_version": 1, "models": {}})())
+    assert (v1_plan.schema_version, v1_plan.needs_swap_control, v1_plan.lock_path) == (
+        1, True, run_module._V1_LOCK_PATH)
+
+
+def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) -> None:
+    def no_v1_join(*args, **kwargs):  # pragma: no cover - proves the branch never lands here
+        raise AssertionError("v2 must not use the v1 four-model build_backend join")
+
+    monkeypatch.setattr(run_module, "build_backend", no_v1_join)
+    config = _v2_config(sdir)
+    fake_ports = {"control": object(), "resources": None, "recovery": object(),
+                  "observers": {mid: object() for mid in config.models},
+                  "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    context = run_module.build_v2_context(config, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+    assert context.boot_id and context.tokens.boot_id == context.boot_id
+    assert sorted(context.book.specs) == ["embedding", "qwen-small"]
+    # one scheduler behind one service behind one lifecycle: the context is the single join
+    assert context.service._scheduler is context.scheduler
+    assert context.lifecycle.instance("embedding") is None  # nothing loaded yet, and no guessed identity
+
+
+def test_v2_refuses_to_guess_site_inputs(sdir) -> None:
+    config = _v2_config(sdir)
+    with pytest.raises(Exception) as missing_identity:
+        run_module.build_v2_context(config, env={}, ports={})
+    assert "SELFMODEL_SWITCH_DEPLOYMENT_ID" in str(missing_identity.value)
+    env = {run_module._V2_DEPLOYMENT_ENV: "orin-lab"}
+    with pytest.raises(Exception) as missing_swap:
+        run_module.build_v2_context(config, env=env, ports={})
+    assert "SELFMODEL_SWITCH_SWAP_CONTROL_URL" in str(missing_swap.value)
+
+
+def test_swap_contract_is_imported_only_for_profiles_that_need_it(sdir, monkeypatch) -> None:
+    monkeypatch.delitem(sys.modules, "model_scheduler.llama_swap_contract", raising=False)
+
+    def to_hf(document) -> None:
+        runtime = document["registration"]["runtimes"][0]
+        runtime["profile_id"] = "hf-sharded-v1"
+        runtime["startup_args"] = ["--host", "--port"]
+
+    config = _v2_config(sdir, mutate=to_hf)
+    plan = run_module.startup_plan(config)
+    assert plan.needs_swap_control is False  # hf-sharded never joins llama-swap
+    assert "model_scheduler.llama_swap_contract" not in sys.modules
+
+
+def test_main_orders_lock_before_context_and_serves_the_v2_plan(sdir, monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    config = _v2_config(sdir)
+    seen: dict = {}
+
+    def fake_acquire(path):
+        seen["lock"] = path
+        return nullcontext()
+
+    def fake_build(cfg):
+        seen["context"] = object()
+        return run_module.RunContextV2(boot_id="b", scheduler=None, service=None, lifecycle=None, book=None,
+                                       blobs=None, tokens=None, recovery=None, observers={}, config=None)
+
+    monkeypatch.setattr(run_module, "load_config", lambda path: config)
+    monkeypatch.setattr(run_module, "acquire", fake_acquire)
+    monkeypatch.setattr(run_module, "build_v2_context", fake_build)
+    monkeypatch.setattr(run_module, "serve_v2", lambda context: seen.__setitem__("served", context))
+    assert run_module.main(["--config", str(sdir / "config.yaml")]) == 0
+    assert seen["lock"] == sdir / "run" / "self-model-switch" / "scheduler.lock"
+    assert list(seen) == ["lock", "context", "served"]  # lock first, one context, then serve
+
+
+@pytest.mark.asyncio
+async def test_both_listeners_share_one_boot_and_the_lifespan_runs_exactly_once(sdir) -> None:
+    import uvicorn
+
+    app = build_tcp_skeleton_app(boot_id="boot-shared", scheduler=None)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    control = ControlServer(build_control_app(boot_id="boot-shared"), socket_path=sdir / "control.sock",
+                            allowed_uids=(os.getuid(),))
+    serving = asyncio.create_task(server.serve())
+    try:
+        for _ in range(400):
+            if server.started:
+                break
+            await asyncio.sleep(0.01)
+        assert server.started
+        await control.start()
+        port = server.servers[0].sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            health = await client.get("/health")
+            assert health.status_code == 200 and health.json()["boot_id"] == "boot-shared"
+            assert health.json()["lifespan_started"] == 1  # the TCP entry owns the one lifespan
+            refused_on_tcp = await client.get("/internal/peer")
+            assert refused_on_tcp.status_code == 404  # control routes are never registered on TCP
+        via_socket = await _request(str(control.socket_path))
+        assert via_socket.json()["boot_id"] == "boot-shared"
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(serving, 10)
+        await control.stop()
+    assert app.state.sms["started"] == 1 and app.state.sms["cleanups"] == 1  # start/cleanup each ONCE
 
 
 # -- the S-gate case: two REAL distinct UIDs on Linux; skipping never counts as passing -----
