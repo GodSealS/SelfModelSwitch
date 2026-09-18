@@ -606,12 +606,12 @@ Device not configured`；`git ls-remote origin refs/heads/main` 仍为 `8d4edcd4
 **Description:** 将当前明确不完整的v217 fixture补齐，并实现run.py要求的CONTROL_CONTRACT；此任务必须早于真实服务闭环。
 **Files likely touched:** `model_scheduler/llama_swap_contract.py`（新增）、`tests/fixtures/llama_swap_contract.json`、`tests/test_llama_swap_fixture.py`、`scripts/capture_control_fixture.py`、`tests/test_capture_control_fixture.py`（后二者新增）。
 **Acceptance criteria:**
-- [ ] 核实固定ARM64二进制版本/hash；受控维护探测分别保存running空/非空、真实模型load、unload的request/status/content-type/body与实例证据。
-- [ ] `python scripts/capture_control_fixture.py --config V2_CONFIG --output EVIDENCE_DIR` 仅访问配置中的loopback端点和登记模型，失败保留材料，不下载资产。
+- [x] 核实固定ARM64二进制版本/hash；受控维护探测分别保存running空/非空、真实模型load、unload的request/status/content-type/body与实例证据。
+- [x] `python scripts/capture_control_fixture.py --config V2_CONFIG --output EVIDENCE_DIR` 仅访问配置中的loopback端点和登记模型，失败保留材料，不下载资产。
   探测脚本直接调用P06 profile/runner，在独占临时目录生成探测用llama-swap配置与manifest，
   包含部署/镜像/资产/端口/argv；不依赖P06b或v3生产renderer，不写系统安装目录。
-- [ ] CONTROL_CONTRACT的load路径/响应解析来自真实fixture，现有load_probe=404不能充当成功；未停止不标通过。
-- [ ] 更新当前“fixture必须不完整”的测试为真实协议正反例；推理流量仍绕过llama-swap自动路由。
+- [x] CONTROL_CONTRACT的load路径/响应解析来自真实fixture，现有load_probe=404不能充当成功；未停止不标通过。
+- [x] 更新当前“fixture必须不完整”的测试为真实协议正反例；推理流量仍绕过llama-swap自动路由。
 **Verification:** `python -m pytest tests/test_llama_swap_fixture.py tests/test_llama_swap_client.py tests/test_capture_control_fixture.py -q`；目标受控探测并记录停止证据。
 **本轮执行记录（2026-09-18）:** status=blocked（未开始实现，先做只读材料核对）；起点 commit `2a9ec8b`（P06 记录提交）。
 已核实事实（本机 + 目标只读 SSH，未改动目标）：
@@ -705,6 +705,29 @@ unload 的 request/status/content-type/body 与实例证据；③ 按原始材�
 - **仍待办**：`scripts/capture_control_fixture.py` 与 `tests/test_capture_control_fixture.py`（本轮尚未实现），
   随后在目标受控维护环境执行探测并回填 fixture 与 `model_scheduler/llama_swap_contract.py`。因此 P06a 仍为 `blocked`（未完成），
   但已不再是"缺材料"，而是"未实施 + 未探测"。
+**本轮执行记录（2026-09-18）:** status=complete（目标受控探测已捕获，契约按原始材料生成）。
+实现与提交：`550370e`（采集工具）、`1c30d21`（`--listen` 从命令行取，弃用 `logRequests`）、`739c83f`（按实测解析 `/running` 对象数组）、
+`02aa359`（fixture 回填 + `model_scheduler/llama_swap_contract.py` + 测试改造）；python=3.12.11（开发机）/3.12.14（目标 toolchain）；
+`pytest tests/test_llama_swap_fixture.py tests/test_llama_swap_client.py tests/test_capture_control_fixture.py -q` = 21 passed；
+`pytest tests -m 'not thor' -q` = 393 passed, 1 deselected；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID
+（真实 v2 服务仍未接线，属 P06b/P17）。
+探测（目标受控维护，`scripts/capture_control_fixture.py`）：证据目录
+`/home/jtzn/self-model-switch-evidence/llama-swap-control-20260918T002718Z/`（capture.json、manifest.json、llama-swap.probe.yaml、
+llama-swap.log）；`result=captured`，停止证据 `exit_code=0`、`port_in_use=false`。实测协议事实（已写入 fixture 与契约）：
+1. `/health` → `200 text/plain; charset=utf-8`，body `OK`；`/running` 空态 → `200 application/json`，body `{"running":[]}`；
+2. **load 路径 = `/upstream/{model_id}/health`**（首个请求启动上游并阻塞至就绪，实测 5.26s；冷加载更长），
+   响应 `200 application/json; charset=utf-8`，body `{"status":"ok"}`；
+3. `/running` 非空态是**上游对象数组**（键 `cmd/description/model/name/proxy/state/ttl`，`state=ready`、`proxy=http://localhost:5800`），
+   旧的"字符串数组"假设被推翻；
+4. `POST /api/models/unload/{model_id}` → `200 text/plain; charset=utf-8`，body `OK`（实测 0.926s）；
+5. 旧 `GET /props?model={model_id}` → **404**，作为 `rejected_load_probe` 负例保留，`counts_as_success=false`，不得当作成功；
+6. v217 的监听地址来自命令行 `--listen`（配置里的 `port` 键被忽略），`logRequests` 已弃用不得写入；
+   llama-swap 以 `${PORT}` 替换模型命令中的发布端口并代理到该端口（探测中为 5800）。
+失败轮保留：`llama-swap-control-20260918T002328Z`（探测到达前未就绪：`port` 键被忽略 + 无就绪等待）、
+`…T002427Z`（就绪等待缺失）、`…T002524Z`（`/running` 解析按旧假设），三轮材料均在，未删除。
+未解决：fixture 的 `running_loaded.body_sha256` 记为 `not_recorded_in_this_fixture_revision`（该轮只保留了字节长度与条目结构，
+未保留完整 body 的 hash），如需完整 body hash 应在下一次受控探测中补记；"推理流量绕过 llama-swap 自动路由"由 P15/P19 的
+gateway/adapter 接线保证，本任务不生成任何自动换模参数，未在此声明已验收。
 
 ### P06b — 动态lab渲染与runner入口接线（M02）
 
