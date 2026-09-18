@@ -294,7 +294,8 @@ def capture(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
     running_wait_seconds: float = 300.0,
-    poll_seconds: float = 1.0,
+    ready_wait_seconds: float = 60.0,
+    poll_seconds: float = 0.5,
 ) -> dict:
     """Run the probe sequence and keep every raw answer, success or failure."""
     output = Path(output_directory)
@@ -355,9 +356,17 @@ def capture(
         return models
 
     try:
-        start_process(
+        operation = start_process(
             [llama_swap_path, "--listen", files["listen"], "--config", str(probe_config_path)], output
         )
+        if getattr(operation, "is_terminal", False):
+            raise CaptureError("llama-swap exited before it opened its loopback port")
+        host = urllib.parse.urlsplit(files["base_url"]).hostname or "127.0.0.1"
+        deadline = clock() + ready_wait_seconds
+        while not port_in_use(host, llama_swap_port):
+            if clock() >= deadline:
+                raise CaptureError(f"llama-swap did not open {host}:{llama_swap_port} in time")
+            sleep(poll_seconds)
         health = exchange("health", "GET", HEALTH_PATH)
         if not health["counts_as_control_response"]:
             raise CaptureError(f"llama-swap is not healthy on its loopback port: status={health['status']}")

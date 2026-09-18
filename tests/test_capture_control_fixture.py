@@ -230,7 +230,13 @@ def test_capture_records_requests_answers_and_negative_samples(tmp_path: Path) -
             return module.probe_http_result(method, path, 404, "application/json", b'{"error":"not found"}')
         raise AssertionError(f"unexpected probe {method} {path}")
 
-    record = module.capture(**_capture_kwargs(tmp_path, http=fake_http))
+    ready = {"calls": 0}
+
+    def fake_port_in_use(host: str, port: int) -> bool:
+        ready["calls"] += 1
+        return ready["calls"] > 1
+
+    record = module.capture(**_capture_kwargs(tmp_path, http=fake_http, port_in_use=fake_port_in_use))
 
     assert ("GET", "/running") in seen
     assert ("POST", "/api/models/unload/qwen25vl-7b-q4") in seen
@@ -265,7 +271,11 @@ def test_capture_keeps_material_when_the_probe_fails(tmp_path: Path) -> None:
 
     output = tmp_path / "evidence"
     with pytest.raises(module.CaptureError):
-        module.capture(**_capture_kwargs(tmp_path, output_directory=output, http=failing_http))
+        module.capture(
+            **_capture_kwargs(
+                tmp_path, output_directory=output, http=failing_http, port_in_use=lambda host, port: True
+            )
+        )
 
     record = json.loads((output / "capture.json").read_text(encoding="utf-8"))
     assert record["result"] == "failed"
