@@ -1143,10 +1143,20 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Description:** 暴露session/execution/blob正式API并确保服务层约束不可通过路由绕过。
 **Files likely touched:** `model_scheduler/control_api.py`（新增）、`model_scheduler/control_server.py`、`tests/test_control_api.py`、`tests/integration/test_control_roundtrip.py`（后二者新增）。
 **Acceptance criteria:**
-- [ ] C05/C07所有路由状态码、版本和错误体符合schema；submit/close/cancel并发结果可复现。
-- [ ] Unix客户端上传→session→execute→读结果→close→确认STOPPED；相同key重复提交无第二次推理。
-- [ ] 非owner查询/取消/blob读取404；过期410；token/超限/不支持媒体负例；disconnect不误判GPU释放。
+- [x] C05/C07所有路由状态码、版本和错误体符合schema；submit/close/cancel并发结果可复现。
+- [x] Unix客户端上传→session→execute→读结果→close→确认STOPPED；相同key重复提交无第二次推理。
+- [x] 非owner查询/取消/blob读取404；过期410；token/超限/不支持媒体负例；disconnect不误判GPU释放。
 **Verification:** `python -m pytest tests/test_control_api.py tests/integration/test_control_roundtrip.py -q`；目标跑同一Unix客户端闭环。到CP2。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `e074af9`（P17 记录提交）；实现提交 `23d8e0b`（路由骨架 + 流式 Blob）、`5a9e766`（session 生命周期）、`fcb77c5`（execution 生命周期）、`b1e6999`（v2 接线 + 端到端闭环）、`1b8ac3f`（peer/限额负例）；python=3.13.5（开发机 `.venv`）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/control_api.py`（`ControlAPI`，ASGI）：版本网关（`/internal/*` 除 peer 外一律要求 `X-SMS-Protocol-Version: 1`，缺失/不支持 400 `unsupported_protocol`）；C05 封闭错误表映射（`_Refused`/`ContractError`/`BlobStoreError`/`ExecutionError`/`IdentityError`/`SessionConflict`/`SessionNotFound`/`ModelUnavailable`/`IdempotencyError`），响应一旦开始绝不再发第二个；严格 JSON（未知字段/非有限数/bool 冒充整数由 P02 解析器拒绝，重复 key 由 `object_pairs_hook` 拒绝）；`/internal/blobs` POST/GET/DELETE（媒体白名单 415、必填小写 64hex `X-Content-SHA256`、declared ≤1 GiB 否则 413、逐块 sha256 不符 422 且零发布、tombstone 410、读租约持有 409 `blob_in_use`、同 owner 重复/未知 DELETE 204）；`/internal/sessions` POST（202 + token 绑定视图；`session.create` 幂等：同 key 同 payload 重放原对象、异 payload 409、拒绝时释放 key）、GET/heartbeat/close（owner 不符 404、token 409 `stale_token`、close 202→200、closed 时 `owner_token=null`）；`/internal/executions` POST/GET/cancel（session token 经指纹映射定位会话，未知/跨 boot 409 `stale_token`；cancel 未终结 202、已终结 200）。会话 token 只存内存摘要，GET 由绑定字段 `issued_at/expires_at` 重算同一 token；状态映射 `preparing→queued/loading`（`holding_id`）、`draining→draining_existing`、blocked 原因码化进 error。
+`model_scheduler/control_server.py`：请求体流式化（64 KiB 块、`Content-Length` 与 `chunked` 均可、两者并存即拒绝、`receive()` 多次投递至 `EndOfMessage`、单连接上限 1 GiB、`http.disconnect` 语义）；方法集加 `DELETE`；`send_json` 公开；`build_control_app(boot_id, api=...)`（peer 路由保留，其余交 API）；204/304 不写 `content-length`。
+`model_scheduler/scheduler.py`：新增公开 `register_session`（注册即返回 PREPARING 视图、不等待加载——路由 202 语义），`open_session` 复用它后照旧等待 ACTIVE（P13 行为不变）。
+`run.py`：`build_v2_context` 把共享 `IdempotencyStore` 放入 `extras`；`serve_v2` 以同一 boot/scheduler/service/tokens/blobs 构造 `ControlAPI` 并交给 `build_control_app(api=...)`；TCP 侧仍 404 `/internal/*`，两入口共享唯一 lifespan。
+测试：`tests/test_control_api.py`（26 项 ASGI 直调：版本网关、403 `peer_forbidden`、404/410/413/415/422、5 MiB 流式 blob、幂等与并发、会话/执行路由）；`tests/integration/test_control_roundtrip.py`（10 项真实 AF_UNIX + 真实 SessionManager/ModelScheduler/BlobStore/ExecutionService + 假 BackendPort：5 MiB 往返、chunked 无长度上传、版本门、session 闭环、排队取消带 `not_started` 证据、同 key 只推理一次、上传→执行→读结果→close 且模型 STOPPED、过期 410、断连不发布、并发提交可复现）；`test_control_socket.py` 增补 v2 装配断言（`service._tokens is context.tokens`、共享 idempotency）。
+开发机：`pytest tests/test_control_api.py tests/integration/test_control_roundtrip.py -q` = 36 passed；全量 `pytest tests -m 'not thor' -q` = 621 passed, 1 skipped, 1 deselected（P17 基线 585）；`ruff check .` exit 0。
+目标机（Linux aarch64，python 3.12.14，`1b8ac3f796aaa576fd4437ecb2ff2b3c7308d1a8`）`pytest tests/test_control_api.py tests/integration/test_control_roundtrip.py tests/integration/test_control_socket.py tests/test_instance_lock.py -q`：jtzn = `51 passed, 1 skipped`（skip=P17 两真实 UID 门禁），root = `52 passed`；树前后为空。P17+P18 至此满足 CP2 的"两 UID 经 Unix 控制完成 create→execute→cancel/close、身份隔离成立"（两 UID 门禁见 P17 记录；本任务证明同一 socket 上的路由闭环）。
+未解决：①真实部署的客户端组/UID 由部署输入渲染（P27）；TCP 旧 API/SSE 的 v2 完整回归属 P19；②1 GiB 上限以常量与 413 断言锁定，真实传输只验证到 5 MiB 流式路径；③vision/embedding/rerank 的 parameters 闭集与 envelope 检查属 P20（本任务路由层只做传输与 C05 契约，能力校验沿用 service 层）；④断连在路由层只证明"上传中断零发布"，GPU/实例释放不误判由 P16 `awaiting_quiescence` 语义与其测试覆盖。
 
 ### P19 — 旧HTTP/SSE与动态模型兼容（M05）
 

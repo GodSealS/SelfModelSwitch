@@ -770,3 +770,49 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18)；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
 - 目标机复验曾暴露 Linux RST vs macOS FIN 的断言差异（`52b739c`、`1f5936a` 两修复后全绿）：记录为测试面修正，非服务端行为变更。
 - **同步状态（2026-09-18）**：开发机提交 `e65908b`→`a2789d3`→`b2d38ee` 均推送 GitHub `origin/main` 并校验远端 SHA；目标机对 GitHub 的访问在本轮中断（HTTP/2 framing 错误、随后 60s 连接超时），故先以显式 GitHub URL 同步到 `a2789d3`，最终改经其既有 origin（本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`，原停于 `f149d37`）fast-forward 至 `b2d38ee`：`verified_target_sha=b2d38ee...`、root 复验 `16 passed`、前后树为空；裸仓 `main` 现为 `b2d38ee`。目标机 origin 与指南"两台一致 GitHub"不符这一拓扑问题仍待用户确认（P14 遗留）。
+
+## P18 记录（2026-09-18）
+
+范围：控制 HTTP 路由闭环——把 C05/C07 的 session/execution/blob 路由挂到 C08 控制 socket，并把流式 Blob 与 v2 运行上下文接到同一 boot。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P18 |
+| status | complete |
+| source_commit | `e074af9`（P17 记录/同步提交，起点） |
+| implementation_commits | `23d8e0b`（路由骨架 + 流式 Blob）、`5a9e766`（session）、`fcb77c5`（execution）、`b1e6999`（v2 接线 + 端到端闭环）、`1b8ac3f`（peer/限额负例） |
+| target_commit | `1b8ac3f796aaa576fd4437ecb2ff2b3c7308d1a8`（经裸仓 origin fast-forward，目标树前后为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机跑既有测试套件（root `52 passed` / jtzn `51 passed, 1 skipped`） |
+
+判定 `complete`：三条 AC 都有"真实 AF_UNIX socket + 真实服务栈 + 假 BackendPort"的证据，并在目标 Linux 上复验；唯一 skip 是 P17 的两真实 UID 门禁（root 运行时不 skip，见 P17 记录）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_control_api.py tests/integration/test_control_roundtrip.py -q`（实现前） | 4 | `control_api` 不存在，收集 ImportError，即 RED |
+| 同上（开发机，实现后；P18 Verification 命令） | 0 | `36 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `621 passed, 1 skipped, 1 deselected`（P17 基线 585） |
+| `ruff check .` | 0 | 通过 |
+| 目标机（Linux，`1b8ac3f`）`test_control_api + roundtrip + control_socket + instance_lock -q`：jtzn / root | 0 / 0 | `51 passed, 1 skipped`（skip=P17 门禁）/ `52 passed`；树前后为空 |
+
+### 3. 关键事实
+
+- 路由面：版本网关先于路由匹配（`/internal/peer` 豁免，P17 语义不变）；全部拒绝经 C05 封闭错误表（`peer_forbidden` 403、`malformed_json` 400 与 `contract_violation` 422 区分、`payload_too_large` 413、`unsupported_media_type` 415、`stale_token`/`busy`/`blob_in_use` 409、`reference_expired` 410）；`/internal/*` 之外一律 404；响应一旦开始绝不追加第二个。
+- Blob（C07）：POST 流式入 `BlobStore.upload`（逐块 hash、declared 与 chunked 预留两路、1 GiB 界）；GET 先判 owner（外 owner 404 不透露存在）与 tombstone（410）；DELETE 204（重复/未知同 owner 亦 204）、读租约持有 409。
+- Session（C05）：POST 202 且**不等加载**（新增 `scheduler.register_session`；`open_session` 复用后行为不变）；幂等重放同对象、异 payload 409、拒绝释 key；GET 由绑定字段重算**同一 token**（明文不落盘，只存 fingerprint）；heartbeat/close 需 token；close 202→200，closed 时 `owner_token=null`；恒 owner-404。
+- Execution（C05）：token 经 fingerprint→session 映射定位会话；submit 202（重放返回现态）、GET 200、cancel 202/200；排队取消带 `not_started` 证据、不伪造容器身份。
+- 帧层：`ControlServer.receive()` 64 KiB 块流式投递（`more_body`/`http.disconnect`），`Content-Length` 与 `chunked` 并存即拒绝；5 MiB 真实上传通过（旧 4 MiB 缓冲帽已不再是瓶颈）；204/304 不写 `content-length`。
+- v2 装配：`serve_v2` 用 context 的 blobs/scheduler/service/tokens/共享 idempotency 构造 `ControlAPI`；`service._tokens is context.tokens` 与共享 `IdempotencyStore` 有断言钉住；TCP 侧 `/internal/*` 仍 404 by construction。
+- 并发可复现：3 个同 key 并发 POST → 恰一个 execution 对象、失败者 `busy`、后端只收到一次推理。
+
+### 4. 未执行 / 未解决
+
+- 真实部署的客户端组/UID 渲染（P27）、TCP 旧 API/SSE 的 v2 回归（P19）、vision/embedding/rerank 的 parameters 闭集与 envelope 检查（P20）。
+- 1 GiB 上限以常量与 413 断言锁定；真实传输验证到 5 MiB（流式路径），未做 1 GiB 实传。
+- 断连：路由层证明"上传中断零发布"；GPU/实例释放不误判由 P16 的 `awaiting_quiescence` 语义与其测试覆盖，本任务未重复。
+- CP2 的最终里程碑确认仍需 P19/P20 之后的端到端验收（本记录只覆盖 M04 的控制闭环）。
