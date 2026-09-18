@@ -16,6 +16,7 @@ it skips (not passes) where the environment cannot prove two distinct uids.
 from __future__ import annotations
 
 import asyncio
+import grp
 import os
 import shutil
 import sys
@@ -346,28 +347,39 @@ async def test_both_listeners_share_one_boot_and_the_lifespan_runs_exactly_once(
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="C08 real two-UID gate: Linux SO_PEERCRED only")
 def test_two_real_uids_on_linux_one_allowed_one_not(sdir) -> None:
-    """Allowed uid connects; a different real uid is closed. Requires permission to drop uid."""
+    """Allowed uid is served; a different REAL uid reaches the socket and is refused by the allow list."""
     if os.geteuid() != 0:
         pytest.skip("two real UIDs need the freedom to run a client as another uid (root or a provisioned test group)")
     server_uid, alien_uid = os.getuid(), 65534  # nobody
+    alien = grp.getgrgid(alien_uid)
+    # the alien uid must get PAST the filesystem to face the allow list: the directory stays
+    # group-traversable but never world-accessible (ControlServer refuses 0o007 parents), and the
+    # socket lands 0660 under the alien group; only SO_PEERCRED can then refuse the connection
+    os.chown(sdir, server_uid, alien.gr_gid)
+    os.chmod(sdir, 0o750)
+    client_python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     program = (
         "import socket,sys;"
         f"s=socket.socket(socket.AF_UNIX);s.connect({str(sdir / 'control.sock')!r});"
+        "sys.stdout.buffer.write(b'connected\\n');sys.stdout.buffer.flush();"  # proves the socket admitted this uid
         "s.sendall(b'GET /internal/peer HTTP/1.1\\r\\nHost: c\\r\\n\\r\\n');"
         "sys.stdout.buffer.write(s.recv(4096))"
     )
 
     async def main() -> None:
         srv = ControlServer(build_control_app(boot_id="gate"), socket_path=sdir / "control.sock",
-                            allowed_uids=(server_uid,))
+                            allowed_uids=(server_uid,), peer_group=alien.gr_name)
         await srv.start()
         try:
-            allowed = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10)
-            denied = subprocess.run([sys.executable, "-c", program], capture_output=True, timeout=10,
-                                    user=alien_uid, group=alien_uid)
-            assert b"200 OK" in allowed.stdout and f"uid:{server_uid}".encode() in allowed.stdout
-            assert denied.stdout == b""  # closed without an HTTP answer
+            # to_thread: a synchronous subprocess.run inside the serving loop starves its own server
+            allowed = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", program],
+                                              capture_output=True, timeout=10)
+            denied = await asyncio.to_thread(subprocess.run, [client_python, "-c", program],
+                                             capture_output=True, timeout=10, user=alien_uid, group=alien_uid)
         finally:
             await srv.stop()
+        assert allowed.stdout.startswith(b"connected\n"), allowed.stdout
+        assert b"200 OK" in allowed.stdout and f"uid:{server_uid}".encode() in allowed.stdout
+        assert denied.stdout == b"connected\n", denied.stdout  # it connected; the allow list answered nothing
 
     asyncio.run(main())  # a never-awaited coroutine must not be able to call this case green
