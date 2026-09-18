@@ -735,11 +735,32 @@ gateway/adapter 接线保证，本任务不生成任何自动换模参数，未�
 **Description:** 提前交付后续目标测试所需的lab配置/启动入口，避免P16必须等待P26生产renderer的隐性循环。
 **Files likely touched:** `model_scheduler/deploy.py`、`deploy/model-runner.py`、`model_scheduler/runtime.py`、`tests/test_deploy_render.py`、`tests/test_runtime.py`。
 **Acceptance criteria:**
-- [ ] 新增 `python -m model_scheduler.deploy render --config V2_CONFIG --mode lab --output LAB_DIR`，生成动态scheduler/llama-swap/runner manifest；不覆盖非空输出。
-- [ ] lab manifest绑定配置hash/runtime/profile/资产，显式标记lab；其digest只作测试实例身份，不是production candidate。
-- [ ] deploy/model-runner与runtime能加载多个动态ID/profile、只读资产及P06a控制契约；旧schema1入口仍通过原测试。
-- [ ] lab只允许隔离维护启动，有临时预算和现场身份检查；缺测不能通过production分支，P26再实现正式门禁。
+- [x] 新增 `python -m model_scheduler.deploy render --config V2_CONFIG --mode lab --output LAB_DIR`，生成动态scheduler/llama-swap/runner manifest；不覆盖非空输出。
+- [x] lab manifest绑定配置hash/runtime/profile/资产，显式标记lab；其digest只作测试实例身份，不是production candidate。
+- [x] deploy/model-runner与runtime能加载多个动态ID/profile、只读资产及P06a控制契约；旧schema1入口仍通过原测试。
+- [x] lab只允许隔离维护启动，有临时预算和现场身份检查；缺测不能通过production分支，P26再实现正式门禁。
 **Verification:** `python -m pytest tests/test_deploy_render.py tests/test_runtime.py tests/test_model_runner.py -q`；目标lab配置启动/停止测试实例。到K1a。
+**本轮执行记录（2026-09-18）:** status=complete；实现提交 `65877c5`（起点 `4a5733b`）；python=3.12.11（开发机）/3.12.14（目标 lab venv）；
+`pytest tests/test_deploy_render.py tests/test_runtime.py tests/test_model_runner.py -q` = 49 passed；`pytest tests -m 'not thor' -q` = 397 passed, 1 deselected；
+`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID（v2 服务接线属 P17）；旧 schema1 入口与其原测试全部保持通过。
+- `model_scheduler/deploy.py` 新增 `render_lab(config_path, output, deployment_id, container_runtime, mode="lab")`：解析 schema-v2 配置 → 用 P06 渲染器为每个登记模型生成 argv
+  → 写出 `manifest.json`（`mode=lab`、`lab_only=true`、`config_sha256`=配置文件字节摘要、`registration_digest`=规范化登记摘要、
+  `runtimes{profile_id,image_digest}`、逐模型 `{container_name,registered_port,argv,argv_sha256,probe_argv,image_digest,runtime_id,profile_id,measured,assets}`）、
+  `scheduler-v2.json`（配置副本）与 `llama-swap.yaml`（`${PORT}` 探测形态）；非空输出目录拒绝。CLI 为计划规定的
+  `python -m model_scheduler.deploy render --config V2 --mode lab --output LAB_DIR --deployment-id ID [--container-runtime nvidia]`，
+  旧 `--input` 路径不变；`--mode production` + `--config` 直接拒绝（正式门禁属 P26）。
+- `model_scheduler/runtime.py` 新增 `load_lab_manifest(path, config_path=...)` 与 `lab_launch_argv(manifest, model_id)`：强制 `mode=lab`/`lab_only`、
+  逐模型校验 `argv_sha256`、可选与配置文件字节摘要比对；未知模型或非 lab 渲染一律拒绝。它是交叉校验器，不替代 P08 的动态账本。
+- `deploy/model-runner.py` 新增 lab 分支：`--lab-manifest` + `--temporary-budget-bytes`（缺失即 `parser.error` 退出 2）+ 可选 `--config-sha256`；
+  `_lab_start` 先要求可导入的 P06a `CONTROL_CONTRACT`（缺失即拒绝），再校验 manifest、容器名与预算，然后用 P06 的 `SupervisedLaunch` 前台受监督启动；
+  `_lab_stop` 走既有身份标签核验的 `docker stop`。旧入口仍只接受固定四 ID。
+- **目标核验（`jtzn-desktop`）**：先建 lab venv `/home/jtzn/self-model-switch-build/venv312`（3.12.14 + `requirements.txt`，含 PyYAML/httpx/psutil），
+  然后 ①`render --mode lab` 成功；②`deploy/model-runner.py start qwen25vl-7b-q4 --lab-manifest … --temporary-budget-bytes 16000000000`
+  启动真实实例：容器 `sms-lab-orin-qwen25vl-7b-q4` Up、llama-server 在容器内 `listening on http://0.0.0.0:8080`（模型已加载）；
+  ③`deploy/model-runner.py stop … --lab-manifest …` 返回 0 → 容器消失（计数 0）、端口 18081 无监听、llama-server 日志 `cleaning up before exit...`。
+  证据目录 `/home/jtzn/self-model-switch-evidence/lab-run-20260918T004852Z/`（lab manifest、runner-start.log、lab-run.json）。
+- 未解决：目标 lab venv 的依赖安装是本轮新增的环境供给（P27 需把它规范成发布 venv 与锁文件安装）；lab 启动为前台受监督进程
+  （供 llama-swap 拉起并代理），手工维护时的后台化由操作者负责；`SupervisedLaunch` 仍需在 P07/P16 接入 observer 与停止证据闭环。到 K1a。
 
 ### P07 — 独立停止观察与启动恢复（M02）
 
