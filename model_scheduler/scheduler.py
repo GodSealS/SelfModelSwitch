@@ -75,6 +75,19 @@ class ModelScheduler:
         self._session_worker: asyncio.Task[None] | None = None
         self._session_leases: dict[str, set[str]] = {}
         self._session_freeze: str | None = None
+        # P14: the execution service installs a drain hook; the scheduler calls it
+        # outside its condition so queue cancellation never blocks the single lock.
+        self.execution_hook = None
+
+    async def _notify_execution_drain(self, session_id: str) -> None:
+        """Tell the execution service (if wired) that a session started draining."""
+        hook = self.execution_hook
+        if hook is None:
+            return
+        try:
+            await hook(session_id)
+        except Exception as exc:
+            self._emit("execution_hook_failed", {"session_id": session_id, "error": type(exc).__name__})
 
     async def acquire(self, model_id: str, request_id: str, deadline: float, *, session_id: str | None = None) -> Lease:
         if model_id not in self.book.specs:
@@ -448,11 +461,14 @@ class ModelScheduler:
         async with self._condition:
             self._shutting_down = True
             self._queue.clear()
-            for session_id, record in self.sessions.records.items():
-                if record.phase != CLOSED:
-                    self.sessions.begin_drain(session_id, self._clock(), "service_shutdown")
-                    self._release_session_freeze(session_id)
+            draining = [session_id for session_id, record in self.sessions.records.items() if record.phase != CLOSED]
+            for session_id in draining:
+                self.sessions.begin_drain(session_id, self._clock(), "service_shutdown")
+                self._release_session_freeze(session_id)
             self._condition.notify_all()
+        for session_id in draining:  # P14: cancel the sessions' executions before draining leases
+            await self._notify_execution_drain(session_id)
+        async with self._condition:
             while any(runtime.leases for runtime in self.book.runtime.values()) and self._clock() < deadline:
                 try:
                     await asyncio.wait_for(self._condition.wait(), deadline - self._clock())
@@ -659,6 +675,7 @@ class ModelScheduler:
             self._queue.remove(session_id, WaitState.CANCELLED)
             self._ensure_session_worker()
             self._condition.notify_all()
+        await self._notify_execution_drain(session_id)
         while True:
             async with self._condition:
                 current = self.sessions.get(session_id)
@@ -733,6 +750,7 @@ class ModelScheduler:
                 return
             self.sessions.begin_drain(session_id, self._clock(), "expired")
             self._condition.notify_all()
+        await self._notify_execution_drain(session_id)
 
     async def _prepare_session(self, session_id: str) -> None:
         async with self._condition:
