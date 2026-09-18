@@ -1133,6 +1133,7 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 目标机（Linux aarch64，python 3.12.14）`pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`：root = `16 passed`（门禁项计入、无 skip），jtzn = `15 passed, 1 skipped`；目标树前后为空。
 门禁细节：socket 0660 且组属 `nogroup`、目录 0750 组可穿越（保持非 world-accessible，`ControlServer` 拒绝 0o007 父目录）——allowed 客户端（uid 0）经真实 socket 得到 `200`/`owner=uid:0`；nobody（65534）在**真实 connect 成功**后只写出自身的 `connected` 标记、零 HTTP 应答，证明身份取自在 accepted socket 上读到的内核 `SO_PEERCRED`，allow-list 是唯一拒绝来源。
 修复前该门禁为假通过（`drive()` 是 async 却从未被 await，`RuntimeWarning: coroutine was never awaited`）；真实执行后又暴露服务端事件循环内同步 `subprocess.run` 的自饥饿（allowed 客户端 10s 超时）；两处均为测试面修正，服务端行为未改。
+同步：`e65908b`→`a2789d3`→`b2d38ee` 均推送 GitHub 并校验；目标机对 GitHub 访问中断后，经其既有裸仓 origin fast-forward 至 `b2d38ee` 并同 SHA 复验（root `16 passed`、树为空）——目标机 origin 与指南不一致的拓扑问题待用户确认（P14 遗留）。
 未解决：①真实部署的客户端组/UID 由部署输入渲染、两 UID 的 create→execute→cancel/close 黑盒闭环属 P18/P27（CP2），本任务只证明身份传递本身；
 ②TCP 侧旧 API（/v1/*、SSE、/api/*）的 v2 完整回归属 P19；③`/internal/*` 正式路由与错误映射属 P18；④控制口 body 流式（1 GiB 上传）在 P18 扩 ControlServer 时处理，当前 buffered ≤4 MiB（inline 帽）。
 

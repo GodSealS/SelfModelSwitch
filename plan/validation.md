@@ -769,3 +769,4 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 真实部署的客户端组/UID 由部署输入渲染（P27）、两 UID 的 create→execute→cancel/close 黑盒闭环属 P18（CP2）；本任务只证明身份传递本身。
 - `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18)；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
 - 目标机复验曾暴露 Linux RST vs macOS FIN 的断言差异（`52b739c`、`1f5936a` 两修复后全绿）：记录为测试面修正，非服务端行为变更。
+- **同步状态（2026-09-18）**：开发机提交 `e65908b`→`a2789d3`→`b2d38ee` 均推送 GitHub `origin/main` 并校验远端 SHA；目标机对 GitHub 的访问在本轮中断（HTTP/2 framing 错误、随后 60s 连接超时），故先以显式 GitHub URL 同步到 `a2789d3`，最终改经其既有 origin（本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`，原停于 `f149d37`）fast-forward 至 `b2d38ee`：`verified_target_sha=b2d38ee...`、root 复验 `16 passed`、前后树为空；裸仓 `main` 现为 `b2d38ee`。目标机 origin 与指南"两台一致 GitHub"不符这一拓扑问题仍待用户确认（P14 遗留）。
