@@ -881,10 +881,29 @@ drain 超时则撤销冻结、保留 waiter、30s 后重试；关闭/到期走�
 **Description:** 接入session/execution清理状态，修正当前release在ABORTED时先删lease的风险。
 **Files likely touched:** `model_scheduler/session_manager.py`、`model_scheduler/scheduler.py`、`model_scheduler/model_registry.py`、`tests/test_sessions.py`、`tests/test_cancellation.py`。
 **Acceptance criteria:**
-- [ ] 到期瞬间submit/heartbeat拒绝；10/30/60s清理、5s对账；BLOCKED保槽/预算且health503。
-- [ ] 断线/异常/取消不提前释放执行lease；其他有效lease完成前不杀共享实例。
-- [ ] 旧boot/generation/operation/attempt晚回写无副作用；close幂等；恢复重hash、不自动推理重放。
+- [x] 到期瞬间submit/heartbeat拒绝；10/30/60s清理、5s对账；BLOCKED保槽/预算且health503。
+- [x] 断线/异常/取消不提前释放执行lease；其他有效lease完成前不杀共享实例。
+- [x] 旧boot/generation/operation/attempt晚回写无副作用；close幂等；恢复重hash、不自动推理重放。
 **Verification:** `python -m pytest tests/test_sessions.py tests/test_cancellation.py tests/test_scheduler_lifecycle.py -q`；覆盖close×heartbeat×late load三方竞争。到K2。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `8d9941d`（P09 记录提交）；实现提交 `7959fcb`、`2ed163c`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
+`pytest tests/test_sessions.py tests/test_cancellation.py tests/test_scheduler_lifecycle.py -q` = 59 passed（新增测试先失败，即 RED）；
+`pytest tests -m 'not thor' -q` = 480 passed, 1 deselected（P09 基线 457）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+到期语义：`SessionManager.is_live()` 以 `now < expires_at` 判定存活（soft TTL 与 hard deadline 取小）；到期瞬间 `heartbeat()` 抛 `session_expired`（不能复活），
+`acquire(..., session_id=…)` 对非 ACTIVE/非存活会话分别抛 `session_not_active`/`session_expired`（submit 拒绝）；等待期的 PREPARING 会话不被当作 live。
+清理与对账：10s 取消等待、30s stop grace、60s 总清理、BLOCKED 保槽位与预算并每 5s 对账（P09 交付，本轮补到期与取消路径测试）；health503 由 HTTP 层在 P18 映射。
+取消与断线：`Book.begin_cancel()` 只标记，lease/槽位/预留全部保留（`begin_eviction` 因仍有 lease 被拒），`release()` 才是释放点且 ABORTED 仍转 ERROR 保预留，
+只有确认 STOPPED 才清零；`tests/test_cancellation.py` 新增断线（ABORTED）后预算保留、shutdown 确认停止才清零的断言；drain 路径从不 revoke lease（P09 的 30s 让步测试 + 本轮交互冷切换 30s drain 测试）。
+Fence 与幂等：`control_protocol_v1.writeback_decision()` 是唯一写回判据（同 boot/model/generation/operation、execution_id 一致、attempt 不得回退），
+拒绝时 `WritebackDecision` 保留原始 fence 供事件与证据（`fence_document()`），`scheduler` 在迟到 load/stop 被 `StaleOperation` 拒绝时发出 `writeback_rejected` 事件；
+`stopped()` 重复调用抛 `StaleOperation`，`begin_cleanup` 对同一模型只允许一次批，close 幂等；会话在加载途中被关闭/到期时，迟到加载成功只触发清理、不会复活会话（`_prepare_session` 在非 PREPARING 时停模型并 CLOSED）；
+`storage_recovered()` 先重新校验（guard 调用）再 recover，测试断言不自动重放任何推理（`backend.loads` 不增长、无残留 lease），新请求仍可正常准入。
+**目标核验**：干净 checkout fast-forward 到 `2ed163c`；P10 测试文件 59 passed；全量（P09 记录同批）471→ 见下：目标机 `tests/test_control_protocol_v1.py tests/test_registry.py tests/test_scheduler_lifecycle.py` 102 passed（`7959fcb`），
+`tests/test_sessions.py tests/test_cancellation.py tests/test_scheduler_lifecycle.py` 59 passed（`2ed163c`）；两次全量均为 3 项 `tests/test_release.py` 环境失败（`.venv/bin/python`，P28 范围）。
+未解决：①health503 与 409/410 状态码映射属 P18；②execution 级 attempt/终止证据由 P14 使用同一 `writeback_decision` 与 `TerminationEvidence`；
+③写回判据是服务端纯函数，未纳入 P03 的 wire schema；④本任务额外触碰 `control_protocol_v1.py`/`tests/test_control_protocol_v1.py`（fence 定义处）与 `tests/test_registry.py`，
+计划列出的 `tests/test_sessions.py`/`tests/test_cancellation.py` 亦已覆盖，共 8 个文件，超出"约 5 个"。到 K2。
 
 ### P11 — Blob上传、读取及租约（M04）
 

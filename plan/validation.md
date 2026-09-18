@@ -408,3 +408,48 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 未执行：HTTP 状态码映射（P18）、execution/cancel 与 blob 传输（P14）、真机模型加载与会话时长验收（P29 以后）。
 - `/health` 在会话等待期间仍需 P18 证明 200；本任务只保证调度器不阻塞其判据。
 - 会话记录在进程重启后不恢复（随机 boot_id 失效）：由 P10/P13 的重启语义确认。
+
+## P10 记录（2026-09-18）
+
+范围：到期/取消/断线的账本语义、generation/attempt fence 与清理幂等；证明 TTL、硬期限、取消、重启都不会提前释放。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P10 |
+| status | complete |
+| source_commit | `8d9941db9464afc08fb956ee246f6cfe63edbd73`（P09 记录提交，起点） |
+| implementation_commit | `7959fcb11d4d1bec275794268ea8d6a89b817513`（fence/取消）、`2ed163caba195edd67ce436363971b3033c3e0a4`（到期/迟到加载） |
+| target_commit | `2ed163caba195edd67ce436363971b3033c3e0a4`（fast-forward，工作区为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：三条验收由开发机与目标机测试支撑（软件层 S）。`health503` 属 HTTP 层，见第 4 节。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_sessions.py tests/test_cancellation.py tests/test_scheduler_lifecycle.py -q`（实现前） | 2 | 新判据/API 不存在，即 RED |
+| 同上（实现后，开发机） | 0 | `59 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `480 passed, 1 deselected`（P09 基线 457） |
+| `ruff check .` / `run.py --check-config`（开发机） | 0 | 通过 / 旧四 ID |
+| P10 三文件（目标机 `2ed163c`） | 0 | `59 passed` |
+| `pytest tests -m 'not thor' -q`（目标机） | 1 | 3 failed，全部为 `tests/test_release.py` 的 `.venv/bin/python` 环境假设（P28） |
+
+### 3. 关键事实
+
+- 到期即失效：`is_live` 用 `now < expires_at`（soft TTL 与 hard deadline 取小），renew/submit 在该瞬间起被拒。
+- 取消不是停止：lease、槽位与预留保留到可信终结；ABORTED 后模型为 ERROR，仍保预留直到确认 STOPPED。
+- 唯一写回判据：boot/model/generation/operation/execution 一致且 attempt 不回退；拒绝时保留原始 fence。
+- 清理只发生一次：重复 `stopped()` 抛 `StaleOperation`，同一模型的 cleanup 批只能建立一次，close 幂等。
+- 会话在加载途中被关闭时，迟到加载成功只触发清理，不复活会话、不留下孤儿驻留。
+- 存储恢复重新校验且不自动重放推理；新请求仍需显式发起。
+
+### 4. 未执行 / 未解决
+
+- `health503`（BLOCKED 时）与 409/410 状态码映射属 P18 的 HTTP 层；本任务交付调度器判据与 `SessionConflict`/`ModelUnavailable`。
+- execution 级 attempt 与终止证据由 P14 使用同一 `writeback_decision` 与 `TerminationEvidence`。
+- 本任务触碰 8 个文件（多出 `control_protocol_v1.py`、`tests/test_control_protocol_v1.py`、`tests/test_registry.py`），超出"约 5 个"，理由见 08-execution-plan 记录。
