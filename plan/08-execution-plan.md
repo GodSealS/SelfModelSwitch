@@ -1016,11 +1016,22 @@ claims 固定为 `boot_id/owner/model_id/session_id/execution_id/expires_at` 的
 **Description:** 第一个真实adapter使用登记profile实现C06，保留llama-swap只控生命周期的边界。
 **Files likely touched:** `model_scheduler/adapters/llama_cpp.py`、`tests/test_llama_adapter.py`、`tests/fixtures/llama_cpp_v1.json`（均新增）、`model_scheduler/backend_router.py`、`model_scheduler/gateway.py`。
 **Acceptance criteria:**
-- [ ] 输入按登记协议消费，输出shape/有限值验证；token/image计数失败时拒绝，不盲dispatch；不跟随重定向访问外部URL。
-- [ ] HTTP响应完成不自动等于设备静止：若固定runtime有可信同步/slot终结协议，fixture绑定并验证；
+- [x] 输入按登记协议消费，输出shape/有限值验证；token/image计数失败时拒绝，不盲dispatch；不跟随重定向访问外部URL。
+- [x] HTTP响应完成不自动等于设备静止：若固定runtime有可信同步/slot终结协议，fixture绑定并验证；
   否则以独立STOPPED作为终结回退，明确其停止/重载成本，不能造quiescent=true。
-- [ ] 新runtime无profile直接拒绝；scheduler进程依赖不含Torch/ORT；adapter无业务job/stage。
+- [x] 新runtime无profile直接拒绝；scheduler进程依赖不含Torch/ORT；adapter无业务job/stage。
 **Verification:** `python -m pytest tests/test_llama_adapter.py tests/test_gateway.py -q`；目标记录真实协议fixture及同步/停止证据，fixture含敏感输入时先脱敏并保留hash关联。
+
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `dfb8ec1`（P13 记录提交）；实现提交 `74d3f63385b8ec27a0ec92f4e63e3a9080b8bcc9`；
+python=3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`）。
+`pytest tests/test_llama_adapter.py tests/test_gateway.py -q` = 30 passed（实现前 adapter 模块不存在，14 项失败，即 RED）；
+`pytest tests/test_llama_adapter.py tests/test_gateway.py tests/test_backend_router.py -q` = 37 passed；
+`pytest tests -m 'not thor' -q` = 536 passed, 1 deselected（P13 基线 519）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增 `model_scheduler/adapters/llama_cpp.py`：`LlamaCppAdapter` 绑定 `llama-cpp-gguf-v1`，实现 `BackendPort`。chat/vision 走 `/v1/chat/completions`，embeddings 走 `/v1/embeddings`，rerank 走 `/reranking`；dispatch 前用 `/apply-template` 再 `/tokenize` 计文本 token，未确定的图像按登记 `max_image_tokens` 计入，超 envelope、远程 URL、边长/图像数越限一律拒绝且不发推理请求；输出拒绝非有限 JSON 与错误 shape。HTTP 3xx 不跟随。`/slots` 的 `is_processing=false` 只作为请求空闲事实，`claims_device_quiescence()` 恒为 false，终结回退为独立 STOPPED，fixture 记录冷加载 18.07s 与 stop grace 30s。llama-swap 只作为注入的 load/unload 控制。
+`backend_router.register` 拒绝 adapter 声明的 `profile_id` 与 runtime 不一致；`gateway.open` 显式 `follow_redirects=False`。`requirements.in`/`requirements.lock` 不含 torch/onnxruntime；adapter 源码无 job/stage。
+新增 `tests/fixtures/llama_cpp_v1.json`：路径与 M00 探测一致（`/health`、`/slots`、`/tokenize`、`/apply-template`、`/v1/chat/completions`），`trusted_for_device_quiescence=false`，`fallback_termination=independent_STOPPED`。fixture 不含媒体原文。
+**Files touched:** `model_scheduler/adapters/__init__.py`（新增）、`model_scheduler/adapters/llama_cpp.py`（新增）、`tests/test_llama_adapter.py`（新增）、`tests/fixtures/llama_cpp_v1.json`（新增）、`model_scheduler/backend_router.py`、`model_scheduler/gateway.py`、`tests/test_gateway.py`。
+未解决：①本轮未在目标机对活的 llama-server 重采协议 body hash，也未做真实推理/停止证据（属目标核验；fixture 目前为 M00 路径钉扎，`acceptance_status=protocol_pinned_from_m00`）；②execution 服务接线属 P14/P16；③vision 的 Blob 输入与完整 envelope 边界属 P20。
 
 ### P16 — backend load/execute/cancel/stop完整接线（M04）
 

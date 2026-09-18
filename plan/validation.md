@@ -578,3 +578,47 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 ### 4. 未执行 / 未解决
 
 - peer credential 注入与 HTTP 错误码映射（P17/P18）；token/幂等接入 session/execution 路由（P14/P18）。
+
+## P15 记录（2026-09-18）
+
+范围：第一个真实 llama.cpp GGUF adapter（C06 输入计数、输出有限值、禁止重定向、HTTP 完成不等于设备静止）。P15 依赖 P06/P03，不依赖未完成的 P14。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P15 |
+| status | software_only |
+| source_commit | `dfb8ec15045076812f267e5799ba7e925915a7e0`（P13 记录提交，起点） |
+| implementation_commit | `74d3f63385b8ec27a0ec92f4e63e3a9080b8bcc9` |
+| target_commit | 待同步 |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`） |
+| evidence_directory | 无新目标证据目录；fixture 钉扎 M00 路径，未重采活协议 body |
+
+本任务软件验收三条均由开发机测试支撑。目标活 llama-server 协议 body hash 与停止证据未在本轮采集，因此标 `software_only`，不是设备侧通过。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_llama_adapter.py tests/test_gateway.py -q`（实现前） | 1 | 14 failed, 16 passed（adapter 模块不存在，即 RED） |
+| 同上（实现后） | 0 | `30 passed` |
+| `pytest tests/test_llama_adapter.py tests/test_gateway.py tests/test_backend_router.py -q` | 0 | `37 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `536 passed, 1 deselected`（P13 基线 519） |
+| `ruff check .` | 0 | 通过 |
+| `run.py --check-config` | 0 | `schema_version=1` 旧四 ID |
+
+### 3. 关键事实
+
+- 输入按登记协议消费：chat/vision=`messages`，embeddings=`input`，rerank=`query`/`documents`。
+- 文本 token 来自 `/apply-template` 再 `/tokenize`；未确定图像按 `envelope.max_image_tokens` 计入；计数失败或越 envelope 不发推理请求。
+- 远程 image URL 拒绝；PNG/JPEG data URL 按解码后边长检查；输出拒绝 NaN/Inf 与错误 shape。
+- HTTP 3xx 不跟随；gateway 显式 `follow_redirects=False`。
+- `/slots` idle 不是设备静止；`claims_device_quiescence()` 恒 false；回退独立 STOPPED，冷加载成本 18.07s。
+- 未知/registration-only profile 拒绝；锁文件不含 torch/onnxruntime；adapter 无 job/stage。
+
+### 4. 未执行 / 未解决
+
+- 目标活 llama-server 协议 body hash 与真实推理/停止证据（本轮未 SSH 探测）。
+- execution 服务接线（P14/P16）；vision Blob 与完整 envelope 边界（P20）。
