@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass
 import inspect
 from time import monotonic
-from typing import Awaitable, Callable
+from typing import Callable, Mapping
 
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
 from .eviction_policy import EvictionPolicy
@@ -42,7 +42,7 @@ class SwitchIntent:
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic, event_sink: Callable[[str, Mapping[str, object]], None] | None = None):
         if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds, switch_window_seconds, cooldown_seconds) <= 0 or max_switches_in_window < 1:
             raise ValueError("scheduler intervals must be positive")
         self.book = book
@@ -71,6 +71,7 @@ class ModelScheduler:
         self._recovery_task: asyncio.Task[None] | None = None
         self.sessions = sessions if sessions is not None else SessionManager()
         self._clock = clock
+        self.event_sink = event_sink
         self._session_worker: asyncio.Task[None] | None = None
         self._session_leases: dict[str, set[str]] = {}
         self._session_freeze: str | None = None
@@ -231,8 +232,13 @@ class ModelScheduler:
             async with self._condition:
                 if observation.presence is Presence.RUNNING and observation.healthy:
                     now = self._clock()
-                    self.book.loaded(operation, now)
-                    self._record_cold_load(now)
+                    try:
+                        self.book.loaded(operation, now)
+                    except StaleOperation:
+                        # A late success for a superseded operation must not move the books.
+                        self._emit_writeback_rejection("load", operation, "stale_operation")
+                    else:
+                        self._record_cold_load(now)
                 else:
                     self.book.failed(operation, observation.detail_code or "load_unverified")
                     recover = self.recovery is not None and not self.book.recovering
@@ -339,8 +345,12 @@ class ModelScheduler:
                 observation = None
             async with self._condition:
                 if observation is not None and observation.presence is Presence.STOPPED:
-                    self.book.stopped(operation)
-                    stopped.append(operation.model_id)
+                    try:
+                        self.book.stopped(operation, self._clock())
+                    except StaleOperation:
+                        self._emit_writeback_rejection("stop", operation, "stale_operation")
+                    else:
+                        stopped.append(operation.model_id)
                 else:
                     self.book.failed(operation, observation.detail_code if observation else "stop_unverified")
                     self._rollback_pending(operations[index + 1:])
@@ -539,6 +549,32 @@ class ModelScheduler:
             self._eviction = task
             self._condition.notify_all()
         return await task
+
+    def _emit(self, kind: str, payload: Mapping[str, object]) -> None:
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink(kind, payload)
+        except Exception:
+            # Evidence collection must never break a lifecycle transition.
+            pass
+
+    def _emit_writeback_rejection(self, stage: str, operation, reason: str) -> None:
+        self._emit("writeback_rejected", {
+            "stage": stage,
+            "reason": reason,
+            "operation_id": operation.operation_id,
+            "model_id": operation.model_id,
+            "generation": operation.generation,
+            "epoch": operation.epoch,
+        })
+
+    async def cancel(self, lease: Lease) -> bool:
+        """Accept one cancel; the lease, the slot and the budget stay until it ends."""
+        async with self._condition:
+            accepted = self.book.begin_cancel(lease)
+            self._condition.notify_all()
+            return accepted
 
     # -- C04 exclusive sessions ---------------------------------------------
 
@@ -852,6 +888,7 @@ class ModelScheduler:
                         "state": "active" if runtime.state.value == "ready" and runtime.leases else runtime.state.value,
                         "generation": runtime.generation,
                         "in_flight": len(runtime.leases),
+                        "cancelling": len(runtime.cancelling),
                         "waiting_requests": self._queue.waiting_count(model_id),
                         "capabilities": sorted(capability.value for capability in self.book.specs[model_id].capabilities),
                         "reserved_bytes": self.book.specs[model_id].reserved_bytes,

@@ -55,6 +55,7 @@ class Runtime:
     total_tokens: int = 0
     usage_unknown_requests: int = 0
     stopped_at: float | None = None
+    cancelling: dict[str, Lease] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -171,9 +172,13 @@ class Book:
         return 0 <= now - sample.sampled_at <= self.max_sample_age and sample.total_bytes > 0 and 0 <= sample.available_bytes <= sample.total_bytes
 
     def sample_after_stop(self, model_id: str, sample: MemorySample) -> bool:
-        """C02: a sample taken before the last proven stop cannot admit a load."""
+        """C02: a sample that predates the last proven stop cannot admit a load.
+
+        A sample taken at the stop instant or later is admissible; the rule exists
+        to stop a pre-stop reading from being reused for the next load.
+        """
         stopped_at = self.runtime[model_id].stopped_at
-        return stopped_at is None or sample.sampled_at > stopped_at
+        return stopped_at is None or sample.sampled_at >= stopped_at
 
     def can_load(self, model_id: str, sample: MemorySample, now: float) -> bool:
         runtime, required = self.runtime[model_id], self.required(model_id)
@@ -249,6 +254,7 @@ class Book:
         if tokens is not None and (type(tokens) is not int or tokens < 0):
             raise ValueError("tokens must be a nonnegative integer")
         del runtime.leases[lease.lease_id]
+        runtime.cancelling.pop(lease.lease_id, None)
         if outcome is Outcome.SUCCESS:
             if tokens is None:
                 runtime.usage_unknown_requests += 1
@@ -260,6 +266,25 @@ class Book:
         if not runtime.leases:
             runtime.idle_since = now
         return True
+
+    def begin_cancel(self, lease: Lease) -> bool:
+        """Accept one cancel; the lease and its budget stay until the terminal proof.
+
+        A cancel acknowledgement is not evidence that computation stopped, so the
+        model keeps its slot, its reservation and its admission block until the
+        execution reports a trusted terminal state (C03/C04).
+        """
+        runtime = self.runtime[lease.model_id]
+        if runtime.leases.get(lease.lease_id) != lease or runtime.generation != lease.generation:
+            return False
+        runtime.cancelling[lease.lease_id] = lease
+        return True
+
+    def is_cancelling(self, lease: Lease) -> bool:
+        return self.runtime[lease.model_id].cancelling.get(lease.lease_id) == lease
+
+    def cancelling_leases(self, model_id: str) -> tuple[Lease, ...]:
+        return tuple(self.runtime[model_id].cancelling.values())
 
     def begin_eviction(self, model_ids: list[str], *, automatic: bool = True) -> list[Operation]:
         if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):

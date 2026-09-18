@@ -321,6 +321,75 @@ def _validate_json_value(value: Any, where: str) -> None:
 
 
 @dataclass(frozen=True)
+class WritebackDecision:
+    """The verdict on one late write-back, plus the raw fence it carried (C03).
+
+    A rejected write-back is never dropped silently: the caller records the
+    decision with its reason and the original fence as raw material, so the
+    evidence shows what arrived too late instead of losing it.
+    """
+
+    accepted: bool
+    reason: str | None
+    fence: "Fence"
+
+    def as_dict(self) -> dict[str, object]:
+        return {"accepted": self.accepted, "reason": self.reason, "fence": fence_document(self.fence)}
+
+
+WRITEBACK_REJECTIONS = frozenset(
+    {
+        "stale_boot",
+        "foreign_model",
+        "stale_generation",
+        "stale_operation",
+        "foreign_execution",
+        "attempt_mismatch",
+        "stale_attempt",
+    }
+)
+
+
+def fence_document(fence: "Fence") -> dict[str, object]:
+    """The raw fence as a plain JSON object, for events and evidence."""
+    if not isinstance(fence, Fence):
+        raise ContractError("fence_document: a Fence is required")
+    return {
+        "boot_id": fence.boot_id,
+        "model_id": fence.model_id,
+        "generation": fence.generation,
+        "operation_id": fence.operation_id,
+        "execution_id": fence.execution_id,
+        "attempt": fence.attempt,
+    }
+
+
+def writeback_decision(current: "Fence", incoming: "Fence") -> WritebackDecision:
+    """C03: only the same boot, generation, operation and a non-older attempt may apply.
+
+    A restart gets a new `boot_id`, a new load a new `generation`/`operation_id`,
+    and every execution attempt is numbered, so a late result or terminal event
+    from a superseded instance can never change the current books.
+    """
+    if not isinstance(current, Fence) or not isinstance(incoming, Fence):
+        raise ContractError("writeback_decision: both fences must be Fence values")
+    checks = (
+        ("stale_boot", incoming.boot_id != current.boot_id),
+        ("foreign_model", incoming.model_id != current.model_id),
+        ("stale_generation", incoming.generation != current.generation),
+        ("stale_operation", incoming.operation_id != current.operation_id),
+        ("foreign_execution", current.execution_id is not None and incoming.execution_id != current.execution_id),
+        ("attempt_mismatch", (current.attempt is None) != (incoming.attempt is None)),
+    )
+    for reason, failed in checks:
+        if failed:
+            return WritebackDecision(False, reason, incoming)
+    if current.attempt is not None and incoming.attempt < current.attempt:
+        return WritebackDecision(False, "stale_attempt", incoming)
+    return WritebackDecision(True, None, incoming)
+
+
+@dataclass(frozen=True)
 class ErrorDetail:
     code: str
     message: str

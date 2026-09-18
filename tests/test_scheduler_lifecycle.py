@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -795,3 +796,182 @@ async def test_an_unconfirmed_cleanup_blocks_and_keeps_the_budget_until_it_recon
     clock.advance(5.0)
     assert await eventually(lambda: sessions.get("session-1").phase == "closed")
     assert registry.committed == 0
+
+
+# ---------------------------------------------------------------------------
+# P10: cancel/TTL/restart never release early, and late write-backs are fenced.
+# ---------------------------------------------------------------------------
+
+
+class GatedBackend(SessionBackend):
+    """A backend whose load can be held open across a restart/recovery."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def load(self, operation, deadline):
+        self.loads.append(operation.model_id)
+        self.started.set()
+        await self.gate.wait()
+        return Observation(Presence.RUNNING, f"instance-{operation.model_id}", True, 0)
+
+
+class GatedRecovery:
+    def __init__(self) -> None:
+        self.called = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def recover(self, deadline):
+        self.called.set()
+        await self.gate.wait()
+        return RecoveryResult(True, "complete", None, ("chat",))
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_cancel_keeps_the_lease_and_the_budget_until_the_proof() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    registry = book()
+    scheduler = session_scheduler(registry, backend, clock)
+    lease = await scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 10)
+
+    assert await scheduler.cancel(lease) is True
+
+    assert registry.runtime["chat"].leases.get(lease.lease_id) == lease  # the slot is still held
+    assert registry.runtime["chat"].cancelling[lease.lease_id] == lease
+    assert registry.committed > 0  # and so is the budget
+    status = await scheduler.status()
+    assert status["models"]["chat"]["cancelling"] == 1
+    with pytest.raises(Conflict):
+        registry.begin_eviction(["chat"])  # a live (cancelling) lease blocks a stop
+
+    await scheduler.release(lease, Outcome.ABORTED)  # the trusted terminal proof
+
+    assert registry.runtime["chat"].cancelling == {}
+    assert registry.committed > 0  # an aborted request keeps the reservation until STOPPED
+    assert registry.runtime["chat"].state is State.ERROR
+    await asyncio.wait_for(scheduler.shutdown(asyncio.get_running_loop().time() + 5), 5)
+    assert registry.committed == 0
+
+
+@pytest.mark.asyncio
+async def test_a_late_load_write_back_is_rejected_and_keeps_the_raw_fence() -> None:
+    backend, recovery = GatedBackend(), GatedRecovery()
+    events: list[tuple[str, dict]] = []
+    registry = book()
+    scheduler = ModelScheduler(
+        registry, Resources(), backend,
+        recovery=recovery,
+        event_sink=lambda kind, payload: events.append((kind, dict(payload))),
+        poll_interval_seconds=0.01,
+    )
+    acquiring = asyncio.create_task(scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 30))
+    await backend.started.wait()
+    recovering = asyncio.create_task(scheduler.recover(asyncio.get_running_loop().time() + 30))
+    await recovery.called.wait()  # begin_recovery already bumped the epoch
+
+    backend.gate.set()  # the load "succeeds" for an operation that is now stale
+
+    assert await eventually(lambda: any(kind == "writeback_rejected" for kind, _ in events))
+    acquiring.cancel()
+    recovery.gate.set()
+    await recovering
+    with contextlib.suppress(asyncio.CancelledError, ModelUnavailable):
+        await acquiring  # recovery refuses the waiter; either way nothing was applied
+
+    kind, payload = next(item for item in events if item[0] == "writeback_rejected")
+    assert kind == "writeback_rejected"
+    assert payload["stage"] == "load"
+    assert payload["reason"] == "stale_operation"
+    assert payload["operation_id"] and payload["generation"] >= 1
+    assert payload["epoch"] == 0  # the fence the operation was created under
+    assert registry.epoch >= 1  # recovery moved the epoch, so that write-back is stale
+    assert registry.runtime["chat"].state is not State.READY  # the late success changed nothing
+
+
+class ClockedReclaimingResources:
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+        self.available = 110
+
+    async def snapshot(self):
+        return MemorySample(10_000, self.available, self.clock())
+
+
+class ClockedReclaimingBackend:
+    def __init__(self, resources: ClockedReclaimingResources) -> None:
+        self.resources = resources
+        self.loads: list[str] = []
+        self.stops: list[str] = []
+
+    async def load(self, operation, deadline):
+        self.loads.append(operation.model_id)
+        return Observation(Presence.RUNNING, operation.model_id, True, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        self.resources.available = 9_000
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_switch_drain_timeout_unfreezes_and_keeps_the_waiter_for_a_later_retry() -> None:
+    clock = ManualClock()
+    specs = {
+        "first": ModelSpec("first", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=2),
+        "second": ModelSpec("second", "http://127.0.0.1:10002", frozenset({Capability.CHAT}), 100),
+    }
+    registry = Book(specs, model_budget=150, free_floor=20, margin=0)
+    for model_id in specs:
+        registry.bootstrap_stopped(model_id)
+    operation = registry.begin_load("first", MemorySample(1_000, 1_000, 0), 0)
+    registry.loaded(operation, 0)
+    holder = registry.acquire_ready("first", "holder", 0)
+    resources = ClockedReclaimingResources(clock)
+    backend = ClockedReclaimingBackend(resources)
+    scheduler = ModelScheduler(
+        registry, resources, backend,
+        clock=clock, poll_interval_seconds=0.01,
+        switch_drain_timeout_seconds=30.0, switch_retry_seconds=30.0,
+    )
+    waiter = asyncio.create_task(scheduler.acquire("second", "waiter", asyncio.get_running_loop().time() + 30))
+
+    assert await eventually(lambda: scheduler._switch_intent is not None)
+    assert scheduler._switch_intent.frozen_models == ("first",)
+    assert registry.runtime["first"].admission_blocked is True
+    clock.advance(30.0)  # the drain window elapses without the holder's lease draining
+
+    assert await eventually(lambda: scheduler._switch_intent is None)
+    assert scheduler._queue.get("waiter") is not None  # the waiter keeps its place
+    assert scheduler._next_switch_attempt["second"] >= 60.0
+    assert registry.runtime["first"].leases.get(holder.lease_id) == holder  # never killed
+    assert registry.runtime["first"].admission_blocked is False  # the freeze was undone
+
+    await scheduler.release(holder, Outcome.SUCCESS)
+    clock.advance(30.0)
+    retried = await asyncio.wait_for(waiter, 5)
+
+    assert retried.model_id == "second"
+    assert backend.stops == ["first"]
+    await scheduler.release(retried, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_ttl_and_an_unverified_stop_never_release_the_budget() -> None:
+    clock, backend = ManualClock(), SessionBackend()
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, ttl_seconds=5.0)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = session_scheduler(registry, backend, clock)
+    lease = await scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 10)
+    await scheduler.release(lease, Outcome.SUCCESS)
+    backend.stop_failures.add("chat")
+
+    assert registry.ttl_due("chat", 5.0)
+    clock.advance(5.0)
+    stopped = await asyncio.wait_for(scheduler.sweep_ttl(asyncio.get_running_loop().time() + 5), 5)
+
+    assert stopped == ()
+    assert registry.runtime["chat"].state is State.ERROR  # TTL only begins a stop
+    assert registry.committed > 0  # and the budget is kept while the stop is unproven

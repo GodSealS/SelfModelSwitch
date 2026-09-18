@@ -693,3 +693,68 @@ def test_export_schema_cli(tmp_path):
     output = tmp_path / "schema.json"
     assert cp.main(["export-schema", "--output", str(output)]) == 0
     assert output.read_text(encoding="utf-8") == cp.render_schema_text()
+
+
+# ---------------------------------------------------------------------------
+# P10: the single write-back fence rule.
+# ---------------------------------------------------------------------------
+
+
+def _typed_fence(**overrides) -> cp.Fence:
+    values = {
+        "boot_id": "boot-0001",
+        "model_id": "qwen25vl-7b-q4",
+        "generation": 3,
+        "operation_id": "op-0001",
+        "execution_id": "e-1",
+        "attempt": 2,
+    }
+    values.update(overrides)
+    return cp.Fence(**values)
+
+
+def test_a_write_back_is_accepted_only_for_the_same_fence() -> None:
+    current = _typed_fence()
+
+    assert cp.writeback_decision(current, _typed_fence()).accepted is True
+    accepted = cp.writeback_decision(current, _typed_fence(attempt=3))
+    assert accepted.accepted is True  # a newer attempt of the same operation may apply
+    assert accepted.reason is None
+
+
+@pytest.mark.parametrize(
+    ("incoming", "reason"),
+    [
+        (_typed_fence(boot_id="boot-0002"), "stale_boot"),
+        (_typed_fence(model_id="other-model"), "foreign_model"),
+        (_typed_fence(generation=4), "stale_generation"),
+        (_typed_fence(operation_id="op-0002"), "stale_operation"),
+        (_typed_fence(execution_id="e-2"), "foreign_execution"),
+        (_typed_fence(attempt=1), "stale_attempt"),
+        (_typed_fence(attempt=None, execution_id=None), "foreign_execution"),
+    ],
+)
+def test_a_stale_write_back_is_rejected_with_its_reason_and_raw_fence(incoming: cp.Fence, reason: str) -> None:
+    decision = cp.writeback_decision(_typed_fence(), incoming)
+
+    assert decision.accepted is False
+    assert decision.reason == reason
+    assert decision.reason in cp.WRITEBACK_REJECTIONS
+    document = decision.as_dict()
+    assert document["fence"]["boot_id"] == incoming.boot_id  # the raw material is preserved
+    assert document["fence"]["attempt"] == incoming.attempt
+    assert document["accepted"] is False
+
+
+def test_an_operation_level_fence_has_no_attempt() -> None:
+    current = _typed_fence(execution_id=None, attempt=None)
+
+    decision = cp.writeback_decision(current, _typed_fence(execution_id=None, attempt=None))
+
+    assert decision.accepted is True  # load/stop fences carry no execution attempt
+    mismatch = cp.writeback_decision(current, _typed_fence())
+    assert (mismatch.accepted, mismatch.reason) == (False, "attempt_mismatch")
+    with pytest.raises(cp.ContractError):
+        cp.writeback_decision(current, "not-a-fence")
+    with pytest.raises(cp.ContractError):
+        cp.fence_document({"boot_id": "boot-0001"})

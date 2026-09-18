@@ -296,3 +296,77 @@ def test_a_proven_stop_needs_a_sample_newer_than_the_stop() -> None:
     assert book.can_load("a", MemorySample(1_000, 900, 50.5), 51.0)
     assert book.stop_settled("a", 50.0 + STOP_RESAMPLE_GRACE_SECONDS)
     assert not book.stop_settled("a", 50.0 + STOP_RESAMPLE_GRACE_SECONDS - 0.001)
+
+
+# ---------------------------------------------------------------------------
+# P10: cleanup runs once, and a late stop write-back cannot release twice.
+# ---------------------------------------------------------------------------
+
+
+def test_a_cleanup_batch_runs_once_and_a_late_stop_cannot_release_again() -> None:
+    book = make_book()
+    load(book, "a")
+    operations = book.begin_cleanup(["a"])
+
+    with pytest.raises(Conflict):
+        book.begin_cleanup(["a"])  # the same model is stopped by exactly one batch
+
+    book.stopped(operations[0], now=5.0)
+    assert book.committed == 0
+
+    with pytest.raises(StaleOperation):
+        book.stopped(operations[0], now=6.0)  # a late duplicate proof has no effect
+    assert book.committed == 0
+
+
+def test_a_cancelling_lease_keeps_its_budget_until_the_terminal_proof() -> None:
+    book = make_book()
+    load(book, "a")
+    lease = book.acquire_ready("a", "req-1", 1.0)
+
+    assert book.begin_cancel(lease) is True
+    assert book.is_cancelling(lease)
+    assert book.cancelling_leases("a") == (lease,)
+    assert book.committed == 100  # a cancel acknowledgement is not a stop
+    with pytest.raises(Conflict):
+        book.begin_eviction(["a"])
+
+    assert book.release(lease, Outcome.ABORTED, 2.0) is True
+    assert book.cancelling_leases("a") == ()
+    assert book.committed == 100  # the aborted model is ERROR: the reservation stays
+    assert book.runtime["a"].state is State.ERROR
+
+    operations = book.begin_cleanup(["a"])
+    book.stopped(operations[0], now=3.0)
+    assert book.committed == 0
+
+
+def test_a_stale_operation_cannot_write_back_a_load_or_a_stop() -> None:
+    book = make_book()
+    stale_load = book.begin_load("a", MemorySample(1_000, 900, 0), 0)
+    book.failed(stale_load, "load_timeout")
+    cleanup = book.begin_cleanup(["a"])[0]
+    book.stopped(cleanup, now=1.0)
+
+    fresh_load = book.begin_load("a", MemorySample(1_000, 900, 1.0), 1.0)
+    book.loaded(fresh_load, 1.0)
+
+    with pytest.raises(StaleOperation):
+        book.loaded(stale_load, 2.0)  # a late success cannot resurrect the failed operation
+
+    eviction = book.begin_eviction(["a"])[0]
+    with pytest.raises(StaleOperation):
+        book.stopped(stale_load, 3.0)
+    book.stopped(eviction, 3.0)
+    assert book.committed == 0
+
+
+def test_a_cancel_is_refused_for_a_lease_this_model_no_longer_holds() -> None:
+    book = make_book()
+    load(book, "a")
+    lease = book.acquire_ready("a", "req-1", 1.0)
+    assert book.begin_cancel(lease) is True
+    assert book.release(lease, Outcome.SUCCESS, 2.0) is True
+
+    assert book.begin_cancel(lease) is False  # released: nothing left to cancel
+    assert book.is_cancelling(lease) is False
