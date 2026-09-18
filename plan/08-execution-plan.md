@@ -1103,12 +1103,32 @@ mid-stream 失败与预派发拒绝在 P17/P16 后续不区分 → 走 awaiting-
 **Description:** 先用真实socket证明C08身份传递，再接入控制路由，不依赖伪造HTTP头测试。
 **Files likely touched:** `model_scheduler/control_server.py`（新增）、`run.py`、`app.py`、`tests/integration/test_control_socket.py`（新增）。
 **Acceptance criteria:**
-- [ ] 两listener共享同一boot/Book，lifespan启动和清理各一次；TCP/internal/*返回404。
-- [ ] run.py明确v1/v2分支：解析→唯一锁→创建一次运行上下文→旧实例reconcile→Blob恢复→开放入口；
+- [x] 两listener共享同一boot/Book，lifespan启动和清理各一次；TCP/internal/*返回404。
+- [x] run.py明确v1/v2分支：解析→唯一锁→创建一次运行上下文→旧实例reconcile→Blob恢复→开放入口；
   仅依赖llama-swap的profile导入CONTROL_CONTRACT，v2不走旧四模型专用build_backend分支。
 - [ ] Linux两UID真实连接：允许UID可访问、非允许UID拒绝；伪X-UID无效；socket0660/目录权限符合部署配置。
-- [ ] 单worker/instance_lock；第二进程明确拒绝；半包、超大头、body timeout、断线不泄漏task/FD。
+- [x] 单worker/instance_lock；第二进程明确拒绝；半包、超大头、body timeout、断线不泄漏task/FD。
 **Verification:** `python -m pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`；Linux真实UID测试属S门禁，Mac skip不能计该项通过。
+
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `2e27543`（P16 目标复验记录提交）；实现提交 `efb19f5`、`c1ba156`、`f096213`；
+python=3.13.5（开发机）。`pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q` = 14 passed, 1 skipped（实现前 control_server 不存在，收集 ImportError，即 RED）；
+全量 `pytest tests -m 'not thor' -q` = 585 passed, 1 skipped, 1 deselected（P16 基线 571）；`ruff check .` exit 0；`run.py --check-config` 仍 v1 四 ID。
+新增 `model_scheduler/control_server.py`：`peer_uid_of`（Linux `SO_PEERCRED` / macOS `LOCAL_PEERCRED`，socketpair 自证真实内核凭据）；
+`ControlServer`=`asyncio.start_unix_server` + h11 **只做请求解析**（h11 0.16 无公开出站 API；响应为小体积显式序列化，避免依赖 uvicorn/h11 私有接口——C08"失败则阻塞，不退化为相信请求头"的正解）；
+allow-list 在解析任何字节前拒绝（连接静默关闭，无 HTTP 应答）；只收 HTTP/1.1 GET/POST，CONNECT/TRACE/HTTP1.0/Upgrade/Proxy-Connection/chunked/超大头（16KiB 帽）一律关闭不断线泄漏；
+scope 注入 `sms.peer=PeerIdentity(uid)`+`sms.request_id`，`client=None`（ASGI client 永不是身份）；`stop()` 先停 accept→cancel+gather 在途连接→删自己的 socket（活 socket 拒绝接管）。
+`build_control_app`：仅 `/internal/peer` 证明 C08 传递（owner/boot_id/via），其余 404 走 C05 错误体；正式路由属 P18。
+`build_tcp_skeleton_app`：TCP 侧唯一 lifespan（计数器断言启动/清理各一次）+ 不注册 `/internal`（TCP 404 by construction）。
+`run.py`：`startup_plan`（v1/v2、锁路径、needs_swap）；v2 分支 `lock→build_v2_context→reconcile_startup→blobs.recover→uvicorn serve + ControlServer`（lifespan 由 TCP 唯一持有，finally 关控制侧）；
+v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅 llama-swap profile 需要时函数内 import（hf-only 计划断言 sys.modules 无该模块）；reconcile 不 ok → 拒绝开放（准入保持 closed）而非半成品服务；
+站点输入 `SELFMODEL_SWITCH_DEPLOYMENT_ID`/`SELFMODEL_SWITCH_SWAP_CONTROL_URL` 缺失即 fail-closed（schema 归属定形 P18/P20，避免本任务偷改 v2 配置闭集）；v1 路径逐行为保留（原 61 行逻辑、monkeypatch 面不变）。
+`deploy/model-scheduler.service.in`：`RuntimeDirectory=model-scheduler self-model-switch` + `RuntimeDirectoryMode=0750`（渲染断言）；`docs/operations.md` 新增"Control socket and client group"
+（0660/group/chmod 失败=启动拒绝、同 uid=同 owner、两真实 UID 属 S 门禁、skip 不计通过）。
+**Files touched:** `model_scheduler/control_server.py`（新增）、`run.py`、`tests/integration/test_control_socket.py`（新增）、`deploy/model-scheduler.service.in`、`docs/operations.md`、`tests/test_deploy_render.py`，共 6 个（计划 4 个，多出文档/模板/渲染断言各一，理由：AC3 的部署契约与渲染回归需同时钉住）。
+**目标核验**：见 validation.md（推送后目标 Linux 复验）。
+未解决：①**两个真实 UID 的 Linux 门禁测试未执行**（需 root 或预配置第二 uid 的专用 S 流程；目标机普通用户仅能证明"名单外 uid 拒绝"这一半，故 AC3 保持未勾）；
+②TCP 侧旧 API（/v1/*、SSE、/api/*）的 v2 完整回归属 P19；③`/internal/*` 正式路由与错误映射属 P18；④unit 的客户端组/UID 由部署输入渲染属 P27；
+⑤控制口 body 流式（1 GiB 上传）在 P18 扩 ControlServer 时处理，当前 buffered ≤4 MiB（inline 帽）。
 
 ### P18 — 控制HTTP路由闭环（M04）
 

@@ -722,3 +722,45 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - v1 `book.specs` → v2 登记直通 Book 的迁移（P14/P16 遗留，P17/P20 定形）；`run.py` v1/v2 分支与 socket 入口属 P17。
 - llama adapter 预派发拒绝目前以 `AdapterError` 抛出（未带"证明未送达"标记）→ managed 路径保守走 stop 结算（多付一次 stop 成本，语义安全）；后续接 `NotDispatched` 需 adapter 侧改造。
 - quiescer 放弃后无自动重试（避免与 session drain worker 抢 stop 权）；恢复依赖 recover/shutdown 路径。
+
+## P17 记录（2026-09-18）
+
+范围：Unix peer credential 与单进程双入口——先用真实 socket 证明 C08 身份传递，再落 run.py 的 v1/v2 分支与共享运行上下文。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P17 |
+| status | software_only |
+| source_commit | `2e27543`（P16 目标复验记录提交，起点） |
+| implementation_commits | `efb19f5`（控制监听器）、`c1ba156`（run.py 分支 + 双 listener）、`f096213`（部署目录/文档） |
+| target_commit | 见 08 记录提交（推送后同步复验） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+判定 `software_only`：AC1/AC2/AC4 由真实 AF_UNIX socket 测试与 run 分支测试支撑；AC3 的"两个真实 UID"半项属 S 门禁（需 root/预配置 uid），本轮如实不勾选、skip 不计通过。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q`（实现前） | 4 | control_server 不存在，收集 ImportError，即 RED |
+| 同上（开发机 macOS，实现后） | 0 | `14 passed, 1 skipped`（skip=两真实 UID 门禁项），重复多轮无抖动 |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `585 passed, 1 skipped, 1 deselected`（P16 基线 571） |
+| `ruff check .` / `run.py --check-config` | 0 | 通过 / 仍 v1 四 ID |
+
+### 3. 关键事实
+
+- 身份唯一来源=accepted socket 的内核凭据：Linux `SO_PEERCRED`、macOS `LOCAL_PEERCRED`（socketpair 测试自证本机 uid）；`client=None`，`X-Owner/X-UID` 头被完整忽略（有测试）；allow-list 外 uid 在解析任何字节前被静默关闭（无 HTTP 应答、无信息泄露）。
+- 帧层策略：h11 只做**请求解析**（0.16 无公开出站 API；不碰 uvicorn/h11 私有接口的决定见计划"失败则阻塞"）；响应显式小体积序列化、`Connection: close`；HTTP/1.0、CONNECT/TRACE、Upgrade/Proxy-Connection、chunked、>16KiB 头、半包超时——一律关连接不残留；断言 task/fd 数量不增长（psutil）。
+- 双入口共享：`run.startup_plan`→v2 锁在 context 构建**之前**（main 顺序测试 `["lock","context","served"]`）；一个 `RunContextV2`（boot_id=TokenAuthority 同源、单 Book、单 BlobStore）；TCP 侧（uvicorn）持有唯一 lifespan（计数器=1/清理=1）；`/internal/*` 从不注册 TCP → 404 by construction；`CONTROL_CONTRACT` 仅 llama-swap profile 需要时 import（hf-only 断言 sys.modules 无该模块）；v2 测试注入 build_backend 炸弹断言永不触发。
+- 站点输入 fail-closed：v2 缺 `SELFMODEL_SWITCH_DEPLOYMENT_ID`/`SELFMODEL_SWITCH_SWAP_CONTROL_URL` → 启动拒绝（exit 78），不猜默认、不静默降级；reconcile 未全 STOPPED → 不开放入口（Book.recovering 保持）。
+- 部署：`RuntimeDirectory=model-scheduler self-model-switch` + `0750`（渲染断言）；`peer_group` 由 ControlServer chown，失败=启动拒绝；operations.md 写明"同 uid=同 owner、两真实 UID 属 S 门禁"。
+
+### 4. 未执行 / 未解决
+
+- **两个真实 UID 的 Linux 门禁测试**：需要 root 或预配置的第二 uid（S 流程执行）；本轮开发/目标均为普通用户 → 该子项未验证，AC3 未勾选。
+- `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18）；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
+- 目标机 Linux 复验见下方补记。
