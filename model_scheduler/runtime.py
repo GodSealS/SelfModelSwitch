@@ -6,20 +6,25 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
-from .backend_control import LlamaSwapBackend, ManagedModel
+from .adapters.llama_cpp import LlamaCppAdapter
+from .backend_control import LlamaSwapBackend, ManagedLifecycle, ManagedModel
 from .deploy import DeployError
 from .config import AppConfig, model_specs
 from .contracts_v2 import DeploymentSpec
+from .control_identity import TokenAuthority
 from .control_recovery import ControlRecoveryClient, DeploymentRecovery, ReconcileOutcome
+from .execution_service import ExecutionService
+from .idempotency import IdempotencyStore
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
 from .model_registry import Book
 from .ports_v3 import ObservationTarget, STOPPED
 from .process_observer import ProcessObserver
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
+from .session_manager import SessionManager
 from .storage_monitor import StorageAdmissionGuard, StorageMonitor
 
 
@@ -207,6 +212,74 @@ def build_scheduler(
         recovery=recovery if recovery is not None else ControlRecoveryClient(),
         admission_guard=guard,
     )
+
+@dataclass(frozen=True)
+class ManagedExecutionRuntime:
+    """The P16 composition: scheduler books, lifecycle bridge and the execution service."""
+
+    scheduler: ModelScheduler
+    lifecycle: ManagedLifecycle
+    adapters: Mapping[str, Any]
+    service: ExecutionService
+
+
+def build_managed_execution(
+    *,
+    boot_id: str,
+    deployment: DeploymentSpec,
+    deployment_id: str,
+    book: Book,
+    resources: Any,
+    control: Any,
+    clients: Mapping[str, Any],
+    observers: Mapping[str, Any],
+    inference_base_urls: Mapping[str, str],
+    blobs: Any,
+    sessions: SessionManager | None = None,
+    clock: Callable[[], float] | None = None,
+    tokens: TokenAuthority | None = None,
+    idempotency: IdempotencyStore | None = None,
+    event_sink: Callable[[str, Mapping[str, object]], None] | None = None,
+    fixture_path: Path | None = None,
+    scheduler_kwargs: Mapping[str, Any] | None = None,
+    execution_kwargs: Mapping[str, Any] | None = None,
+) -> ManagedExecutionRuntime:
+    """Join one v2 registration, llama-swap control, C03 observers and the queue.
+
+    Every model gets its own adapter whose identity is RESOLVED THROUGH THE
+    BRIDGE: load writes back the docker-verified instance and execute/stop use
+    that same identity until a proven stop clears it (P16 AC1). The execution
+    service is built in managed-termination mode: dispatched requests settle
+    via the adapter's trusted protocol when it claims one, otherwise via a
+    proven independent STOPPED of the shared instance (P16 AC2/AC3).
+    """
+    runtimes = {runtime.runtime_id: runtime for runtime in deployment.runtimes}
+    models = {model.model_id: model for model in deployment.models}
+    missing = set(models) - set(clients) - set(observers) - set(inference_base_urls)
+    if missing:
+        raise RuntimeCompositionError(f"managed composition lacks ports for: {sorted(missing)}")
+    adapters: dict[str, Any] = {}
+    lifecycle = ManagedLifecycle(
+        boot_id=boot_id, deployment_id=deployment_id, specs=models,
+        adapter_for=adapters.__getitem__, observers=observers,
+    )
+    for model_id, model in models.items():
+        adapters[model_id] = LlamaCppAdapter(
+            runtime=runtimes[model.runtime_id], model=model,
+            inference_base_url=inference_base_urls[model_id], client=clients[model_id],
+            identity=lambda mid=model_id: lifecycle.instance(mid),
+            fixture_path=fixture_path, control=control,
+        )
+    clock_kwargs = {} if clock is None else {"clock": clock}
+    scheduler = ModelScheduler(book, resources, lifecycle, sessions=sessions,
+                               **clock_kwargs, **(scheduler_kwargs or {}))
+    service = ExecutionService(
+        scheduler, blobs=blobs, backend_for=adapters.__getitem__, boot_id=boot_id,
+        tokens=tokens, idempotency=idempotency, event_sink=event_sink, managed_termination=True,
+        **clock_kwargs, **(execution_kwargs or {}),
+    )
+    return ManagedExecutionRuntime(scheduler=scheduler, lifecycle=lifecycle, adapters=adapters, service=service)
+
 
 def load_lab_manifest(path: str | Path, *, config_path: str | Path | None = None) -> dict[str, Any]:
     """Load a lab manifest rendered by `deploy render --mode lab` (P06b).

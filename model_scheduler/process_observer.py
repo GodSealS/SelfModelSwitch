@@ -357,10 +357,23 @@ class DockerProcessObserver:
         return inspect_container_ids(list_container_ids(self._deployment_id, self._model_id, self._docker), self._docker)
 
     def _match(self, target: ports_v3.ObservationTarget, facts: tuple[ContainerFact, ...]) -> ContainerFact | None | object:
-        matches = [fact for fact in facts if target.container_id is None or fact.container_id == target.container_id]
-        if len(matches) > 1:
+        """Bind the target to one container fact.
+
+        With no explicit container id, this boot's RUNNING instance is the
+        candidate; exited containers for the same model are historical facts
+        and never make a reload ambiguous. Two running instances of one model
+        are always ambiguous. With an explicit container id the listing must
+        contain that exact id (P16 AC1: reload after a fallback stop).
+        """
+        candidates = [fact for fact in facts if target.container_id is None or fact.container_id == target.container_id]
+        if target.container_id is not None:
+            if len(candidates) > 1:  # impossible with unique ids, kept fail-closed
+                return _AMBIGUOUS
+            return candidates[0] if candidates else None
+        running = [fact for fact in candidates if fact.running]
+        if len(running) > 1:
             return _AMBIGUOUS
-        return matches[0] if matches else None
+        return running[0] if running else None
 
     def _subprocess_state(self, target: ports_v3.ObservationTarget, launch: ports_v3.LaunchOperation | None) -> str:
         pid = launch.pid if launch is not None else target.process_group_id

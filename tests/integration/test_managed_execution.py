@@ -24,8 +24,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+import json
+from pathlib import Path
+import time
+from typing import Any, Callable
 
+import httpx
 import pytest
 
 from model_scheduler import control_protocol_v1 as cp
@@ -379,3 +383,260 @@ async def test_a_broken_stream_publishes_nothing_and_waits_for_the_stop_proof(tm
     assert record.error is not None and record.error.code == "backend_failed"
     assert record.result is None and record.evidence is not None and record.evidence.reason == "independent_STOPPED"
     await eventually(lambda: stack.blobs.metadata.usage("uid-1000").total_bytes == 0)
+
+
+# -- P16 AC1/AC3 end to end: the REAL llama.cpp adapter and the REAL docker observer --------
+
+from model_scheduler.contracts_v2 import parse_deployment  # noqa: E402
+from model_scheduler.process_observer import (  # noqa: E402
+    CONFIG_LABEL,
+    DEPLOYMENT_LABEL,
+    MODEL_LABEL,
+    RUNTIME_LABEL,
+    DockerProcessObserver,
+    SystemClock,
+    canonical_utc,
+)
+from model_scheduler.runtime import build_managed_execution  # noqa: E402
+
+CHAT_OUTPUT = {"model": "lab-qwen", "choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+LAB_MODEL = "lab-qwen"
+LAB_DEPLOYMENT = "orin-lab"
+LAB_RUNTIME = "llama-cpp-gguf-v1"
+LAB_CONFIG_SHA = "f" * 64
+
+
+def lab_deployment():
+    return parse_deployment({
+        "schema_version": 2,
+        "runtimes": [{
+            "runtime_id": "rt-llama",
+            "profile_id": "llama-cpp-gguf-v1",
+            "image_digest": "repo/llama@sha256:" + "a" * 64,
+            "adapter_sha256": "b" * 64,
+            "lock_sha256": "c" * 64,
+            "startup_args": ["--parallel", "--kv-unified-per-slot", "--no-warmup"],
+        }],
+        "models": [{
+            "model_id": LAB_MODEL,
+            "runtime_id": "rt-llama",
+            "capabilities": ["chat"],
+            "assets": [{"role": "model", "path": "lab/model.gguf", "sha256": "3f" + "0" * 62, "size_bytes": 1024}],
+            "port": 18099,
+            "envelope": {"ctx_size": 4096, "max_input_tokens": 2048, "max_output_tokens": 1024,
+                         "max_parallel": 1, "max_image_tokens": 0, "max_image_edge_pixels": 0, "max_images": 0},
+            "timeout_seconds": 3600,
+            "reserved_bytes": 100,
+            "measured": True,
+            "measurement_ref": "e" * 64,
+            "physical_resident_peak_bytes": 80,
+        }],
+    })
+
+
+class LabDocker:
+    """Fake docker CLI: a swap boot lands a NEW labelled container; an unload exits it."""
+
+    def __init__(self) -> None:
+        self.facts: dict[str, dict] = {}
+        self.booted = 0
+
+    def boot(self) -> str:
+        self.booted += 1
+        container_id = f"container-{self.booted}"
+        self.facts[container_id] = {
+            "Id": container_id,
+            "Image": "sha256:" + "d" * 64,
+            "Config": {"Labels": {DEPLOYMENT_LABEL: LAB_DEPLOYMENT, MODEL_LABEL: LAB_MODEL,
+                                  RUNTIME_LABEL: LAB_RUNTIME, CONFIG_LABEL: LAB_CONFIG_SHA}},
+            "State": {"Running": True, "Status": "running", "ExitCode": 0,
+                      "StartedAt": f"2026-09-18T05:0{self.booted}:00.000000000Z"},
+        }
+        return container_id
+
+    def kill(self) -> None:
+        for fact in self.facts.values():
+            if fact["State"]["Running"]:
+                fact["State"] = {**fact["State"], "Running": False, "Status": "exited", "ExitCode": 0}
+
+    def __call__(self, argv):
+        verb = argv[1] if len(argv) > 1 else ""
+        if verb == "ps":
+            wanted: dict[str, str] = {}
+            for index, token in enumerate(argv):
+                if token == "--filter":
+                    label, _, value = argv[index + 1].partition("=")
+                    if label == "label":
+                        key, _, val = value.partition("=")
+                        wanted[key] = val
+            listed = [fid for fid, fact in self.facts.items()
+                      if all(fact["Config"]["Labels"].get(k) == v for k, v in wanted.items())]
+            return 0, "".join(f"{fid}\n" for fid in listed), ""
+        if verb == "inspect":
+            wanted_ids = argv[2:]
+            if any(fid not in self.facts for fid in wanted_ids):
+                return 1, "", f"Error: No such object: {wanted_ids[0]}"
+            return 0, json.dumps([self.facts[fid] for fid in wanted_ids]), ""
+        raise AssertionError(f"unexpected docker command: {argv}")
+
+    def identity(self, container_id: str) -> InstanceIdentity:
+        fact = self.facts[container_id]
+        return InstanceIdentity(container_id=container_id, started_at=canonical_utc(fact["State"]["StartedAt"]),
+                                deployment_id=LAB_DEPLOYMENT, model_id=LAB_MODEL, runtime_id=LAB_RUNTIME,
+                                candidate_digest=LAB_CONFIG_SHA, image_digest=fact["Image"])
+
+
+class LabSwap:
+    """llama-swap lifecycle: load boots a fresh container, unload exits it (load/unload only)."""
+
+    def __init__(self, docker: LabDocker) -> None:
+        self.docker = docker
+        self.loads: list[str] = []
+        self.unloads: list[str] = []
+
+    async def load(self, model_id: str) -> None:
+        self.loads.append(model_id)
+        self.docker.boot()
+
+    async def unload(self, model_id: str) -> None:
+        self.unloads.append(model_id)
+        self.docker.kill()
+
+
+def lab_server(hang: asyncio.Event | None = None) -> tuple[httpx.AsyncClient, dict]:
+    calls = {"chat": 0}
+
+    async def chat(request: httpx.Request) -> httpx.Response:
+        calls["chat"] += 1
+        if hang is not None:
+            await hang.wait()
+        return httpx.Response(200, json=CHAT_OUTPUT)
+
+    routes: dict[str, Any] = {
+        "/health": (200, {"status": "ok"}),
+        "/slots": (200, [{"id": 0, "is_processing": False, "n_ctx": 4096}]),
+        "/apply-template": lambda request: httpx.Response(200, json={"prompt": "hi"}),
+        "/tokenize": lambda request: httpx.Response(200, json={"tokens": [1]}),
+        "/v1/chat/completions": chat,
+    }
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            handler = routes.get(request.url.path)
+            if handler is None:
+                return httpx.Response(404, json={"error": "missing"})
+            if callable(handler):
+                result = handler(request)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
+            status, payload = handler
+            return httpx.Response(status, json=payload)
+
+    client = httpx.AsyncClient(transport=Transport(), follow_redirects=False, base_url="http://127.0.0.1:18099")
+    return client, calls
+
+
+class LabResources:
+    """A fresh, ample memory sample on the REAL monotonic clock (the observer's time base)."""
+
+    async def snapshot(self) -> MemorySample:
+        return MemorySample(64 * 1024**3, 60 * 1024**3, time.monotonic())
+
+    def snapshot_now(self) -> MemorySample:
+        return MemorySample(64 * 1024**3, 60 * 1024**3, time.monotonic())
+
+
+async def start_lab(tmp_path, *, hang: asyncio.Event | None = None):
+    docker = LabDocker()  # noqa: F841 - returned for assertions
+    swap = LabSwap(docker)
+    client, calls = lab_server(hang=hang)
+    v1_spec = ModelSpec(LAB_MODEL, "http://127.0.0.1:18099", frozenset({Capability.CHAT}), 100, max_concurrency=1)
+    book = Book({LAB_MODEL: v1_spec}, model_budget=1_000, free_floor=20, margin=0)
+    book.bootstrap_stopped(LAB_MODEL)
+
+    def port_state(_port: int) -> str:
+        return "listening" if any(f["State"]["Running"] for f in docker.facts.values()) else "closed"
+
+    observer = DockerProcessObserver(
+        LAB_DEPLOYMENT, LAB_MODEL, 18099, docker=docker, port_state=port_state,
+        launch_lookup=lambda target: None, process_state=lambda pid: "absent", clock=SystemClock(),
+    )
+    sessions = SessionManager(wait_seconds=100.0, hard_deadline_seconds=3600.0, heartbeat_seconds=10.0,
+                              ttl_seconds=120.0, prepare_seconds=100.0, drain_seconds=30.0, retry_seconds=30.0,
+                              cleanup_seconds=60.0, cancel_seconds=10.0, stop_grace_seconds=30.0, reconcile_seconds=5.0)
+    blobs = BlobStore(tmp_path / "blobs")
+    runtime = build_managed_execution(
+        boot_id="boot-lab", deployment=lab_deployment(), deployment_id=LAB_DEPLOYMENT, book=book,
+        resources=LabResources(), control=swap, clients={LAB_MODEL: client},
+        observers={LAB_MODEL: observer}, inference_base_urls={LAB_MODEL: "http://127.0.0.1:18099"},
+        blobs=blobs, sessions=sessions, fixture_path=LAB_FIXTURE,
+        scheduler_kwargs={"poll_interval_seconds": 0.01},
+        execution_kwargs={"poll_seconds": 0.01, "wait_seconds": 600.0},
+    )
+    await asyncio.wait_for(runtime.scheduler.open_session(LAB_MODEL, "client-a", "session-lab"), 5)
+    return runtime, docker, swap, calls, book, blobs, None
+
+
+def lab_document(key: str) -> dict:
+    return {"session_token": "t", "operation": "chat",
+            "input": {"inline": {"messages": [{"role": "user", "content": "hi"}]}},
+            "parameters": {"max_tokens": 8}, "idempotency_key": key}
+
+
+LAB_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "llama_cpp_v1.json"
+
+
+@pytest.mark.asyncio
+async def test_managed_round_trip_boot_execute_stop_reload(tmp_path) -> None:
+    runtime, docker, swap, calls, book, blobs, _clock = await start_lab(tmp_path)
+    service = runtime.service
+
+    # the session prepare booted ONE container; the bridge stores the docker-verified identity
+    assert swap.loads == [LAB_MODEL] and docker.booted == 1
+    instance_one = runtime.lifecycle.instance(LAB_MODEL)
+    assert instance_one == docker.identity("container-1")
+    assert book.runtime[LAB_MODEL].generation == 1 and book.committed == 100
+
+    first = await service.submit(session_id="session-lab", owner="uid:1000", document=lab_document("k-1"))
+    assert await eventually(lambda: service.record(first["execution_id"]).state == "succeeded")
+    rec1 = service.record(first["execution_id"])
+    assert calls["chat"] == 1  # the real adapter consumed the registered chat protocol
+    assert rec1.evidence is not None and rec1.evidence.reason == "independent_STOPPED"
+    assert rec1.evidence.instance == instance_one == rec1.instance
+    assert rec1.evidence.fence == rec1.fence
+    assert await blobs.read_all(rec1.output_blob_id, "uid-1000", "probe") == json.dumps(
+        CHAT_OUTPUT, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    # AC3: the fallback stop left the model UNLOADED while the session kept its grant
+    assert (await runtime.scheduler.session_view("session-lab"))["phase"] == "active"
+    assert book.runtime[LAB_MODEL].state.value == "unloaded" and book.committed == 0
+    assert runtime.lifecycle.instance(LAB_MODEL) is None
+    assert swap.unloads == [LAB_MODEL]
+
+    # the next execution re-admits and re-loads: new container, new identity, generation 2, re-signed fence
+    second = await service.submit(session_id="session-lab", owner="uid:1000", document=lab_document("k-2"))
+    assert await eventually(lambda: service.record(second["execution_id"]).state == "succeeded")
+    rec2 = service.record(second["execution_id"])
+    assert rec2.fence.generation == 2 and book.runtime[LAB_MODEL].generation == 2
+    assert rec2.instance == docker.identity("container-2")
+    assert rec2.evidence is not None and rec2.evidence.instance == rec2.instance
+    assert swap.loads == [LAB_MODEL, LAB_MODEL]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_round_trip_publishes_nothing_after_the_stop(tmp_path) -> None:
+    hang = asyncio.Event()
+    runtime, docker, swap, calls, book, blobs, _clock = await start_lab(tmp_path, hang=hang)
+    service = runtime.service
+    third = await service.submit(session_id="session-lab", owner="uid:1000", document=lab_document("k-1"))
+    execution_id = third["execution_id"]
+    assert await eventually(lambda: calls["chat"] == 1)  # in flight inside the real HTTP path
+
+    cancelling = await service.cancel(execution_id, owner="uid:1000")
+    assert cancelling["state"] == "cancelling"
+    hang.set()  # the response ends per protocol; only the proven stop may settle it
+    assert await eventually(lambda: service.record(execution_id).state == "cancelled")
+    record = service.record(execution_id)
+    assert record.result is None and record.evidence.reason == "independent_STOPPED"
+    assert blobs.metadata.usage("uid-1000").published_bytes == 0  # no partial output, ever
+    assert book.runtime[LAB_MODEL].state.value == "unloaded"
