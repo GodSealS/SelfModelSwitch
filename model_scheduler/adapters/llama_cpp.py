@@ -32,11 +32,18 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import httpx
 
-from ..contracts_v2 import GGUF_PROFILE, ContractError, ModelSpec, RuntimeSpec, require_startable_profile
+from ..contracts_v2 import (
+    GGUF_PROFILE,
+    ContractError,
+    ModelSpec,
+    RuntimeSpec,
+    canonical_json_bytes,
+    require_startable_profile,
+)
 from ..control_protocol_v1 import Fence, InstanceIdentity
 from ..ports_v3 import CancelAck, ExecutionHandle, ExecutionRequest, Observation, StopAck
 
@@ -188,7 +195,7 @@ class LlamaCppAdapter:
         model: ModelSpec,
         inference_base_url: str,
         client: httpx.AsyncClient,
-        identity: InstanceIdentity | None = None,
+        identity: InstanceIdentity | None | Callable[[], InstanceIdentity | None] = None,
         fixture_path: Path | None = None,
         control: Any | None = None,
     ) -> None:
@@ -216,6 +223,20 @@ class LlamaCppAdapter:
         self.stop_reload_cost = dict(self.slot_protocol["stop_reload_cost"])
         self.last_http_complete = False
         self.last_slot_idle = False
+        self._results: dict[str, bytes] = {}
+
+    def _resolve_identity(self) -> InstanceIdentity | None:
+        """The identity in force right now; a provider lets the lifecycle bridge reload it (P16)."""
+        identity = self._identity() if callable(self._identity) else self._identity
+        return identity
+
+    @property
+    def current_identity(self) -> InstanceIdentity | None:
+        return self._resolve_identity()
+
+    def take_result(self, execution_id: str) -> bytes | None:
+        """The validated response bytes for one execution, delivered exactly once."""
+        return self._results.pop(execution_id, None)
 
     def claims_device_quiescence(self) -> bool:
         """HTTP completion is never device-idle evidence."""
@@ -350,7 +371,7 @@ class LlamaCppAdapter:
             return False
         return all(isinstance(slot, dict) and slot.get("is_processing") is False for slot in slots)
 
-    async def _dispatch(self, name: str, body: Mapping, deadline: float, validator) -> None:
+    async def _dispatch(self, name: str, body: Mapping, deadline: float, validator) -> Any:
         status, payload = await self._json("POST", self._endpoint(name), deadline=deadline, json_body=body)
         self.last_http_complete = 200 <= status < 300
         if not self.last_http_complete:
@@ -360,11 +381,13 @@ class LlamaCppAdapter:
             self.last_slot_idle = await self._slots_idle(deadline)
         except AdapterError:
             self.last_slot_idle = False
+        return payload
 
     def _require_identity(self) -> InstanceIdentity:
-        if self._identity is None:
+        identity = self._resolve_identity()
+        if identity is None:
             raise AdapterError("instance identity is required after dispatch", "instance_unknown")
-        return self._identity
+        return identity
 
     async def load(self, spec: ModelSpec, fence: Fence, deadline: float) -> Observation:
         if spec.model_id != self._model.model_id:
@@ -382,7 +405,7 @@ class LlamaCppAdapter:
             sampled_at_utc=datetime.now(UTC),
             port_state="listening" if healthy else "unknown",
             subprocess_state="running" if healthy else "unknown",
-            instance=self._identity,
+            instance=self._resolve_identity(),
             launch_operation=None,
         )
 
@@ -403,14 +426,14 @@ class LlamaCppAdapter:
             payload = self._chat_payload(messages, parameters)
             tokens = await self._count_chat_tokens(messages, len(images), deadline)
             self._check_budget(tokens, payload["max_tokens"])
-            await self._dispatch("chat", payload, deadline, self._validate_chat)
+            output = await self._dispatch("chat", payload, deadline, self._validate_chat)
         elif request.operation == "embeddings":
             raw_input = request.inline_input.get("input")
             if not (isinstance(raw_input, str) and raw_input) and not (
                 isinstance(raw_input, list) and raw_input and all(isinstance(item, str) and item for item in raw_input)
             ):
                 raise AdapterError("embeddings input must be a non-empty string or string list", "contract_violation")
-            await self._dispatch(
+            output = await self._dispatch(
                 "embeddings",
                 {"model": self._model.model_id, "input": raw_input, "encoding_format": parameters.get("encoding_format", "float")},
                 deadline,
@@ -421,7 +444,7 @@ class LlamaCppAdapter:
             documents = request.inline_input.get("documents")
             if not isinstance(query, str) or not query or not isinstance(documents, list) or not documents:
                 raise AdapterError("rerank requires query and documents", "contract_violation")
-            await self._dispatch(
+            output = await self._dispatch(
                 "rerank",
                 {
                     "query": query,
@@ -434,6 +457,8 @@ class LlamaCppAdapter:
             )
         else:
             raise AdapterError(f"unsupported operation {request.operation!r}", "capability_mismatch")
+        # The validated response is kept for exactly one publication (the service owns the blob).
+        self._results[request.execution_id] = canonical_json_bytes(output)
         return ExecutionHandle(execution_id=request.execution_id, instance=self._require_identity())
 
     async def cancel(self, handle: ExecutionHandle, deadline: float) -> CancelAck:

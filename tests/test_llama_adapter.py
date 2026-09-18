@@ -706,3 +706,44 @@ async def test_cancel_is_an_ack_not_a_stop_proof() -> None:
     assert isinstance(ack, CancelAck)
     assert ack.execution_id == "e-1"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_identity_provider_resolves_per_action_and_results_are_captured_once() -> None:
+    """P16: the managed lifecycle feeds the observed identity in; results await publication."""
+    current = [_identity()]
+    second = InstanceIdentity(
+        container_id="c-reloaded", started_at="2026-09-18T06:00:00Z", deployment_id="orin-local",
+        model_id="qwen25vl-7b-q4", runtime_id="llama-cpp-cuda-sm87-4bc272f",
+        candidate_digest="e" * 64, image_digest="ghcr.io/example/llama-cuda@sha256:" + "f" * 64,
+    )
+    chat_output = {"model": "qwen", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    client, _transport = _client(
+        {
+            "/apply-template": _apply_template,
+            "/tokenize": _tokenize_by_words,
+            "/v1/chat/completions": (200, chat_output),
+            "/slots": (200, [{"id": 0, "is_processing": False, "n_ctx": 32768}]),
+        }
+    )
+    adapter = _adapter(client, identity=lambda: current[0])
+    request = ExecutionRequest(
+        execution_id="e-cap", operation="chat", parameters={"max_tokens": 8},
+        inline_input={"messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    handle = await adapter.execute(request, _fence(), _deadline())
+    assert handle.instance == current[0]
+    assert adapter.current_identity == current[0]
+
+    payload = adapter.take_result("e-cap")
+    assert payload is not None and json.loads(payload) == chat_output
+    assert adapter.take_result("e-cap") is None  # consumed exactly once
+
+    # after a reload the same adapter object resolves the NEW identity
+    current[0] = second
+    handle2 = await adapter.execute(
+        ExecutionRequest(execution_id="e-cap2", operation="chat", parameters={"max_tokens": 8},
+                         inline_input={"messages": [{"role": "user", "content": "hi"}]}), _fence(), _deadline())
+    assert handle2.instance == second
+    await client.aclose()
