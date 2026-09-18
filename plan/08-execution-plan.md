@@ -1089,7 +1089,10 @@ per-model adapter 身份经桥解析）。`DockerProcessObserver._match` 修复 
 **Files touched:** `model_scheduler/backend_control.py`、`model_scheduler/adapters/llama_cpp.py`、`model_scheduler/execution_service.py`、`model_scheduler/runtime.py`、
 `model_scheduler/process_observer.py`、`tests/test_backend_control.py`、`tests/test_llama_adapter.py`、`tests/integration/test_managed_execution.py`（新增），共 8 个，超出"约 5 个"，
 理由：桥/终结循环/装配各层都不可单测成环，E2E 需同时钉真实 adapter 与真实 observer。
-**目标核验**：见 validation.md（本轮提交推送后同步复验）。真实推理/取消一轮与停止/内存回收证据：本轮未启动模型（需 llama-swap+模型在线，属 K4 场景验收，见未解决）。
+**目标核验**：目标机 `origin` 仍指本地裸仓（与指南不符，同 P14 处理）——显式从 GitHub fetch，干净树守卫下 fast-forward 到 `fe4c1fbe481d41e77f6b29d097b9d1c843ca79cb`，前后工作区为空；
+python 3.12.14（lab venv）：`pytest tests/integration/test_managed_execution.py tests/test_backend_control.py -q` = 17 passed；
+全量 `pytest tests -m 'not thor' -q` = 568 passed + 3 项既有 `test_release` 环境失败（P10/P13/P14/P15 同款，P28 范围），无回归。
+真实推理/取消一轮与停止/内存回收证据：本轮未启动模型（需 llama-swap 与模型在线，属 K4 场景验收，见未解决）。
 未解决：①`book.specs` 仍读 v1 字段，v2 登记直通 Book 的迁移未做（P14/P16 遗留说明，随 P17/P20 接线定形）；②`NotDispatched` 的 adapter 侧接线（llama 适配器目前以 AdapterError 抛出，
 mid-stream 失败与预派发拒绝在 P17/P16 后续不区分 → 走 awaiting-stop 保守路径，行为安全但多付一次 stop）；③quiescer 放弃后（grace 超时未证明停止）恢复仅靠 recover/shutdown，
 不提供自动重试循环（避免与 drain worker 抢 stop 权）；④reload 的 `awaiting_quiescence` 视图仍显示 running/dispatched（协议无该状态，P02 闭集），排查靠事件 `termination_unproven`。

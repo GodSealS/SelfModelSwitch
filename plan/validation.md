@@ -686,7 +686,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | status | software_only |
 | source_commit | `92ed283`（P14 目标复验记录提交，起点） |
 | implementation_commits | `f5a3c5b`（生命周期桥）、`a36a17c`（adapter 身份 provider/结果捕获）、`f5dfc74`（managed termination）、`511fec9`（组装 + E2E + observer 修复） |
-| target_commit | 见 08 记录提交（推送后同步复验） |
+| target_commit | `fe4c1fbe481d41e77f6b29d097b9d1c843ca79cb`（显式从 GitHub fast-forward，目标树为空） |
 | candidate_sha256 | null（本任务不产出候选） |
 | python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
 | evidence_directory | 无新目录；目标机只跑既有测试套件 |
@@ -702,8 +702,10 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | 同上（开发机，实现后） | 0 | `15 passed` |
 | `pytest tests/integration -q`（开发机） | 0 | `18 passed` |
 | `pytest tests -m 'not thor' -q`（开发机） | 0 | `571 passed, 1 deselected`（P14 基线 556） |
-| managed+lifecycle 文件重复 5 次 | 0 | 每轮 `15 passed`，无抖动 |
+| managed+lifecycle 文件重复 5 次 | 0 | 每轮 `15 passed`（含后续 E2E 为 9+8=17），无抖动 |
 | `ruff check .` / `run.py --check-config` | 0 | 通过 / 仍为 v1 四 ID |
+| 目标机（`fe4c1fb`，python 3.12.14）计划验证命令 | 0 | `17 passed` |
+| 目标机全量 `pytest tests -m 'not thor' -q` | 1 | `568 passed` + 3 项既有 `test_release` 环境失败（无回归） |
 
 ### 3. 关键事实
 
