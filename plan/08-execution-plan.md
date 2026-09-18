@@ -1061,13 +1061,38 @@ python=3.12.11（开发机）/3.12.14（目标 lab venv）。
 **Description:** 让真实adapter、observer与execution服务走同一资源账本，消除fake中看不出的终结空隙。
 **Files likely touched:** `model_scheduler/backend_control.py`、`model_scheduler/runtime.py`、`model_scheduler/execution_service.py`、`tests/integration/test_managed_execution.py`（新增）。
 **Acceptance criteria:**
-- [ ] 完整load→execute→cancel→stop→reload；每步实例/Fence一致；StopAck后容器仍活则不释放。
-- [ ] 无单请求同步证明且还有别的lease时冻结新请求，等待已有请求协议终结后停止共同实例，避免互等lease形成死锁。
+- [x] 完整load→execute→cancel→stop→reload；每步实例/Fence一致；StopAck后容器仍活则不释放。
+- [x] 无单请求同步证明且还有别的lease时冻结新请求，等待已有请求协议终结后停止共同实例，避免互等lease形成死锁。
   “响应已结束但待STOPPED证明”的请求单独标记awaiting_quiescence，不算仍在计算的等待对象。
-- [ ] 因终结回退STOPPED后session仍ACTIVE且保留独占权，模型转UNLOADED；下一execution重新准入/load并提升generation。
+- [x] 因终结回退STOPPED后session仍ACTIVE且保留独占权，模型转UNLOADED；下一execution重新准入/load并提升generation。
   reload等待受session TTL/hard deadline约束，旧generation终结不复用；回退期间禁止新dispatch、可继续heartbeat。
-- [ ] 模型ready失败、Docker断开、backend断流均保留账本直到独立停止；不从部分输出构造成功。
+- [x] 模型ready失败、Docker断开、backend断流均保留账本直到独立停止；不从部分输出构造成功。
 **Verification:** `python -m pytest tests/integration/test_managed_execution.py tests/test_backend_control.py -q`；目标真实推理/取消一轮，记录停止与内存回收。到K4。
+
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `92ed283`（P14 目标复验记录提交）；实现提交 `f5a3c5b`、`a36a17c`、`f5dfc74`、`511fec9`；
+python=3.13.5（开发机 `.venv`）。`pytest tests/integration/test_managed_execution.py tests/test_backend_control.py -q` = 15 passed（实现前 ManagedLifecycle/managed_termination 不存在，RED）；
+`pytest tests -m 'not thor' -q` = 571 passed, 1 deselected（P14 基线 556）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID；managed 文件重复 5 次无抖动。
+新增 `backend_control.ManagedLifecycle`：v1 scheduler 后端形态到 v3 adapter/ObserverPort 的桥——load 先经 adapter（llama-swap 启动 + /health + /slots），
+再**独立观察**核对结构化 `InstanceIdentity` 才写回账本（health 谎报 → UNKNOWN，实例身份不入库）；stop 按已验证身份发 unload，
+StopAck 不算证明，轮询 C03 四事实，RUNNING→账本不释放、UNKNOWN（docker 断开）→同样不释放。`LlamaCppAdapter` 的 identity 改为可解析 provider（reload 后自动换身份），
+新增 `take_result`（验证过的完整响应按 execution 一次性交付）与 `current_identity`。
+`ExecutionService` 新增 managed termination：handle 返回（响应协议终结）后按 `claims_device_quiescence()` 分流——可信请求级协议直接构造
+`request_protocol_terminated` 证据；llama.cpp 回退路径标记 `awaiting_quiescence`，per-model quiescer：仍有计算/准入中的请求（含 claimed，防"第二个请求未开始就停"）→
+冻结新 dispatch（heartbeat、排队过期不受影响）；计算全部协议终结后一次性释放 batch lease（awaiting 不算等待对象，预算留在 book）、
+经 `scheduler.unload` 单账本路径停实例（四事实证明 → `Book.stopped` 清预算），晚到的 STOPPED 为每个 record 组装自身 fence 的
+`independent_STOPPED` dispatched 证据并结算（结果发布/取消/失败各归其位；publish 互斥加 in-flight 锁，重复 handle/双 publish 竞态已封闭）；
+证明不了停止 → 记录不结算、账本保留、quiescer 在 grace 后放弃（fail-closed，drain→BLOCKED 是 P10 既有语义），reload 由 acquire 自然走冷加载
+（generation+1、fence 重签、旧代证据必拒）。`runtime.build_managed_execution` 为 P17 生产装配入口（deployment×book×swap×observers×blobs×service，
+per-model adapter 身份经桥解析）。`DockerProcessObserver._match` 修复 reload 盲区：无显式 container 目标时以本 boot 的 running 实例为准，
+历史 exited 容器不再造成 AMBIGUOUS（两个 running 仍 AMBIGUOUS）；显式 id 语义不变。E2E 用真实 `LlamaCppAdapter`（脚本化 llama-server over httpx transport）+
+真实 `DockerProcessObserver`（fake docker CLI，load 落新带标签容器/unload 退出）跑通 boot→execute→STOPPED 终结→发布→reload(gen2,新身份)→cancel→stop 与断流不发布。
+**Files touched:** `model_scheduler/backend_control.py`、`model_scheduler/adapters/llama_cpp.py`、`model_scheduler/execution_service.py`、`model_scheduler/runtime.py`、
+`model_scheduler/process_observer.py`、`tests/test_backend_control.py`、`tests/test_llama_adapter.py`、`tests/integration/test_managed_execution.py`（新增），共 8 个，超出"约 5 个"，
+理由：桥/终结循环/装配各层都不可单测成环，E2E 需同时钉真实 adapter 与真实 observer。
+**目标核验**：见 validation.md（本轮提交推送后同步复验）。真实推理/取消一轮与停止/内存回收证据：本轮未启动模型（需 llama-swap+模型在线，属 K4 场景验收，见未解决）。
+未解决：①`book.specs` 仍读 v1 字段，v2 登记直通 Book 的迁移未做（P14/P16 遗留说明，随 P17/P20 接线定形）；②`NotDispatched` 的 adapter 侧接线（llama 适配器目前以 AdapterError 抛出，
+mid-stream 失败与预派发拒绝在 P17/P16 后续不区分 → 走 awaiting-stop 保守路径，行为安全但多付一次 stop）；③quiescer 放弃后（grace 超时未证明停止）恢复仅靠 recover/shutdown，
+不提供自动重试循环（避免与 drain worker 抢 stop 权）；④reload 的 `awaiting_quiescence` 视图仍显示 running/dispatched（协议无该状态，P02 闭集），排查靠事件 `termination_unproven`。
 
 ### P17 — Unix peer credential与双入口生命周期（M04）
 

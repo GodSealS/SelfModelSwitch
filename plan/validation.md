@@ -673,3 +673,50 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 - 目标活 llama-server 协议 body hash 与真实推理/停止证据（本轮未 SSH 探测）。
 - execution 服务接线（P14/P16）；vision Blob 与完整 envelope 边界（P20）。
+
+## P16 记录（2026-09-18）
+
+范围：真实 adapter、C03 observer 与 execution 服务走同一资源账本；消除 P14 fake 中"终结靠测试手工喂"的空隙（M04/K4）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P16 |
+| status | software_only |
+| source_commit | `92ed283`（P14 目标复验记录提交，起点） |
+| implementation_commits | `f5a3c5b`（生命周期桥）、`a36a17c`（adapter 身份 provider/结果捕获）、`f5dfc74`（managed termination）、`511fec9`（组装 + E2E + observer 修复） |
+| target_commit | 见 08 记录提交（推送后同步复验） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+判定 `software_only`：四条验收由集成测试（真实 `LlamaCppAdapter` + 真实 `DockerProcessObserver` + fake docker/llama-server/llama-swap）与全量回归支撑；
+计划验证项中的"目标真实推理/取消一轮，记录停止与内存回收"属 K4 场景验收，需 llama-swap 与模型在线，本轮未启动模型。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/integration/test_managed_execution.py tests/test_backend_control.py -q`（实现前） | 1 | ManagedLifecycle/managed_termination 不存在，即 RED |
+| 同上（开发机，实现后） | 0 | `15 passed` |
+| `pytest tests/integration -q`（开发机） | 0 | `18 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `571 passed, 1 deselected`（P14 基线 556） |
+| managed+lifecycle 文件重复 5 次 | 0 | 每轮 `15 passed`，无抖动 |
+| `ruff check .` / `run.py --check-config` | 0 | 通过 / 仍为 v1 四 ID |
+
+### 3. 关键事实
+
+- 桥：`ManagedLifecycle.load` = adapter（swap 启动 + /health + /slots）之后**再独立观察**核对结构化身份才写回；health 谎报（观察 UNKNOWN/歧义）→ `instance_unverified`，账本不动。`stop` 只对已验证身份发 unload；StopAck 不释放，轮询四事实：RUNNING/UNKNOWN → Presence 非 STOPPED → `Book.failed stop_unverified`，预算保留（v1 语义复用）。
+- 终结：`claims_device_quiescence()` True → `request_protocol_terminated` 证据；False（llama.cpp）→ `awaiting_quiescence` + per-model quiescer。inflight 判定覆盖"已 claim 未派发"（准入中）记录，杜绝"batch 未齐先停"竞态；stop 经 `scheduler.unload` 单账本路径；一次共享 stop 结算整个 batch（测试断言 unload 恰一次）。
+- reload：fallback stop 后 session 保持 ACTIVE（heartbeat 通过）、模型 UNLOADED、预算 0；下一 execution 冷加载 generation+1、fence 重签、adapter 身份 provider 换绑新容器；旧代 terminal 被 `writeback_decision` 拒（`stale_generation`）。
+- 不伪造：证明不了停止 → 记录不结算（视图仍 running/cancelling，非 terminal 不带 error，P02 一致），grace 后 quiescer 放弃，fail-closed 交给 drain/BLOCKED/recover；断流异常 → `backend_failed` 也要等 STOPPED 证据才 failed，且晚到/部分输出永不发布（publish 仅在"发布+可信终结"同时具备时发生，in-flight 互斥已封闭双 publish 竞态——该竞态曾被 P14 回归测试抓到并修复）。
+- observer 修复：`_match` 在无显式 container 目标时以本 boot running 实例为准（reload 后历史 exited 不再 AMBIGUOUS；双 running 仍歧义）。`canonical_json_bytes(adapter输出)` 为发布字节，与 `read_all` 逐字节相等。
+- 装配：`runtime.build_managed_execution` 是 P17 run.py 的 v2 分支入口；本任务未改 `run.py`/`app.py`（P17 范围），v1 行为不变。
+
+### 4. 未执行 / 未解决
+
+- 目标真实推理/取消一轮 + 停止/内存回收记录（K4 验收项，需 llama-swap 与模型在线，本轮未启动模型）。
+- v1 `book.specs` → v2 登记直通 Book 的迁移（P14/P16 遗留，P17/P20 定形）；`run.py` v1/v2 分支与 socket 入口属 P17。
+- llama adapter 预派发拒绝目前以 `AdapterError` 抛出（未带"证明未送达"标记）→ managed 路径保守走 stop 结算（多付一次 stop 成本，语义安全）；后续接 `NotDispatched` 需 adapter 侧改造。
+- quiescer 放弃后无自动重试（避免与 session drain worker 抢 stop 权）；恢复依赖 recover/shutdown 路径。
