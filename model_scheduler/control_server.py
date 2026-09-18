@@ -11,10 +11,11 @@
   parsed, and injected into the ASGI scope as ``sms.peer``. ``X-Owner``,
   ``X-UID``, bodies, reverse-proxy headers and the generic ASGI ``client``
   field are never identity;
-* only bounded HTTP/1.1 is accepted (GET/POST, no CONNECT/TRACE, no
-  Upgrade/Proxy-Connection, a header byte cap and a body cap); protocol
-  abuse closes the connection WITHOUT an HTTP answer (the C05 table has no
-  code for framing errors);
+* only bounded HTTP/1.1 is accepted (GET/POST/DELETE, no CONNECT/TRACE, no
+  Upgrade/Proxy-Connection, a header byte cap); bodies stream in bounded
+  chunks with either Content-Length or chunked framing, and protocol abuse
+  closes the connection WITHOUT an HTTP answer (the C05 table has no code for
+  framing errors);
 * `stop()` first stops accepting, then cancels and awaits every in-flight
   connection task and closes its transport, so no task or fd survives —
   the shared lifespan cleanup runs exactly once in the owner of this server,
@@ -38,15 +39,16 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from . import control_protocol_v1 as cp
+from .blob_store import MAX_BLOB_BYTES
 from .contracts_v2 import CONTROL_SOCKET_MODE, CONTROL_SOCKET_PATH
 from .control_identity import IdentityError, PeerIdentity, owner_from_peer
-from .control_protocol_v1 import MAX_INLINE_INPUT_BYTES
 
 logger = logging.getLogger(__name__)
 
 CONTROL_APP_NAME = "control-v1"
-_ALLOWED_METHODS = frozenset({"GET", "POST"})
+_ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE"})
 _FORBIDDEN_HEADERS = frozenset({"upgrade", "proxy-connection"})
+_BODY_READ_BYTES = 64 * 1024
 
 
 class ControlServerError(RuntimeError):
@@ -103,36 +105,39 @@ def build_tcp_skeleton_app(*, boot_id: str, scheduler: Any = None, shutdown_grac
     return app
 
 
-def build_control_app(*, boot_id: str) -> Callable[..., Awaitable[None]]:
-    """The control ASGI skeleton that PROVES C08 identity delivery.
+def build_control_app(*, boot_id: str, api: Any = None) -> Callable[..., Awaitable[None]]:
+    """The control ASGI app: the P17 identity proof plus the P18 route surface.
 
-    P18 lands the full /internal session/execution/blob routes on this app;
-    P17 pins that `owner` can only come from the injected peer credential and
-    that anything else answers with the C05 error body shape.
+    `/internal/peer` always stays here — it proves that C08 identity delivery
+    works; every other path is handed to `api` when one is wired, and without
+    it the P17 shape remains: anything else answers with the C05 error body.
     """
 
     async def app(scope: Mapping[str, Any], receive: Callable[[], Awaitable[Mapping[str, Any]]],
                   send: Callable[[Mapping[str, Any]], Awaitable[None]]) -> None:
         request_id = str(scope.get("sms.request_id") or "")
         if scope["type"] != "http":
-            await _send_json(send, 404, cp.error_document("not_found", "only over the control socket", request_id))
+            await send_json(send, 404, cp.error_document("not_found", "only over the control socket", request_id))
+            return
+        if api is not None and scope["path"] != "/internal/peer":
+            await api(scope, receive, send)
             return
         try:
             owner = owner_from_peer(scope.get("sms.peer"))
         except IdentityError as exc:
-            await _send_json(send, cp.ERROR_STATUS.get(exc.code, 403),
-                             cp.error_document(exc.code if exc.code in cp.ERROR_STATUS else "peer_forbidden",
-                                               str(exc), request_id))
+            await send_json(send, cp.ERROR_STATUS.get(exc.code, 403),
+                            cp.error_document(exc.code if exc.code in cp.ERROR_STATUS else "peer_forbidden",
+                                              str(exc), request_id))
             return
         if scope["method"] == "GET" and scope["path"] == "/internal/peer":
-            await _send_json(send, 200, {"owner": owner, "boot_id": boot_id, "via": CONTROL_APP_NAME})
+            await send_json(send, 200, {"owner": owner, "boot_id": boot_id, "via": CONTROL_APP_NAME})
             return
-        await _send_json(send, 404, cp.error_document("not_found", "the route is not served here", request_id))
+        await send_json(send, 404, cp.error_document("not_found", "the route is not served here", request_id))
 
     return app
 
 
-async def _send_json(send, status: int, payload: Mapping[str, Any]) -> None:
+async def send_json(send, status: int, payload: Mapping[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
     await send({"type": "http.response.start", "status": status,
                 "headers": [(b"content-type", b"application/json"),
@@ -153,7 +158,7 @@ class ControlServer:
         peer_group: str | None = None,
         mode: int = CONTROL_SOCKET_MODE,
         max_header_bytes: int = 16 * 1024,
-        max_body_bytes: int = MAX_INLINE_INPUT_BYTES,
+        max_body_bytes: int = MAX_BLOB_BYTES,
         request_timeout_seconds: float = 10.0,
     ) -> None:
         self._app = app
@@ -259,25 +264,26 @@ class ControlServer:
             return
         if any(token in lowered.get("connection", "").lower() for token in ("upgrade", "proxy")):
             return
-        te = lowered.get("transfer-encoding", "").lower()
-        if te not in ("", "identity"):
-            return  # chunked request bodies are not accepted here
-        try:
-            declared = int(lowered.get("content-length", "0"))
-        except ValueError:
-            return
-        if declared > self._max_body_bytes:
-            refused = json.dumps(cp.error_document("payload_too_large", "the request body is too large", "")).encode("utf-8")
-            _write_response(writer, 413, [(b"content-type", b"application/json"),
-                                          (b"content-length", str(len(refused)).encode("ascii")),
-                                          (b"connection", b"close")], refused)
-            return
-        body = rest[:declared]
-        while len(body) < declared:
-            chunk = await asyncio.wait_for(reader.read(min(65536, declared - len(body))), self._request_timeout)
-            if not chunk:
+        te = lowered.get("transfer-encoding", "").strip().lower()
+        if te not in ("", "identity", "chunked"):
+            return  # only identity framing and chunked bodies are accepted here
+        if te == "chunked" and "content-length" in lowered:
+            return  # ambiguous framing is refused, never guessed
+        if "content-length" in lowered:
+            try:
+                declared = int(lowered["content-length"])
+            except ValueError:
                 return
-            body += chunk
+            if declared < 0:
+                return
+            if declared > self._max_body_bytes:
+                refused = json.dumps(cp.error_document("payload_too_large", "the request body is too large", "")).encode("utf-8")
+                _write_response(writer, 413, [(b"content-type", b"application/json"),
+                                              (b"content-length", str(len(refused)).encode("ascii")),
+                                              (b"connection", b"close")], refused)
+                return
+        if rest:
+            conn.receive_data(rest)
         target, _, query = event.target.decode("utf-8").partition("?")
         scope: dict[str, Any] = {
             "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
@@ -288,13 +294,42 @@ class ControlServer:
             "client": None, "server": (str(self.socket_path), 0),  # never identity (C08)
             "sms.peer": PeerIdentity(uid), "sms.request_id": uuid4().hex,
         }
-        state = {"got_request": False, "status": 0, "headers": []}
+        state = {"status": 0, "headers": []}
+        body_state = {"done": False, "total": 0}
 
         async def receive() -> Mapping[str, Any]:
-            if state["got_request"]:
-                return {"type": "http.disconnect"}
-            state["got_request"] = True
-            return {"type": "http.request", "body": body, "more_body": False}
+            """Feed one bounded body chunk (or the disconnect) out of the h11 parser."""
+            if body_state["done"]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            buffer = bytearray()
+            while True:
+                incoming = conn.next_event()
+                if incoming is h11.NEED_DATA:
+                    try:
+                        raw = await asyncio.wait_for(reader.read(_BODY_READ_BYTES), self._request_timeout)
+                    except asyncio.TimeoutError:
+                        body_state["done"] = True
+                        return {"type": "http.disconnect"}
+                    if not raw:
+                        body_state["done"] = True
+                        return {"type": "http.disconnect"}
+                    conn.receive_data(raw)
+                    continue
+                if isinstance(incoming, h11.Data):
+                    body_state["total"] += len(incoming.data)
+                    if body_state["total"] > self._max_body_bytes:
+                        raise ControlServerError("the request body exceeds the listener bound")
+                    buffer += incoming.data
+                    if len(buffer) >= _BODY_READ_BYTES:
+                        return {"type": "http.request", "body": bytes(buffer), "more_body": True}
+                    continue
+                if isinstance(incoming, h11.EndOfMessage):
+                    body_state["done"] = True
+                    return {"type": "http.request", "body": bytes(buffer), "more_body": False}
+                if isinstance(incoming, h11.ConnectionClosed):
+                    body_state["done"] = True
+                    return {"type": "http.disconnect"}
+                raise ControlServerError(f"unexpected h11 event while reading a request body: {type(incoming).__name__}")
 
         async def send(message: Mapping[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -305,10 +340,8 @@ class ControlServer:
                     raise ControlServerError("streaming responses belong to the TCP gateway, not the control socket")
                 payload = bytes(message.get("body", b""))
                 base = [(k, v) for k, v in state["headers"] if k.lower() not in (b"content-length", b"connection")]
-                _write_response(writer, state["status"],
-                                base + [(b"content-length", str(len(payload)).encode("ascii")),
-                                         (b"connection", b"close")],
-                                payload)
+                meta = [] if state["status"] in (204, 304) else [(b"content-length", str(len(payload)).encode("ascii"))]
+                _write_response(writer, state["status"], base + meta + [(b"connection", b"close")], payload)
             elif message["type"] == "http.response.pathsend":  # pragma: no cover - unsupported
                 raise ControlServerError("pathsend is not supported on the control socket")
 
