@@ -17,7 +17,7 @@ import sys
 from . import EXIT_FAILED, EXIT_INPUT, EXIT_OK
 from .collect import FactsError, collect_facts
 
-_NOT_YET = ("candidate", "source", "run", "merge", "verify")
+_NOT_YET = ("run", "merge", "verify")
 
 
 class InputError(RuntimeError):
@@ -86,6 +86,33 @@ def _calibrate(args) -> int:
     return EXIT_OK if summary.get("verdict") == "passed" else EXIT_FAILED
 
 
+def _source(args) -> int:
+    from .candidate import build_source_archive
+
+    require_fresh_output(args.output)
+    result = build_source_archive(root=args.root, output=args.output)
+    print(f"source archive written to {result['output']}: {result['sha256']}")
+    if result["excluded"]:
+        print(f"excluded from the archive: {', '.join(result['excluded'])}", file=sys.stderr)
+    return EXIT_OK
+
+
+def _candidate(args) -> int:
+    from .candidate import CandidateError, build_candidate
+
+    require_fresh_output(args.output)
+    try:
+        result = build_candidate(config_path=args.config, facts_path=args.facts,
+                                 measurements_dir=args.measurements, policy_path=args.policy,
+                                 fixtures_path=args.fixtures, source_path=args.source,
+                                 deployment_id=args.deployment_id, output=args.output)
+    except CandidateError as exc:
+        print(f"candidate: {exc}", file=sys.stderr)
+        return EXIT_INPUT if exc.input_error else EXIT_FAILED
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m model_scheduler.acceptance")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -106,6 +133,21 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate_parser.add_argument("--from-evidence", type=Path,
                                   help="recompute from preserved raw sampling material instead of a fresh run")
 
+    source_parser = sub.add_parser("source", help="deterministic allowlisted source archive; no deployment needed")
+    source_parser.add_argument("--root", type=Path, required=True)
+    source_parser.add_argument("--output", type=Path, required=True)
+
+    candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
+    candidate_parser.add_argument("--config", type=Path, required=True)
+    candidate_parser.add_argument("--facts", type=Path, required=True)
+    candidate_parser.add_argument("--measurements", type=Path, required=True)
+    candidate_parser.add_argument("--policy", type=Path, required=True)
+    candidate_parser.add_argument("--fixtures", type=Path, required=True)
+    candidate_parser.add_argument("--source", type=Path, required=True)
+    candidate_parser.add_argument("--deployment-id", required=True,
+                                  help="deployment identity; it is an explicit input and is never derived or guessed")
+    candidate_parser.add_argument("--output", type=Path, required=True)
+
     for name in _NOT_YET:
         stub = sub.add_parser(name, help=f"{name} is delivered by a later plan task and refuses to pretend")
         stub.add_argument("rest", nargs=argparse.REMAINDER)
@@ -119,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
             return _collect(args)
         if args.command == "calibrate":
             return _calibrate(args)
+        if args.command == "source":
+            return _source(args)
+        if args.command == "candidate":
+            return _candidate(args)
         raise InputError(f"`{args.command}` is not implemented yet: the plan assigns it to a later task")
     except (InputError, FactsError) as exc:
         print(f"{args.command}: {exc}", file=sys.stderr)

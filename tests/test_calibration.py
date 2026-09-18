@@ -225,7 +225,7 @@ def test_the_cli_derives_disk_locations_from_a_v2_config(tmp_path, monkeypatch) 
 def test_a_command_without_an_implementation_refuses_with_exit_2(capsys) -> None:
     from model_scheduler.acceptance.__main__ import main
 
-    assert main(["candidate"]) == EXIT_INPUT
+    assert main(["run"]) == EXIT_INPUT  # `run`/`merge`/`verify` arrive with P23—P25
     assert "not implemented yet" in capsys.readouterr().err
 
 
