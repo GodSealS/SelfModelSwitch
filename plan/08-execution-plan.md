@@ -1125,7 +1125,10 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 `deploy/model-scheduler.service.in`：`RuntimeDirectory=model-scheduler self-model-switch` + `RuntimeDirectoryMode=0750`（渲染断言）；`docs/operations.md` 新增"Control socket and client group"
 （0660/group/chmod 失败=启动拒绝、同 uid=同 owner、两真实 UID 属 S 门禁、skip 不计通过）。
 **Files touched:** `model_scheduler/control_server.py`（新增）、`run.py`、`tests/integration/test_control_socket.py`（新增）、`deploy/model-scheduler.service.in`、`docs/operations.md`、`tests/test_deploy_render.py`，共 6 个（计划 4 个，多出文档/模板/渲染断言各一，理由：AC3 的部署契约与渲染回归需同时钉住）。
-**目标核验**：见 validation.md（推送后目标 Linux 复验）。
+**目标核验**：目标机（Linux aarch64，python 3.12.14，lab venv）显式从 GitHub fast-forward 到 `1f5936a4cc59a52d4b110b9b2014488aa1493277`，前后工作区为空。
+`pytest tests/integration/test_control_socket.py tests/test_instance_lock.py -q` = 15 passed, 1 skipped ——**Linux `SO_PEERCRED` 真路径全执行**（允许 uid 访问、名单外 uid 拒绝、伪头无效、0660、帧层滥用不泄漏）；skip 仅两真实 UID 门禁项（需 root/第二 uid 的 S 流程）。
+复验曾抓到两处真实平台差异并修复（`fix: ...raced reset...` 等两提交）：Linux 对"读毕即关"回 RST 而非 FIN，拒绝类断言现同时接受 EOF/ECONNRESET——属测试面修正，服务端行为未改。
+全量 `pytest tests -m 'not thor' -q` = 582 passed, 1 skipped + 3 项既有 `test_release` 环境失败（P10/P13/P14/P16 同款，P28 范围），无回归。
 未解决：①**两个真实 UID 的 Linux 门禁测试未执行**（需 root 或预配置第二 uid 的专用 S 流程；目标机普通用户仅能证明"名单外 uid 拒绝"这一半，故 AC3 保持未勾）；
 ②TCP 侧旧 API（/v1/*、SSE、/api/*）的 v2 完整回归属 P19；③`/internal/*` 正式路由与错误映射属 P18；④unit 的客户端组/UID 由部署输入渲染属 P27；
 ⑤控制口 body 流式（1 GiB 上传）在 P18 扩 ControlServer 时处理，当前 buffered ≤4 MiB（inline 帽）。

@@ -735,7 +735,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | status | software_only |
 | source_commit | `2e27543`（P16 目标复验记录提交，起点） |
 | implementation_commits | `efb19f5`（控制监听器）、`c1ba156`（run.py 分支 + 双 listener）、`f096213`（部署目录/文档） |
-| target_commit | 见 08 记录提交（推送后同步复验） |
+| target_commit | `1f5936a4cc59a52d4b110b9b2014488aa1493277`（显式从 GitHub fast-forward，目标树为空） |
 | candidate_sha256 | null（本任务不产出候选） |
 | python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
 | evidence_directory | 无新目录；目标机只跑既有测试套件 |
@@ -750,6 +750,8 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | 同上（开发机 macOS，实现后） | 0 | `14 passed, 1 skipped`（skip=两真实 UID 门禁项），重复多轮无抖动 |
 | `pytest tests -m 'not thor' -q`（开发机） | 0 | `585 passed, 1 skipped, 1 deselected`（P16 基线 571） |
 | `ruff check .` / `run.py --check-config` | 0 | 通过 / 仍 v1 四 ID |
+| 目标机（Linux，`1f5936a`，python 3.12.14）计划验证命令 | 0 | `15 passed, 1 skipped`（真 `SO_PEERCRED` 路径全执行；skip=两真实 UID 门禁项） |
+| 目标机全量 | 1 | `582 passed, 1 skipped` + 3 项既有 `test_release` 环境失败（无回归） |
 
 ### 3. 关键事实
 
@@ -761,6 +763,6 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 
 ### 4. 未执行 / 未解决
 
-- **两个真实 UID 的 Linux 门禁测试**：需要 root 或预配置的第二 uid（S 流程执行）；本轮开发/目标均为普通用户 → 该子项未验证，AC3 未勾选。
-- `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18）；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
-- 目标机 Linux 复验见下方补记。
+- **两个真实 UID 的 Linux 门禁测试**：需要 root 或预配置的第二 uid（S 流程执行）；本轮开发/目标均为普通用户 → 该子项未验证，AC3 未勾选（目标机已验证同一 allow-list 代码路径的单侧拒绝）。
+- `/internal/*` 正式路由、错误映射与 1 GiB 流式上传（P18)；TCP 旧 API 的 v2 完整回归（P19）；unit 客户端组/UID 由部署输入渲染（P27）；v2 配置 schema 是否收纳 swap/deployment 输入由 P18/P20 定形。
+- 目标机复验曾暴露 Linux RST vs macOS FIN 的断言差异（`52b739c`、`1f5936a` 两修复后全绿）：记录为测试面修正，非服务端行为变更。
