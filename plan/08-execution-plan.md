@@ -974,11 +974,30 @@ python=3.12.11（开发机）/3.12.14（目标 lab venv）。
 **Description:** 在不依赖HTTP的服务层实现授权/幂等，防止路由或重试绕过状态机。
 **Files likely touched:** `model_scheduler/control_identity.py`、`model_scheduler/idempotency.py`、`tests/test_control_identity.py`、`tests/test_idempotency.py`（均新增）。
 **Acceptance criteria:**
-- [ ] owner来自可信PeerIdentity；token绑定boot/session/model/owner，摘要比较；交叉owner读取/修改404。
-- [ ] HMAC输入编码固定，GET重算token与创建值相同；boot_key不落盘、重启token失效，比较采用恒定时间函数。
-- [ ] 同key并发只创建一次；不同payload409；route命名空间隔离；活跃对象不可被24h清理。
-- [ ] 重启旧token无效；对象/索引失效不能重放推理；日志和status没有token原文。
+- [x] owner来自可信PeerIdentity；token绑定boot/session/model/owner，摘要比较；交叉owner读取/修改404。
+- [x] HMAC输入编码固定，GET重算token与创建值相同；boot_key不落盘、重启token失效，比较采用恒定时间函数。
+- [x] 同key并发只创建一次；不同payload409；route命名空间隔离；活跃对象不可被24h清理。
+- [x] 重启旧token无效；对象/索引失效不能重放推理；日志和status没有token原文。
 **Verification:** `python -m pytest tests/test_control_identity.py tests/test_idempotency.py -q`。到K3（P11/P12也必须完成）。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `cd67c8c`（P12 记录提交）；实现提交 `f2b8c3e`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
+`pytest tests/test_control_identity.py tests/test_idempotency.py -q` = 13 passed（新文件，先 RED）；
+`pytest tests -m 'not thor' -q` = 519 passed, 1 deselected（P12 基线 506）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
+新增 `control_identity`：`PeerIdentity(uid)` → `owner="uid:<decimal>"`，`owner_from_peer()` 只接受可信 peer（缺失即 403 `peer_forbidden`），
+`check_owner()` 对交叉 owner 返回 `not_found`（404）；`TokenAuthority` 用启动时生成的 32 字节 boot key（不落盘）签发 `v1.<claims_b64>.<hmac>`，
+claims 固定为 `boot_id/owner/model_id/session_id/execution_id/expires_at` 的规范化 JSON，`verify()` 先恒定时间比较签名再逐字段比对绑定关系，
+任何不匹配或过期都抛 `stale_token`；`fingerprint()` 只暴露 16 位不可逆引用，测试断言 token 原文不出现在 claims 与指纹中。
+新增 `idempotency`：`fingerprint(route, owner, key, payload)` = HMAC(boot_key, 规范化(route/owner/key) + 0x00 + 规范化 payload)，
+因此同一请求在 GET 时重算与创建值一致、不同 route/owner/key 天然隔离；`begin()` 对同 key 同 payload 的并发重试返回 `busy`（首次仍在跑）、
+完成后返回同一记录供重放、payload 不同抛 `idempotency_conflict`（409）；`complete()` 记录 status/resource_id/body 与 token 指纹（不存原文）、
+`fail()` 释放 key 允许重试、`sweep()` 跳过仍有活跃对象的记录（`active_until` 保护），`replay()` 在重放前重算指纹。
+测试覆盖：peer 独占 owner 与交叉 owner 404、token 绑定五项与过期边界（10s 边界：9.999 通过 / 10.0 拒绝）、
+同一 claims 两次签发字节一致、重启（换 boot key/boot_id）后旧 token 与旧索引都不能重放、篡改 payload/签名/版本一律 `stale_token`、
+同 key 并发只创建一次、不同 payload 409、route/owner/key 命名空间隔离、24h 清理不删活跃对象、失败重试、记录里只有 token 指纹。
+**目标核验**：干净 checkout fast-forward 到 `f2b8c3e`；`tests/test_control_identity.py tests/test_idempotency.py -q` = 13 passed。到 K3（P11/P12/P13 全部完成）。
+未解决：①HTTP 层的身份注入（`SO_PEERCRED` → scope）与错误码映射属 P17/P18；②token 与幂等记录接入 session/execution 路由属 P14/P18；
+③幂等记录是每 boot 的内存索引，跨重启只保证"不重放"，持久化重放窗口由 P14 的执行服务决定。
 
 ### P14 — execution队列与结果提交服务（M04）
 

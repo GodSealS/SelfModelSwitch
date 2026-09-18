@@ -537,3 +537,44 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 ### 4. 未执行 / 未解决
 
 - HTTP 路由与 peer UID 身份（P17/P18）、执行终结证据接线（P14）、profile 上限进入 candidate 摘要（P26/P27）。
+
+## P13 记录（2026-09-18）
+
+范围：不依赖 HTTP 的服务层授权与幂等（owner 只来自 peer credential、token 绑定 boot/session/model/owner、幂等索引按 boot 隔离）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P13 |
+| status | complete |
+| source_commit | `cd67c8c5155ae1ab4bf0c6a44fa076095f6b97d0`（P12 记录提交，起点） |
+| implementation_commit | `f2b8c3e859f2120bad38884d2e776ba9d10fa00d` |
+| target_commit | `f2b8c3e859f2120bad38884d2e776ba9d10fa00d`（fast-forward，工作区为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.12.11（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机只跑既有测试套件 |
+
+本任务判定为 `complete`：四条验收由开发机与目标机测试支撑（软件层 S）。达成 **K3**（P11/P12/P13 全部完成）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_control_identity.py tests/test_idempotency.py -q`（实现前） | 4 | 新模块不存在，即 RED |
+| 同上（实现后，开发机） | 0 | `13 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `519 passed, 1 deselected`（P12 基线 506） |
+| `ruff check .`（开发机） | 0 | 通过 |
+| 同上（目标机 `f2b8c3e`） | 0 | `13 passed` |
+
+### 3. 关键事实
+
+- owner 只能来自 `PeerIdentity`；自报 owner 或交叉 owner 一律 404，缺失 peer 为 403。
+- token 绑定 boot/owner/model/session/execution 与过期时刻，签名恒定时间比较，boot key 每次启动新建且不落盘 → 重启旧 token 全失效。
+- 幂等指纹含 route/owner/key（namespace 隔离）并绑定 payload；同 key 不同 payload 是 409，同 key 同 payload 的并发重试返回 busy 或同一记录。
+- `active_until` 保护活跃对象不被 24h 清理；失败尝试释放 key 允许重试。
+- 记录与指纹中都不含 token 原文。
+
+### 4. 未执行 / 未解决
+
+- peer credential 注入与 HTTP 错误码映射（P17/P18）；token/幂等接入 session/execution 路由（P14/P18）。
