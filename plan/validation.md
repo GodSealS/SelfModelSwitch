@@ -1307,3 +1307,20 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 3. 接线真实 `CaseDriver` 与 `run --layers` 编排（层编排 + 材料落盘）；
 4. 重建候选（新 `candidate_sha256`）并重跑完整 S/B/O；P25 的离线 verify 与 P28 的发布门禁复验新候选；
 5. 三条 AC 方可勾选；P30/P31 同样依赖此链。
+
+### 5. 解除阻塞的可行性探测（2026-09-19，目标机）
+
+为确定恢复路径的第一步，本轮对目标机做了只读探测（未安装、未启动任何模型）：
+
+| 探测项 | 结果 |
+|---|---|
+| `docker version --format '{{.Server.Version}}'` | `29.2.1`（宿主 Docker 可用） |
+| `docker images` | **已有运行时镜像** `sms-llama-cpp:4bc272f`（621 MB，M00 期构建的 llama.cpp 视觉运行时） |
+| 固定 llama-swap 二进制 | `/opt/self-model-switch/bin/llama-swap` 已安装；保留的发布包 `…/llama-swap-217-20260917T233137Z/llama-swap_217_linux_arm64.tar.gz` 在证据目录内 |
+| 到 GitHub releases 的网络 | `api.github.com` 返回 200（必要时可重新拉取固定版本） |
+
+**结论**：§6 的"受控镜像"比 P28 记录的估计更接近就绪——镜像与固定二进制已在设备上，缺的是**把镜像按 digest 固定并入库**（当前是 tag `sms-llama-cpp:4bc272f`，需要 `docker inspect` 的 image id / registry digest 写入候选运行时登记）。
+
+**因此解除阻塞的第一步应是 P21 遗留的 `calibrate` fresh-run 路径**（用官方启动路径拉起模型 + `MemorySampler` 采样 + stop/quiescence 证明），而不是先造镜像：只有它能把 `physical_resident_peak_bytes` 从 null 变成实测值，从而让 `candidate` 写出第一个真实候选。其后依次是：②镜像按 digest 入库；③真实 `CaseDriver` 与 `run --layers` 编排接线；④重建候选并完整重跑 S/B/O。
+
+本轮**未执行**：fresh-run 校准（需要实现 + 一次独占维护窗口，属下一次会话的第一个任务），也未改动任何镜像/tag。
