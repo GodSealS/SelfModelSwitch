@@ -232,18 +232,40 @@ def v2_health_checks(context: RunContextV2):
     return checks
 
 
+def _v2_token_counter(context: RunContextV2):
+    """The compatibility API's token counter: the model adapter's own runtime count (C06/P20).
+
+    C06 forbids estimating tokens from characters, so the compat route counts
+    through the same `/apply-template` + `/tokenize` path the adapter uses. A
+    model without a counter refuses (503) instead of being dispatched blind.
+    """
+
+    async def counter(model_id: str, messages: list, image_count: int) -> int:
+        runtime = context.extras.get("runtime")
+        adapters = getattr(runtime, "adapters", None)
+        adapter = adapters.get(model_id) if isinstance(adapters, dict) else None
+        count = getattr(adapter, "count_chat_input", None)
+        if not callable(count):
+            raise RuntimeCompositionError(f"no runtime token counter is available for {model_id!r}")
+        return await count(messages, image_count,
+                           monotonic() + context.config.gateway.inference_timeout_seconds)
+
+    return counter
+
+
 def build_v2_tcp_app(context: RunContextV2):
     """The TCP listener of the v2 process (P19): the legacy surface over the managed runtime.
 
     The control routes stay on the Unix socket: this app never registers
     `/internal/*`, so the TCP side answers 404 by construction (C08), and
-    /api/status reports this process's own boot id.
+    /api/status reports this process's own boot id. A v2 registration also
+    brings its C06 envelope and the runtime token counter (P20).
     """
     from app import create_app
 
     return create_app(config=context.config, scheduler=context.scheduler, gateway=None,
                       boot_id=context.boot_id, execution_stats=_execution_stats(context),
-                      health_checks=v2_health_checks(context))
+                      health_checks=v2_health_checks(context), token_counter=_v2_token_counter(context))
 
 
 def serve_v2(context: RunContextV2) -> None:

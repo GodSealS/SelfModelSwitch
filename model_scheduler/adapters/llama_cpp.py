@@ -5,7 +5,8 @@ a loopback llama-server using the paths pinned in `tests/fixtures/llama_cpp_v1.j
 llama-swap, when injected, is used only as a load/unload lifecycle control; this
 module never asks it to route inference.
 
-C06 rules this module enforces before any dispatch:
+C06 rules this module enforces before any dispatch (the shared input checks
+live in `model_scheduler.envelope_validator`, P20):
 
 * chat/vision consume OpenAI `messages`; embeddings consume `input`; rerank
   consumes `query`/`documents`;
@@ -25,8 +26,6 @@ this module only uses httpx and the stdlib.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import math
 import time
@@ -45,10 +44,16 @@ from ..contracts_v2 import (
     require_startable_profile,
 )
 from ..control_protocol_v1 import Fence, InstanceIdentity
+from ..envelope_validator import (
+    EnvelopeError,
+    check_chat_budget,
+    check_images,
+    collect_image_sizes,
+    effective_max_tokens,
+)
 from ..ports_v3 import CancelAck, ExecutionHandle, ExecutionRequest, Observation, StopAck
 
 FIXTURE_PATH = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures" / "llama_cpp_v1.json"
-ALLOWED_IMAGE_MEDIA = frozenset({"image/png", "image/jpeg"})
 UTC = timezone.utc
 
 
@@ -68,92 +73,6 @@ def _json_object(value: Any, where: str) -> dict:
     if not isinstance(value, dict):
         raise AdapterError(f"{where}: expected an object", "contract_violation")
     return value
-
-
-def _png_size(data: bytes) -> tuple[int, int]:
-    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise AdapterError("image is not a PNG", "envelope_exceeded")
-    if data[12:16] != b"IHDR":
-        raise AdapterError("PNG missing IHDR", "envelope_exceeded")
-    width = int.from_bytes(data[16:20], "big")
-    height = int.from_bytes(data[20:24], "big")
-    if width < 1 or height < 1:
-        raise AdapterError("PNG has invalid dimensions", "envelope_exceeded")
-    return width, height
-
-
-def _jpeg_size(data: bytes) -> tuple[int, int]:
-    if data[:2] != b"\xff\xd8":
-        raise AdapterError("image is not a JPEG", "envelope_exceeded")
-    index = 2
-    while index + 9 <= len(data):
-        if data[index] != 0xFF:
-            index += 1
-            continue
-        marker = data[index + 1]
-        if marker in {0xC0, 0xC1, 0xC2}:
-            height = int.from_bytes(data[index + 5 : index + 7], "big")
-            width = int.from_bytes(data[index + 7 : index + 9], "big")
-            if width < 1 or height < 1:
-                raise AdapterError("JPEG has invalid dimensions", "envelope_exceeded")
-            return width, height
-        if marker in {0xD8, 0xD9} or marker < 0xC0:
-            index += 2
-            continue
-        length = int.from_bytes(data[index + 2 : index + 4], "big")
-        index += 2 + length
-    raise AdapterError("JPEG missing size marker", "envelope_exceeded")
-
-
-def _decode_data_url(url: str) -> tuple[str, bytes]:
-    if not url.startswith("data:") or ";base64," not in url:
-        raise AdapterError(f"unsupported image url {url[:48]!r}", "contract_violation")
-    header, payload = url.split(";base64,", 1)
-    media = header[len("data:") :].split(";", 1)[0].strip().lower()
-    if media not in ALLOWED_IMAGE_MEDIA:
-        raise AdapterError(f"unsupported image media type {media!r}", "unsupported_media_type")
-    try:
-        raw = base64.b64decode(payload, validate=True)
-    except (ValueError, binascii.Error) as exc:
-        raise AdapterError("image data URL is not valid base64", "contract_violation") from exc
-    return media, raw
-
-
-def _image_size(media: str, raw: bytes) -> tuple[int, int]:
-    return _png_size(raw) if media == "image/png" else _jpeg_size(raw)
-
-
-def _message_parts(content: Any) -> list[Any]:
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    if isinstance(content, list):
-        return list(content)
-    raise AdapterError("message content must be a string or part list", "contract_violation")
-
-
-def _collect_images(messages: list[Any]) -> list[tuple[int, int]]:
-    sizes: list[tuple[int, int]] = []
-    if not isinstance(messages, list) or not messages:
-        raise AdapterError("messages must be a non-empty list", "contract_violation")
-    for message in messages:
-        item = _json_object(message, "message")
-        for part in _message_parts(item.get("content")):
-            if not isinstance(part, dict):
-                raise AdapterError("message part must be an object", "contract_violation")
-            kind = part.get("type")
-            if kind == "text":
-                continue
-            if kind != "image_url":
-                raise AdapterError(f"unsupported message part {kind!r}", "contract_violation")
-            image = _json_object(part.get("image_url"), "image_url")
-            url = image.get("url")
-            if not isinstance(url, str) or not url:
-                raise AdapterError("image url is required", "contract_violation")
-            if url.startswith("http://") or url.startswith("https://") or not url.startswith("data:"):
-                raise AdapterError("remote image url is not allowed", "contract_violation")
-            media, raw = _decode_data_url(url)
-            sizes.append(_image_size(media, raw))
-    return sizes
 
 
 def _finite_numbers(values: Any, where: str) -> list[float]:
@@ -291,36 +210,19 @@ class LlamaCppAdapter:
         image_tokens = image_count * self._model.envelope.max_image_tokens
         return text_tokens + image_tokens
 
-    def _check_images(self, sizes: list[tuple[int, int]], operation: str) -> None:
-        envelope = self._model.envelope
-        if sizes and "vision" not in self._model.capabilities:
-            raise AdapterError("image input requires the vision capability", "capability_mismatch")
-        if operation == "vision" and not sizes:
-            raise AdapterError("vision requires an image", "contract_violation")
-        if len(sizes) > envelope.max_images:
-            raise AdapterError("image count exceeds envelope.max_images", "envelope_exceeded")
-        for width, height in sizes:
-            if max(width, height) > envelope.max_image_edge_pixels:
-                raise AdapterError("image edge exceeds envelope.max_image_edge_pixels", "envelope_exceeded")
-
-    def _check_budget(self, input_tokens: int, max_tokens: int) -> None:
-        envelope = self._model.envelope
-        if input_tokens > envelope.max_input_tokens:
-            raise AdapterError("input tokens exceed envelope.max_input_tokens", "envelope_exceeded")
-        if max_tokens > envelope.max_output_tokens:
-            raise AdapterError("max_tokens exceeds envelope.max_output_tokens", "envelope_exceeded")
-        if input_tokens + max_tokens > envelope.ctx_size:
-            raise AdapterError("input plus output exceeds ctx_size", "envelope_exceeded")
+    async def count_chat_input(self, messages: list[Any], image_count: int, deadline: float) -> int:
+        """The runtime's own token count for one chat body (C06; the compatibility API injects this, P20)."""
+        return await self._count_chat_tokens(messages, image_count, deadline)
 
     def _chat_payload(self, messages: list[Any], parameters: Mapping) -> dict[str, Any]:
-        envelope = self._model.envelope
-        requested = parameters.get("max_tokens", min(4096, envelope.max_output_tokens))
-        if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
-            raise AdapterError("max_tokens must be a positive integer", "contract_violation")
+        try:
+            max_tokens = effective_max_tokens(parameters, self._model.envelope)
+        except EnvelopeError as exc:
+            raise AdapterError(str(exc), exc.code) from exc
         payload: dict[str, Any] = {
             "model": self._model.model_id,
             "messages": messages,
-            "max_tokens": min(requested, envelope.max_output_tokens),
+            "max_tokens": max_tokens,
             "stream": False,
         }
         for key in ("temperature", "top_p", "seed"):
@@ -421,11 +323,18 @@ class LlamaCppAdapter:
             messages = request.inline_input.get("messages")
             if not isinstance(messages, list):
                 raise AdapterError("chat input requires messages", "contract_violation")
-            images = _collect_images(messages)
-            self._check_images(images, request.operation)
-            payload = self._chat_payload(messages, parameters)
+            try:
+                images = collect_image_sizes(messages)
+                check_images(images, capabilities=self._model.capabilities, operation=request.operation,
+                             envelope=self._model.envelope)
+                payload = self._chat_payload(messages, parameters)
+            except EnvelopeError as exc:
+                raise AdapterError(str(exc), exc.code) from exc
             tokens = await self._count_chat_tokens(messages, len(images), deadline)
-            self._check_budget(tokens, payload["max_tokens"])
+            try:
+                check_chat_budget(tokens, payload["max_tokens"], self._model.envelope)
+            except EnvelopeError as exc:
+                raise AdapterError(str(exc), exc.code) from exc
             output = await self._dispatch("chat", payload, deadline, self._validate_chat)
         elif request.operation == "embeddings":
             raw_input = request.inline_input.get("input")

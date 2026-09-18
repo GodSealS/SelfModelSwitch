@@ -27,10 +27,20 @@ import httpx
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
 from model_scheduler.config import AppConfig, ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
+from model_scheduler.envelope_validator import (
+    EnvelopeError,
+    check_chat_input,
+    check_embeddings_input,
+    check_rerank_input,
+)
 from model_scheduler.model_registry import Conflict
 from model_scheduler.gateway import DirectInferenceGateway
 from model_scheduler.runtime import build_scheduler
 from model_scheduler.scheduler import ModelUnavailable, QueueFull
+
+# C06 input refusals onto HTTP: an over-limit request is 422 (m00-envelope §3),
+# an unsupported image media type is 415.
+_ENVELOPE_STATUS = {"unsupported_media_type": 415}
 
 
 class BodyError(ValueError):
@@ -86,6 +96,7 @@ class _CatalogModel:
     upstream_url: str
     capabilities: frozenset
     preload: bool
+    envelope: object | None = None  # v2 registrations carry the measured C06 envelope
 
 
 @dataclass(frozen=True)
@@ -105,7 +116,8 @@ def _model_catalog(config) -> dict[str, _CatalogModel]:
         preload = set(config.scheduler.preload_models)
         return {
             model_id: _CatalogModel(model_id=model_id, upstream_url=f"http://127.0.0.1:{model.port}",
-                                    capabilities=frozenset(model.capabilities), preload=model_id in preload)
+                                    capabilities=frozenset(model.capabilities), preload=model_id in preload,
+                                    envelope=model.envelope)
             for model_id, model in config.models.items()
         }
     return {
@@ -236,13 +248,18 @@ async def _require_empty_body(request: Request, *, timeout_seconds: float) -> No
         raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
 
 
-def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, token_counter=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover.
 
     The same surface serves schema v2 (plan/08 P19): the catalog derives the
     upstream URL and the preload flag from the dynamic registration, `boot_id`
     and `execution_stats` enrich /api/status, and the load/unload budgets fall
     back to the memory-reclaim timeout because v2 has no llama-swap section.
+
+    A v2 registration also carries the measured C06 envelope, so chat/vision,
+    embeddings and rerank bodies are checked BEFORE any dispatch (P20):
+    `token_counter(model_id, messages, image_count)` supplies the runtime's own
+    token count (never a character estimate) when the deployment wires one.
     """
     if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
         raise ValueError("preload_retry_delays must contain positive values")
@@ -329,6 +346,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
     app.state.health_checks = health_checks
     app.state.boot_id = boot_id
     app.state.execution_stats = execution_stats
+    app.state.token_counter = token_counter
 
     async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
         try:
@@ -478,10 +496,26 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
         model = catalog.get(body.model)
         if model is None:
             return _error(404, "model_not_found", "Unknown model", request_id, "model")
-        if "chat" not in model.capabilities:
+        if "chat" not in model.capabilities and "vision" not in model.capabilities:
             return _error(422, "unsupported_capability", "Model does not support chat", request_id, "model")
         if app.state.scheduler is None or app.state.gateway is None:
             return _error(503, "service_unavailable", "Service is not ready", request_id)
+        if model.envelope is not None:
+            counter = app.state.token_counter
+
+            async def _count(messages, image_count):
+                return await counter(body.model, messages, image_count)
+
+            try:
+                await check_chat_input(payload, capabilities=model.capabilities, envelope=model.envelope,
+                                       token_counter=_count if counter is not None else None)
+            except EnvelopeError as exc:
+                return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "messages")
+            except Exception:
+                # Counting failed, so compliance cannot be proven: refuse instead of
+                # dispatching a request whose envelope was never checked (C06).
+                return _error(503, "service_unavailable", "The input could not be counted against the envelope",
+                              request_id)
         lease = None
         try:
             deadline = monotonic() + config.gateway.inference_timeout_seconds
@@ -589,9 +623,10 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid embedding request", request_id)
-        inputs = [body.input] if isinstance(body.input, str) else body.input
-        if not inputs or len(inputs) > 256 or any(not value.strip() for value in inputs):
-            return _error(400, "invalid_request", "Embedding input is invalid", request_id, "input")
+        try:
+            inputs = check_embeddings_input(payload)
+        except EnvelopeError as exc:
+            return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "input")
         upstream_payload = dict(payload)
         upstream_payload["encoding_format"] = "float"
         context, error = await acquire_json(body.model, Capability.EMBEDDINGS, upstream_payload, request_id)
@@ -643,8 +678,10 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(exc.status, exc.code, str(exc), request_id)
         except (ValidationError, ValueError):
             return _error(400, "invalid_request", "Invalid rerank request", request_id)
-        if not body.query.strip() or not 1 <= len(body.documents) <= 256 or any(not item.strip() for item in body.documents):
-            return _error(400, "invalid_request", "Rerank input is invalid", request_id)
+        try:
+            check_rerank_input(payload)
+        except EnvelopeError as exc:
+            return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id)
         count = len(body.documents) if body.top_n is None else body.top_n
         if not 1 <= count <= len(body.documents): return _error(400, "invalid_request", "top_n is out of range", request_id, "top_n")
         context, error = await acquire_json(body.model, Capability.RERANK, {"model": body.model, "query": body.query, "documents": body.documents, "top_n": len(body.documents)}, request_id)

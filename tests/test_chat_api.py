@@ -307,10 +307,13 @@ def test_a_v2_registration_drives_the_same_chat_surface(tmp_path) -> None:
     with TestClient(app) as client:
         unknown = client.post("/v1/chat/completions", json={"model": "missing", "messages": []})
         mismatch = client.post("/v1/chat/completions", json={"model": "embedding", "messages": []})
-        accepted = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+        malformed = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": []})
+        accepted = client.post("/v1/chat/completions",
+                               json={"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}]})
 
     assert unknown.status_code == 404 and unknown.json()["error"]["code"] == "model_not_found"
     assert mismatch.status_code == 422 and mismatch.json()["error"]["code"] == "unsupported_capability"
+    assert malformed.status_code == 422  # the C06 format check refuses an empty message list before dispatch
     assert accepted.status_code == 200 and scheduler.releases == [Outcome.SUCCESS]
 
 

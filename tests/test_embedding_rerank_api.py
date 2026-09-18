@@ -116,3 +116,15 @@ def test_capability_mismatch_on_the_json_routes_is_422() -> None:
     assert embeddings.json()["error"]["code"] == "unsupported_capability"
     assert rerank.status_code == 422 and rerank.json()["error"]["code"] == "unsupported_capability"
     assert scheduler.outcomes == []  # refused before any lease
+
+
+def test_an_over_cap_batch_and_document_list_are_422_envelope_exceeded() -> None:
+    scheduler = Scheduler()
+    with TestClient(create_app(scheduler=scheduler, gateway=Gateway())) as client:
+        batch = client.post("/v1/embeddings", json={"model": "embedding", "input": ["x"] * 257})
+        documents = client.post("/v1/rerank", json={"model": "reranker", "query": "q", "documents": ["d"] * 257})
+
+    # plan/m00-envelope.md §3: any over-limit input is refused with 422 before dispatch
+    assert batch.status_code == 422 and batch.json()["error"]["code"] == "envelope_exceeded"
+    assert documents.status_code == 422 and documents.json()["error"]["code"] == "envelope_exceeded"
+    assert scheduler.outcomes == []  # refused before any lease
