@@ -860,3 +860,48 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - v2 的 `pinned_models`/`preload_models` 未落入账本（`_exclusive_conflict` 与 C04 独占会话的共存规则需单独定形，与 P27 一并）；当前 v2 health 因此保守 503（fail-closed）。
 - vision/embedding/rerank 的 parameters 闭集与 envelope 检查（P20）；status 的 executions 计数为内存账本、无持久化。
 - 真实 llama-swap/模型在线的兼容面端到端（K5/CP3）仍待 P20 之后的目标机联调。
+
+## P20 记录（2026-09-18）
+
+范围：vision 输入与 embedding/rerank 能力 envelope——把 C06 的运行前输入检查覆盖到兼容 API 与通用接口（adapter），并用每能力输入 fixture 证明检查确实消费输入。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P20 |
+| status | complete |
+| source_commit | `e2b115b`（P19 记录提交，起点） |
+| implementation_commits | `21892f3`（C06 输入检查共享化） |
+| target_commit | `21892f3b75b2717e3db57d270edc9c0c66484b12`（经裸仓 origin fast-forward，目标树前后为空） |
+| candidate_sha256 | null（本任务不产出候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 无新目录；目标机跑既有测试套件（Verification 38 passed、兼容+控制面回归 60 passed） |
+
+判定 `complete`：三条 AC 均由 `tests/test_envelopes.py`（四能力 fixture、精确边界/+1、零 dispatch 断言）与既有 adapter/路由测试支撑，并在目标 Linux 复验。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_envelopes.py tests/test_embedding_rerank_api.py tests/test_llama_adapter.py -q`（Verification） | 0 | `38 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `642 passed, 1 skipped, 1 deselected`（P19 基线 628） |
+| `ruff check .` | 0 | 通过 |
+| 目标机（Linux，`21892f3`）Verification | 0 | `38 passed` |
+| 目标机（Linux，`21892f3`）兼容面+控制面回归（chat/admin/control_socket/roundtrip） | 0 | `60 passed`；树前后为空 |
+
+### 3. 关键事实
+
+- 单一实现：`envelope_validator.py` 被 adapter（通用接口）与 app（兼容 API）共同复用；adapter 删除私有副本后 17 项既有测试逐项通过（行为不变）。
+- 图像按**解码后像素**检查（PNG IHDR / JPEG SOF marker），远程 URL 直接拒绝且从不抓取；畸形头不会变成"巨大图像"绕过尺寸限制。
+- token 预算不可猜测：兼容 API 注入的 counter 走 adapter 的 `/apply-template`+`/tokenize`（同 runtime tokenizer/template），计数失败 → 503 而非盲目 dispatch；adapter 侧未确定图像按登记 `max_image_tokens` 计入。
+- 精确边界：input=28672 通过、28673 拒绝；ctx=input+output；图像 1024px/1 张通过、1025px/2 张拒绝；batch/document 256 通过、257 拒绝且**零 lease 零 dispatch**。
+- 兼容面语义变化（有意）：v2 注册的模型空 `messages` 现在 422（C06 格式检查）；embeddings/rerank 超限由 400 改为 422 `envelope_exceeded`（对齐 m00-envelope §3）；chat 路由接受 `chat` 或 `vision` 能力（vision 模型可用 data URL 直接走兼容 chat）。
+- AC3：路由集合无 audio/video（测试断言）；`CAPABILITY_INPUT_KEYS` 与 `CAPABILITY_FIXTURES` 一一覆盖四能力，`fixture_coverage` 供 P22 拒绝无 fixture 的生产 candidate。
+
+### 4. 未执行 / 未解决
+
+- batch/document 的实测上限绑定 candidate（P22/P23）；当前 256 为接口层保守默认、只能收紧。
+- compat 的 token 计数依赖模型运行时在线（失败 → 503）；真实 llama-server 联调属 K5。
+- Envelope 契约未新增 batch 字段（若 P22 的 candidate 需要独立登记 batch 上限再按 C09 扩展）。
+- 输出侧校验（NaN embeddings / rank shape / 上游 shape）仍由 app 与 adapter 各自持有（P17/P15 已测），本轮只共享输入侧。

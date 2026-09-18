@@ -1184,10 +1184,19 @@ v2 永不 `build_backend`（测试注入炸弹断言）；`CONTROL_CONTRACT` 仅
 **Description:** 将C06运行前输入检查覆盖到兼容API与通用接口，fixture验证实际消费输入。
 **Files likely touched:** `model_scheduler/adapters/llama_cpp.py`、`model_scheduler/envelope_validator.py`（新增）、`app.py`、`tests/test_envelopes.py`（新增）、`tests/test_embedding_rerank_api.py`。
 **Acceptance criteria:**
-- [ ] text/template/image总token、每边尺寸、图像数、batch和并发组合限制一致；精确边界通过，+1拒绝且无dispatch。
-- [ ] vision只接data URL/已登记Blob，禁止远程URL；恶意解码尺寸、NaN embeddings、非法rank shape拒绝。
-- [ ] 不新增音频/视频路由；每能力fixture映射完整，无fixture的模型不能出现在生产candidate。
+- [x] text/template/image总token、每边尺寸、图像数、batch和并发组合限制一致；精确边界通过，+1拒绝且无dispatch。
+- [x] vision只接data URL/已登记Blob，禁止远程URL；恶意解码尺寸、NaN embeddings、非法rank shape拒绝。
+- [x] 不新增音频/视频路由；每能力fixture映射完整，无fixture的模型不能出现在生产candidate。
 **Verification:** `python -m pytest tests/test_envelopes.py tests/test_embedding_rerank_api.py tests/test_llama_adapter.py -q`。到K5。
+
+**本轮执行记录（2026-09-18）:** status=complete；起点 commit `e2b115b`（P19 记录提交）；实现提交 `21892f3`（C06 输入检查共享化）；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/envelope_validator.py`：C06 输入检查的单一实现——`data:` URL 解码（PNG/JPEG 头解析得**解码后像素**、拒绝 `http(s)://` 且从不抓取）、图像数/每边尺寸、token 与 ctx 预算（input ≤ max_input_tokens、output ≤ max_output_tokens、input+output ≤ ctx_size）、`max_tokens` 裁剪、embeddings batch / rerank documents 上限（保守默认 256，实测值只能收紧）、`fixture_coverage`（无输入 fixture 的能力不得进入生产 candidate，C09）。超限一律 422 `envelope_exceeded`（对齐 m00-envelope §3）；不支持的图像媒体 415；其余契约错误 422。设计要点：**token 计数必须注入**（同 runtime 的 `/apply-template`+`/tokenize`，模块本身不做字符估计）。
+`model_scheduler/adapters/llama_cpp.py`：删除私有图片/预算函数，全部复用 validator（行为逐项不变，17 项既有测试通过）；新增公开 `count_chat_input(messages, image_count, deadline)` 供兼容 API 注入计数。
+`app.py`：`_CatalogModel` 携带 v2 的 `envelope`；chat 路由接受 `chat` 或 `vision` 能力；有 envelope 的模型在 **acquire/gateway 之前**执行格式+图像+预算检查，注入 runtime 计数时含 token 预算；计数失败 → 503（"不能证明合规"就不盲目 dispatch）；embeddings/rerank 的 batch/document 与空白检查统一走 validator（超限 422 `envelope_exceeded`，形态错误 422 `contract_violation`）；新增 `token_counter` 注入点。
+`run.py`：新增 `_v2_token_counter`（经 `extras["runtime"].adapters[model_id]` 调用 adapter 的 runtime 计数，deadline 取 `gateway.inference_timeout_seconds`）并注入 `build_v2_tcp_app`。
+测试：`tests/test_envelopes.py`（13 项：四能力 fixture 与 `fixture_coverage`；token 边界=28672 通过/+1 拒绝且 counter 真实收到 fixture；ctx=input+output；PNG 1024 通过 / 1025 拒绝 / 2 图拒绝；JPEG 真实 marker 尺寸；远程与畸形图拒绝；batch/document 256/257 与"只能收紧"；compat chat 在边界 200 且 gateway 被调用、+1 时 422 且**零 lease 零 dispatch**；无 vision 能力的模型带图 422；路由集合无 audio/video）；`test_embedding_rerank_api.py` 增 257 → 422；`test_llama_adapter.py` 回归；`test_control_socket.py` 的 v2 app 测试断言 compat chat 的计数确实走 adapter（不可达端口 → 503）。
+开发机：P20 Verification = 38 passed；全量 `pytest tests -m 'not thor' -q` = 642 passed, 1 skipped, 1 deselected（P19 基线 628）；`ruff check .` exit 0。目标机（Linux aarch64，`21892f3b75b2717e3db57d270edc9c0c66484b12`）：Verification = 38 passed；兼容面+控制面回归 = 60 passed；树为空。
+未解决：①batch/document 的"实测上限绑定 candidate"属 P22/P23，当前 256 为接口层保守默认；②compat 的 token 计数依赖模型运行时在线（计数失败 → 503），真实 server 联调属 K5；③Envelope 契约未新增 batch 字段（若 P22 的 candidate 需要独立登记 batch 上限，再按 C09 扩展）；④输出侧校验（NaN embeddings/rank shape）仍由 app 与 adapter 各自实现（P17/P15 已测），本轮只共享输入侧。
 
 ### P21 — 现场facts、校准和物理内存口径（M06）
 
