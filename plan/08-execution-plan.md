@@ -1288,11 +1288,19 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 从原始事件、采样、输出重算结论，不能相信summary、手填passed或GPU布尔。
 **Files likely touched:** `model_scheduler/acceptance/evaluator.py`、`model_scheduler/acceptance/verify.py`、`tests/test_verify.py`、`tests/test_evaluator.py`（均新增）、`model_scheduler/acceptance/__main__.py`。
 **Acceptance criteria:**
-- [ ] 必测集合全集唯一；失败历史保留；每场景结果从材料计算；缺失/重复/未知/hash错/path逃逸/evaluator缺失拒绝。
-- [ ] 报告时间等于case最早/最晚；UTC未来偏差<=5min，从开始起7天，恰到7天过期；重打包不刷新。
-- [ ] 离线verify不访问模型、Docker或网络；exit0通过、exit2缺材料/结构错、exit3完整材料语义失败。
-- [ ] 改一个原始值后即使重填summary也失败；case绑定设备/候选/工具版本不匹配失败。
+- [x] 必测集合全集唯一；失败历史保留；每场景结果从材料计算；缺失/重复/未知/hash错/path逃逸/evaluator缺失拒绝。
+- [x] 报告时间等于case最早/最晚；UTC未来偏差<=5min，从开始起7天，恰到7天过期；重打包不刷新。
+- [x] 离线verify不访问模型、Docker或网络；exit0通过、exit2缺材料/结构错、exit3完整材料语义失败。
+- [x] 改一个原始值后即使重填summary也失败；case绑定设备/候选/工具版本不匹配失败。
 **Verification:** `python -m pytest tests/test_verify.py tests/test_evaluator.py -q`；对真实失败/通过材料副本分别离线verify。
+
+**本轮执行记录（2026-09-18）:** status=complete（evaluator + 离线 verify + merge；真实 S/B/O 材料生成属 P29）；起点 commit `1d0891c`（P24 记录提交）；实现提交 `e11f06e`；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/acceptance/evaluator.py`：**不读任何存储结论**（忽略 `status`/`passed`/`gpu_verified`/summary）——设备归属只从 `samples/tegrastats.jsonl`、`samples/proc_maps.jsonl` 原始行重算；B 类按 P23 同源判据（provider/实例/停止/取消 + 组合边界 + 能力输出 shape/有限值）+ 重算的归属；O01 从原始工作负载行用 `workload.evaluate_workload` 重算；O02—O06 用 `operational_cases.recompute_objections`（与编排器同表判据，未知 case 拒绝）；S01—S06 由声明观测重算，S03 的 C02 算术（`reserved=ceil(peak×1.15)`、边界等式与差 1 byte）从原始数字重算；缺规则/缺材料一律失败，绝不通过。
+新增 `model_scheduler/acceptance/verify.py`：`verify_evidence` 只做文件 I/O（无 socket、无 subprocess、无模型）——先parse候选/报告，再逐项核对 artifact 的存在/非符号链接/size/hash（→ exit 2），再校验报告身份（candidate/device digest）与工具绑定（每个 attempt 的 collector/evaluator hash 必须等于候选）与有效期（未来偏差 ≤5min、**自 started_at 起 7 天、恰到 7 天即过期、重打包不刷新**）（→ exit 3），最后逐 case 复算（任一失败 → exit 3）；`merge_runs` 只合并同候选/同设备的 run，逐文件重校 hash、按 case 唯一 final、保留材料内部结构（`case.json` 与 `samples/` 同层），报告起止**重算**而不刷新有效期。CLI 增 `merge`/`verify`（0/2/3；拒绝覆盖非空输出），至此 §5 的 acceptance 子命令全部落地、无存根。
+测试：`tests/test_evaluator.py` 9 项（原始采样重算归属、删采样/低于边界即使文档自称 passed 也失败、能力输出 NaN、O01 从原始行重算比率与结尾状态、O0x 事实重算与未知 case 拒绝、S03 边界/差 1 byte/缺数字、S 类观测缺失或被否定、材料属他 case、缺材料）＋`tests/test_verify.py` 10 项（完整 26 case 证据通过；缺文件/改字节 → exit 2；语义失败 → exit 3；有效期 6 天通过/7 天与 8 天过期/未来超限；身份与工具 hash 绑定；缺 final → exit 2；**重填 summary 后原始值仍决定结论**；离线证明——把 socket/subprocess 全部替换为"禁止"仍 exit 0；merge 两 run → 合并后可 verify 通过、重复 attempt 拒绝；CLI verify/merge 接线与不可覆盖）。
+开发机：P25 Verification = 19 passed；全量 `pytest tests -m 'not thor' -q` = 735 passed, 1 skipped, 1 deselected（P24 基线 717）；`ruff check .` exit 0。
+目标机（Linux aarch64，`e11f06e`）：Verification = 19 passed；用真实文件系统构造 26 个必测 case 的完整证据 → `verify_exit=0, verdict=passed`；随后**删掉原始设备活动行并把 manifest 的 size/hash 一并重填**（模拟"重填 summary"）→ `verify_exit=3`，原因 `B:qwen-small:cap:vision: ['the raw samples show no attributable device activity']`；目标树为空。
+未解决：①真实 S/B/O 材料（P29/P30）尚未产生，本任务以合成材料验证复算与拒绝路径；②`evaluator_sha256` 的候选绑定在 P22 由 fixtures 声明的 evaluator 材料提供，P29 重做 source/candidate 时应改为绑定本任务交付的 `acceptance/evaluator.py` 源码 hash；③merge 的 run 拆分/合并策略（S+B 与 O 分批）在 P29/P30 按真实时长落地。
 
 ### P26 — production render和现场preflight（M06）
 

@@ -1090,3 +1090,49 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - **真实执行属 P30**：O01 的 1800s 真实混合负载、O02 的挂载命名空间/配额文件系统、O03 的真实 Docker 故障、O04 的真实重启/残留、O06 的隔离 lab release 演练均需目标设备与宿主特权；本任务按计划只交付编排与端口契约。
 - O05 仅调用 P26 的 preflight 原语；完整 production gate 在 P31 执行。
 - `workload.py` 的发送使用注入的 clock/wait，真实运行需真实时钟（P30 接线）。
+
+## P25 记录（2026-09-18）
+
+范围：独立 evaluator 与离线 verify——交付 `acceptance/evaluator.py`（从原始事件/采样/输出重算结论）、`acceptance/verify.py`（离线复算 + merge），CLI 的 `merge`/`verify` 接线。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P25 |
+| status | complete（evaluator/verify/merge + 合成与目标真实文件系统核验；真实 S/B/O 材料属 P29/P30） |
+| source_commit | `1d0891c`（P24 记录提交，起点） |
+| implementation_commits | `e11f06e` |
+| target_commit | `e11f06e4a51d1b1fb9c2f2b83a72ed3013cae97c`（经裸仓 origin fast-forward，目标树空） |
+| candidate_sha256 | null（P29 生成真实候选） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 开发机 pytest 报告 + 目标机 `/home/jtzn/self-model-switch-evidence/p25/`（26 case 的合成证据与篡改后副本） |
+
+判定 `complete`：四条 AC 全部有测试覆盖，并在目标机以真实文件系统执行"通过 → 篡改原始值（并重填清单 hash）→ 语义失败"的完整链路；本任务按计划不产生可发布通过记录。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_verify.py tests/test_evaluator.py -q`（Verification，开发机） | 0 | `19 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `735 passed, 1 skipped, 1 deselected`（P24 基线 717） |
+| `ruff check .` | 0 | 通过 |
+| 目标机同 Verification | 0 | `19 passed` |
+| 目标机离线 verify（26 必测 case 完整证据，真实文件系统） | 0 | `verdict=passed`、`cases=26` |
+| 目标机篡改（删原始设备活动行 + 重填 manifest size/hash） | **3** | `B:qwen-small:cap:vision: ['the raw samples show no attributable device activity']` |
+
+### 3. 关键事实
+
+- **结论只从材料来**：evaluator 忽略 `status`/`passed`/`gpu_verified`/summary；设备归属只由 `samples/tegrastats.jsonl`、`samples/proc_maps.jsonl` 的原始行重算；缺原始采样即失败（不是"未测通过"）。
+- **判据同源**：B 类复用 P23 的判据函数（已改为公开 `attribution_problems`/`capability_output_problems`），O02—O06 复用 P24 的 `recompute_objections` 表；编排器与评估器在同一事实上不产生分歧（测试交叉核对）。
+- **S03 算术重算**：`reserved=ceil(peak×1.15)`、边界等式与"差 1 byte 必须拒绝"全部从原始数字重算；缺数字或数字非整数即失败。
+- **离线可证**：`verify` 只做文件 I/O——测试把 `socket.socket`、`subprocess.run`、`subprocess.Popen` 全部替换为"禁止"后仍 `exit 0`；同时覆盖 exit 2（缺文件/改字节/缺 final/重复 attempt）与 exit 3（身份与工具绑定、有效期、复算失败）。
+- **有效期语义**：未来偏差 ≤5min；自 `started_at` 起 7 天，**恰好 7 天即过期**，且 merge 重排报告起止但不刷新窗口（重打包不能续期）。
+- **merge**：只合并同候选/同设备 run，逐文件重校 hash、按 case 唯一 final、保留材料内部结构（`case.json` 与 `samples/` 同层，否则复算会读不到原始采样——这是本轮实际修掉的一个缺陷）。
+- 目标机的篡改实验刻意**重填了 manifest 的 size/hash**，证明"把材料改得自洽"不能改变结论：判定确实来自原始值本身。
+
+### 4. 未执行 / 未解决
+
+- 真实 S/B/O 材料在 P29/P30 产生；本任务的证据为合成材料（结构与判据真实，不含设备证据）。
+- 候选的 `evaluator_sha256` 目前由 fixtures 声明的 evaluator 材料提供（P22 设计）；P29 重做 source/candidate 时应改为绑定本任务交付的 `acceptance/evaluator.py` 源码 hash。
+- `merge` 的 run 拆分策略（S+B / O 分批）随 P30 的真实执行落地。
