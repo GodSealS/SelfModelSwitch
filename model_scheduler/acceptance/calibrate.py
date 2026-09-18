@@ -570,9 +570,10 @@ def run_live_calibration(*, config_path: Path, facts_path: Path, maintenance_pat
         raise CalibrationError(f"cannot digest {config_path}: {exc}", semantic=False) from exc
 
     # Identity first: the facts must describe this machine before any model moves.
-    from .collect import FactsReader
+    from .collect import SystemFactsReader
 
-    machine_id = hashlib.sha256(FactsReader().read_text("/etc/machine-id").strip().encode("utf-8")).hexdigest()
+    machine_id = hashlib.sha256(
+        SystemFactsReader().read_text("/etc/machine-id").strip().encode("utf-8")).hexdigest()
     if device.machine_id_sha256 != machine_id:
         raise CalibrationError("the facts were taken on a different machine: calibration refuses to measure here",
                                semantic=True)

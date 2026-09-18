@@ -583,7 +583,7 @@ def _live_site(tmp_path, monkeypatch, *, rounds: int = 2):
             assert path == "/etc/machine-id"
             return "0123456789abcdef0123456789abcdef\n"
 
-    monkeypatch.setattr(collect_module, "FactsReader", _Reader)
+    monkeypatch.setattr(collect_module, "SystemFactsReader", _Reader)
     monkeypatch.setattr(cal, "verify_maintenance",
                         lambda *a, **k: {"live_verified_utc": "2026-09-18T00:00:00Z", "declared_by": "jtzn",
                                          "containers": [], "lock_path": str(tmp_path / "scheduler.lock")})
@@ -624,6 +624,14 @@ def test_the_cli_runs_a_fresh_calibration_through_the_official_launch(tmp_path, 
     assert (output / "raw" / "run1" / "sampling" / "meminfo.csv").is_file()
 
 
+def test_the_live_identity_reader_is_concrete() -> None:
+    """The bug the first target run found: a Protocol has no instance to read with."""
+    from model_scheduler.acceptance.collect import SystemFactsReader
+
+    reader = SystemFactsReader()  # instantiating the Protocol would raise TypeError
+    assert callable(reader.read_text)
+
+
 def test_a_fresh_calibration_requires_an_explicit_launch_identity(tmp_path, monkeypatch, capsys) -> None:
     config_path, facts_path, maintenance = _live_site(tmp_path, monkeypatch, rounds=1)
 
@@ -647,7 +655,7 @@ def test_a_fresh_calibration_refuses_another_machines_facts(tmp_path, monkeypatc
         def read_text(self, path: str) -> str:
             return "ffffffffffffffffffffffffffffffff\n"
 
-    monkeypatch.setattr(collect_module, "FactsReader", _OtherReader)
+    monkeypatch.setattr(collect_module, "SystemFactsReader", _OtherReader)
 
     from model_scheduler.acceptance.__main__ import main
 
