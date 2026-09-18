@@ -1371,9 +1371,27 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Files likely touched:** `plan/validation.md`、`docs/operations.md`（证据索引，不写设备凭据）。
 **Acceptance criteria:**
 - [ ] 目标干净checkout与本地release源码SHA一致，硬件/设备树/SM/盘核实；全部登记模型/能力有fixture及性能阈值。
+  *本项**部分可证**：目标干净 checkout 与本地 release 源码 SHA 一致（`f60149a…`）、C09 facts 真实采集成功；但"全部登记模型/能力有 fixture 及性能阈值"需绑定一个**已冻结候选**，而候选因 C02 被阻塞（见下），故整项不勾。*
 - [ ] S在发布解释器通过；B每模型六类/每cap全部通过，3冷启动/3重载/组合最大envelope证据完整。
+  *本项 `not_run`：`acceptance run --layers B` 在目标实测 exit 3（真实 CaseDriver/编排未接线，P23/P24 交付的是注入式执行器逻辑）。*
 - [ ] 任一修复更改candidate，重建并重跑其完整S/B/O，不拼接其他candidate历史通过。
+  *规则已在 P25/P26 落实为机制（候选摘要绑定、证据离线复算、merge 拒绝跨候选 run）；本轮无候选可重跑，故不勾。*
 **Verification:** 第5节collect/candidate/run命令；保留环境、每资产SHA、CUDA/runtime、命令exit、耗时、峰值、stop/quiescence。
+
+**本轮执行记录（2026-09-19）:** status=blocked（前置条件未满足；按 06-acceptance §4「缺真实设备、资产、fixture或性能值则 not_run/输入不完整，不填写占位通过值」记为 `not_run`，不勾任何 AC）；起点 commit `f60149a`（P28 记录提交）；实现提交：本轮无（只交付证据索引与阻塞记录）；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+目标机真实前置审计（Linux aarch64，`f60149a251d59886eb58420132a5c7f90508f323`，树空）：
+
+| 步骤 | exit | 结果 |
+|---|---|---|
+| 干净 checkout 与远端 main 一致 | 0 | `target_sha=f60149a…` 与本地 release 源码一致 |
+| `acceptance collect`（fresh C09 facts） | 0 | 真实 Orin facts 写盘（`…/p29/facts.json`） |
+| `acceptance source --root .` | 0 | 归档 sha256 `43708bc77d8ecb622c708f02a2a5c451c2c0920ec47ac5cd6c8c3c308dcb294b` |
+| `acceptance candidate …`（P21 真实材料 + P22 policy/fixtures） | **2** | `the measurement does not prove a physical bound: production candidates need a passed calibration with a proven bound (C02)`；**未写出候选** |
+| `acceptance run --layers B` | **3** | 编排未接线，无部分 run 输出 |
+
+**阻塞链（三条独立原因，均有实测）**：①C02——P21 的 3 轮材料缺 MemFree 与单调窗口，物理上界无法证明，`candidate` 因此拒绝（这是设计要求的阻塞，不是缺陷）；②fresh 校准需 §6 的受控 runtime 镜像/runner 接线，当前新采集路径显式 exit 3；③真实 `run` 需要真实 `CaseDriver`（控制 API 客户端）与 S 层执行器，P23/P24 交付的是注入式执行器逻辑，`run --layers B` 按设计 exit 3 且不写部分输出。
+**本任务实际交付**：`docs/operations.md` 新增**证据索引**（目标机各证据目录、内容、离线复核命令；不含任何设备凭据）与本节记录；P29 的三条 AC 全部保持未勾。
+**恢复路径（依赖顺序）**：①按 §6 构建并固定 ARM64 runtime 镜像（P06a 已有 fixture/CONTROL_CONTRACT，需镜像 digest 入库）→ ②用 P21 的 `MemorySampler` 做一次 **fresh** 3 轮校准（产出含 MemFree 与单调窗口的原始材料，`physical_resident_peak_bytes` 由 null 升级为实测值）→ ③接线真实 `CaseDriver` 与 `run --layers` 编排 → ④重跑 P22 candidate 与 P23 `run --layers B`（新建候选、完整 S/B/O，绝不拼接历史通过）→ ⑤P29 三条 AC 方可勾选。到 M07 的 P30/P31 同样依赖该链。
 
 ### P30 — 真实混合负载、故障恢复及离线复核（M07）
 

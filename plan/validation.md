@@ -1264,3 +1264,46 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - GitHub Actions 的**真实执行**需要远端 runner；本轮验证的是工作流定义与目标机上的等价命令（Verification + 锁解析）。
 - ARM64 **干净 venv 全量安装两把锁并运行 G** 属 P29/G 步骤（目标机已具备 3.12 venv 与锁文件，dry-run 已证明可解析）。
 - 控制 listener 若需新直接依赖，仍按计划走独立的 P28a 更新 `requirements.in` 与锁，不突破本任务文件边界。到 CP3。
+
+## P29 记录（2026-09-19）
+
+范围：最终候选冻结与全量 S/B 验收（M07）。本轮**未产生候选**：前置条件缺失，按 06-acceptance §4「缺真实设备、资产、fixture 或性能值则 not_run，不填写占位通过值」记为 **blocked / not_run**，不勾任何验收项。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P29 |
+| status | **blocked**（三条独立前置未满足；不勾 AC；无候选、无 S/B 通过记录） |
+| source_commit | `f60149a`（P28 记录提交，起点） |
+| implementation_commits | 无（本轮只交付证据索引与阻塞记录） |
+| target_commit | `f60149a251d59886eb58420132a5c7f90508f323`（干净 checkout，与本地 release 源码一致） |
+| candidate_sha256 | **null**（`candidate` 按 C02 拒绝写出） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/{p21-calibration,p22,p23,p25,p26,p27,p29}/`（见 `docs/operations.md` 证据索引） |
+
+### 2. 本轮命令与结果（目标机真实执行）
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| 干净 checkout 与远端 main 比对 | 0 | `target_sha=f60149a251d59886eb58420132a5c7f90508f323`，与本地 release 源码一致 |
+| `acceptance collect --model-disk /media/jtzn/sandisk-ext4/models --scratch-disk /var/lib` | 0 | 真实 C09 facts 写盘（`…/p29/facts.json`） |
+| `acceptance source --root .` | 0 | 归档 sha256 `43708bc77d8ecb622c708f02a2a5c451c2c0920ec47ac5cd6c8c3c308dcb294b` |
+| `acceptance candidate`（P21 真实测量 + P22 policy/fixtures） | **2** | `the measurement does not prove a physical bound … (C02)`；**未写出候选** |
+| `acceptance run --layers B` | **3** | 编排未接线；无部分 run 输出 |
+
+### 3. 关键事实（阻塞链的三条独立原因）
+
+1. **C02（主要）**：P21 的 3 轮真实材料只保留 `MemAvailable` 且无单调窗口，`system_nonfree_upper_bound_v1` 无法证明 → `candidate` 在冻结阶段即拒绝。这是 C02 要求的**阻塞语义**，不是缺陷；材料与逐轮理由完整保留。
+2. **fresh 校准**：新采集路径需要 §6 的受控 runtime 镜像/runner 接线；当前该路径显式 exit 3，不产出"看似完成"的校准。
+3. **真实执行器**：`run --layers B` 需要真实 `CaseDriver`（控制 API 客户端）与 S 层执行器；P23/P24 交付的是**注入式执行器逻辑**（已测），所以 `run` 按设计 exit 3 且不写部分输出。
+
+**本任务真正交付**：`docs/operations.md` 的证据索引（各证据目录内容 + 离线复核命令，不含任何设备凭据）与本记录。P29 三条 AC 全部保持未勾；`plan/08-execution-plan.md` 中逐条注明了"部分可证 / not_run / 机制已备"的准确状态。
+
+### 4. 恢复路径（依赖顺序，任何一步都不许拼接历史通过）
+
+1. 按 §6 构建并固定 ARM64 runtime 镜像（P06a 的 fixture 与 `CONTROL_CONTRACT` 已在包内，缺镜像 digest 入库）；
+2. 用 P21 的 `MemorySampler` 做 **fresh** 3 轮校准（含 MemFree 与单调窗口的原始材料；`physical_resident_peak_bytes` 由 null 升级为实测值）；
+3. 接线真实 `CaseDriver` 与 `run --layers` 编排（层编排 + 材料落盘）；
+4. 重建候选（新 `candidate_sha256`）并重跑完整 S/B/O；P25 的离线 verify 与 P28 的发布门禁复验新候选；
+5. 三条 AC 方可勾选；P30/P31 同样依赖此链。

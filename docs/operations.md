@@ -121,3 +121,23 @@ unrelated Docker containers as part of this procedure.
    candidate the site stops for repair.
 5. Record the resulting systemd/PID/socket state (unit states, `current` target,
    socket owner/mode) with the release id.
+
+## Evidence index (target device)
+
+All acceptance material lives under `/home/jtzn/self-model-switch-evidence/` on the
+target. The index lists what each directory contains and how to re-verify it
+**offline**. No credentials, tokens or device keys are recorded here — none are
+needed to re-verify, and none may be added.
+
+| Directory | Contents | Offline re-verification |
+|---|---|---|
+| `p21-calibration/` | `facts.json` (16 C09 facts with provenance), `scheduler-v2.yaml`, `maintenance.json`, `calibration-final/{measurements.json, raw/run1..3/}` | re-run `acceptance calibrate --from-evidence …/p21-calibration/calibration-final` (recomputes §5 criteria and the C02 bound from the preserved rows; it stays `blocked` for material without MemFree/window) |
+| `p22/` | `source-a.tar.gz`/`source-b.tar.gz` (identical deterministic archives), `policy.json`, `fixtures.json`, `fixtures/`, `scheduler-v2-claims-measured.yaml` | `acceptance source --root <checkout> --output <new tar>` then compare sha256; `acceptance candidate …` (refuses on unproven material, never writes a partial candidate) |
+| `p23/` | M00-envelope fixtures (`fixtures/`) with their boundary dimensions | `pytest tests/test_backend_cases.py -q`; compare fixture sha256 against the recorded ones |
+| `p25/` | 26-case synthetic evidence set and its tampered copy | `acceptance verify --candidate <c.json> --evidence <dir>` → 0 clean, 3 tampered/missing |
+| `p26/` | rendered v3 deployment (`deploy/manifest.json` + service units) and the layer-1 result | `model_scheduler.deploy preflight --manifest …/manifest.json` (layer 1, loads nothing) |
+| `p27/` | rendered service units + `service-facts.json` | `systemd-analyze verify <units>` (exit 0) |
+| `p29/` | `facts.json`, `source.tar.gz` (sha256 `43708bc7…`), `source.log` — the P29 prerequisite audit | re-run `collect`, `source`, `candidate`, `run --layers B` and compare exit codes (2 / 3 by design until the blockers clear) |
+
+Re-verification never starts a model, never talks to Docker and never opens a
+socket: `acceptance verify` and the P26 preflight are pure file-and-hash checks.
