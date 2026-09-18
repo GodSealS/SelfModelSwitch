@@ -998,3 +998,48 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - 真实 `acceptance run --layers B/O`（P23/P24）与生产 evaluator（P25）未实现，故 P22 的 fixture/evaluator 在测试中为 **test-only 标记材料**；P28 后由 P29 重做 source/candidate 并真实执行全集。
 - 多模型测量的材料需按模型分别提供；当前工具在多个 `measured=true` 时显式拒绝并说明原因（单一测量材料无法证明每个模型的物理上界）。
 - P21 遗留的 fresh 校准（受控 runner/镜像）仍未执行，因此**真实候选在 P29 前不可能生成**——这是 C02 的预期阻塞，不是本任务的缺陷。
+
+## P23 记录（2026-09-18）
+
+范围：每模型 B 场景真实执行器——交付 `acceptance/fixtures.py`（达组合边界的确定性 fixture）与 `acceptance/backend_cases.py`（只经正式 API 的案例编排），附 `run --layers` 脚手架。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P23 |
+| status | complete（执行器逻辑 + fixture + 目标核验；真实 `run --layers B` 属 P29） |
+| source_commit | `8b12b51`（P22 记录提交，起点） |
+| implementation_commits | `6fddcdc` |
+| target_commit | `6fddcdcd1fc53f08d42121c70cc902574bb0b7f1`（经裸仓 origin fast-forward，目标树空） |
+| candidate_sha256 | null（本任务不产出候选，也不计 B 通过） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | 开发机 pytest 报告 + `/home/jtzn/self-model-switch-evidence/p23/fixtures/`（M00 envelope 的 chat/vision fixture 材料） |
+
+判定 `complete`：三条 AC 均有单测覆盖并在目标机复核；真实 B 执行按计划在 P29，本任务**不把 fixture 计为 B 通过**（06-acceptance §3 与 P23 Verification 明确要求）。
+
+### 2. 本轮命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_backend_cases.py -q`（Verification，开发机） | 0 | `13 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `698 passed, 1 skipped, 1 deselected`（P22 基线 685） |
+| `ruff check .` | 0 | 通过 |
+| 目标机 `pytest tests/test_backend_cases.py -q` | 0 | `13 passed` |
+| 目标机 M00 envelope fixture 生成（28672/4096/2/1280/1024/1） | 0 | chat 材料 286927 B、vision 材料 1310730 B；两次生成字节一致 |
+| 目标机 `run --layers B --output …/run-b` | **3** | 显式拒绝（编排未接线），未产生部分 run 输出 |
+
+### 3. 关键事实
+
+- **单请求组合边界**：fixture 把 `max_input_tokens` 文本、`max_output_tokens`、`max_images`×`max_image_edge_pixels` 图与 `max_parallel` 放在**同一个请求体**里；`boundary_shortfalls()` 逐维报出未达项，短欠即该案例 failed——不接受"拆成若干小请求"的替代（测试断言每个推理案例恰一次调用）。
+- **三者齐备才 passed**：推理类案例要求 provider + 可归属设备活动（必须来自原始采样，布尔不算）+ 真实输出；缺归属 → `unknown`（汇总不通过），契约短欠/非有限值/无输出 → `failed`；`Attempt` 自检禁止"passed 带 failure/problems"。
+- **崩溃留痕**：执行器捕获任何异常 → failed attempt + 通过正式 API 调 `cleanup` 并记录其结果（cleanup 自身失败也入材料）；接 `FileCollector` 时同步落 `cases.jsonl`/`failures.jsonl`，失败材料只追加。
+- **最小值守护**：`CaseExecutor` 拒绝少于 3 次冷启动或少于 3 轮重载的构造参数；reload 每轮都要求上一实例 **proven stopped** 后才 cold load。
+- **能力案例输出契约**：chat/vision 非空内容、embeddings 向量数=batch 且维度一致、数值全部有限、rerank 结果数=文档数且 score 有限；不含音视频质量断言（fixture 对 `video/audio/transcription/voiceprint/face` 直接拒绝）。
+- fixture 字节确定性（固定种子、无时钟）在开发机与目标机均验证；`write_fixture_material` 产出 P22 兼容的 size/sha256 条目，可直接喂 `candidate --fixtures`。
+
+### 4. 未执行 / 未解决
+
+- **真实 `CaseDriver`**（控制 API 客户端的 load/start/execute/cancel/stop）与 `run --layers B` 编排未实现；`run` 目前校验层集合后显式 exit 3 且不写任何部分输出——属 P24（运维执行器）与 P29（真实运行）。
+- capability 输出契约只覆盖协议/shape/有限值/范围；本计划不声称转写/人脸/声纹/视频质量达标。
+- embeddings/rerank 的 batch/document 上限沿用 P20 的接口层保守默认 256；实测上限绑定候选待 P29。

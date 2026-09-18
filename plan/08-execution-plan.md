@@ -1248,10 +1248,18 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 **Description:** 执行器只通过正式API施加动作，逐模型/能力产生B证据，不直接改registry。
 **Files likely touched:** `model_scheduler/acceptance/backend_cases.py`、`model_scheduler/acceptance/fixtures.py`、`tests/test_backend_cases.py`（均新增）、`model_scheduler/acceptance/__main__.py`。
 **Acceptance criteria:**
-- [ ] 每模型load/infer/envelope/cancel/stop/reload六类及每cap；>=3独立冷启动和3轮完整重载。
-- [ ] 最大输入同轮达到已声明组合边界，不能将文本/视觉/并发拆开替代；provider+归属设备活动+实际输出三者齐备。
-- [ ] executor crash也留下attempt和清理记录；未知不能转换为passed；fixture不包含视频质量评估。
+- [x] 每模型load/infer/envelope/cancel/stop/reload六类及每cap；>=3独立冷启动和3轮完整重载。
+- [x] 最大输入同轮达到已声明组合边界，不能将文本/视觉/并发拆开替代；provider+归属设备活动+实际输出三者齐备。
+- [x] executor crash也留下attempt和清理记录；未知不能转换为passed；fixture不包含视频质量评估。
 **Verification:** `python -m pytest tests/test_backend_cases.py -q`验证执行器逻辑；真实最终 `acceptance run --layers B` 在P29执行，不能把本任务fixture计B通过。到K6。
+
+**本轮执行记录（2026-09-18）:** status=complete（执行器逻辑与 fixture；真实 `run --layers B` 仍属 P29）；起点 commit `8b12b51`（P22 记录提交）；实现提交 `6fddcdc`；python=3.13.5（开发机）/3.12.14（目标 lab venv）。
+新增 `model_scheduler/acceptance/fixtures.py`：按声明能力生成**单请求**即达组合边界的确定性 fixture——`chat`（`max_input_tokens` 文本 + `max_output_tokens` + `max_parallel`）、`vision`（`max_image_edge_pixels` 的确定性 PNG × `max_images` + 剩余文本预算 + 输出 + 并发）、`embeddings`/`rerank`（接口层 batch/document 上限 256）；filler 与 PNG 固定种子、无时钟，`fixture_bytes` 可复现；`boundary_shortfalls()` 逐维报出单轮未达项；`audio/video/transcription/voiceprint/face` 显式拒绝（本计划从不声称音视频质量）；每能力无 fixture 或未知能力即拒。
+新增 `model_scheduler/acceptance/backend_cases.py`：`CaseExecutor` 只通过 `CaseDriver`（正式 API：load/start/execute/cancel/stop/cleanup，reload 由执行器按 stop→cold load 编排）施加动作；逐模型跑 load×3 冷启动、infer、envelope、cancel、stop、reload×3 轮、每能力 cap 案例；**归属判据**按案例类别：推理类需 provider+可归属设备活动（原始采样，非布尔）+真实输出，load 需实例事实，stop 需 `stop_proven`，cancel 需 `cancelled`；envelope 用 `boundary_shortfalls` 校验**同一请求**内的全部声明维度；问题分类为 failed（自身契约短欠/输出非有限/无输出）或 **unknown（无法归属）**，且 passed 只由无问题产生——未知永不转 passed；异常留 failed attempt **并**调用 cleanup 记录（cleanup 自身失败也入材料）；可用 P22 `FileCollector` 落 cases/events/failures 材料。`__main__.py` 新增 `run --layers` 脚手架：层集合校验（仅 S/B/O、不重复）+ 拒绝覆盖非空输出，编排未接线前显式 exit 3 且**不产生任何部分 run 输出**。
+测试：`tests/test_backend_cases.py` 13 项（矩阵与 3 冷启动/3 重载计数、envelope 单请求组合边界与短欠失败、无设备活动 → unknown 且汇总不通过、crash → failed+cleanup+失败材料、cleanup 失败入材料、embeddings/rerank 形状与有限性、cancel/stop 证据、<3 冷启动或重载即拒、fixture 确定性与边界、音视频拒绝、fixture 材料 size/hash、`run` 层校验与拒绝）。
+开发机：P23 Verification = 13 passed；全量 `pytest tests -m 'not thor' -q` = 698 passed, 1 skipped, 1 deselected（P22 基线 685）；`ruff check .` exit 0。
+目标机（Linux aarch64，`6fddcdcd1fc53f08d42121c70cc902574bb0b7f1`）：`pytest tests/test_backend_cases.py -q` = 13 passed；用 M00 真实 envelope（28672/4096/parallel 2/1280 image tokens/1024 px/1 图）生成 fixture：chat 边界 `{input_tokens: 28672, output_tokens: 4096, parallel: 2}`（材料 286927 B）、vision 边界 `{input_tokens: 28672, output_tokens: 4096, images: 1, image_edge_pixels: 1024, parallel: 2}`（材料 1310730 B），两次生成字节一致 `deterministic: True`；`run --layers B` → exit **3**、无部分输出；目标树为空。
+未解决：①真实 `CaseDriver`（控制 API 客户端 + 真实 load/execute/cancel/stop 接线）与 `run --layers B` 编排属 P24/P29——本任务按计划只交付执行器逻辑与 fixture，**不把本任务 fixture 计为 B 通过**；②capability 的输出契约只覆盖协议/shape/有限值/范围，不声称转写/人脸/声纹/视频质量（与 06-acceptance §3 一致）；③embeddings/rerank 的 batch/document 上限沿用 P20 的接口层保守默认 256，实测上限绑定候选仍待 P29。
 
 ### P24 — O01—O06运维执行器（M06）
 
