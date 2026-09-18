@@ -6,7 +6,9 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  software-gate:
+    # G: the software gate. `-m 'not thor'` is the retained compatibility selector;
+    # the marker is never implicitly renamed here.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,3 +19,27 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m ruff check .
       - run: python -m pytest tests -m 'not thor' -q
+
+  peer-uid-gate:
+    # The C08 two-real-UID gate needs root: it drops to a second uid and proves the
+    # control socket refuses it. It reports on its own, never mixed into the software gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r requirements-dev.lock
+      - run: sudo -E env PATH="$PATH" python -m pytest tests/integration/test_control_socket.py -q
+      - run: python -m pytest tests/integration/test_control_socket.py -q
+
+  hardware:
+    # Real-device acceptance is a separate, self-hosted job. Mock or host-side results
+    # never count as B/O evidence (plan/06-acceptance.md section 3).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, arm64, jetson]
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3.12 -m pip install --require-hashes -r requirements-dev.lock
+      - run: python3.12 -m pytest tests -m 'thor' -q
+      - run: echo "hardware evidence is produced by P29/P30/P31 and is never inferred from this job"
