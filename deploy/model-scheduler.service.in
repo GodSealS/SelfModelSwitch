@@ -14,7 +14,10 @@ Group=model-scheduler
 SupplementaryGroups=docker
 WorkingDirectory=/opt/self-model-switch/current
 Environment=MODEL_SCHEDULER_CONFIG=/etc/self-model-switch/config.yaml
-RuntimeDirectory=model-scheduler
+# self-model-switch holds the C08 control.sock; the scheduler creates and secures
+# it 0660 with the registered peer group at startup (plan/03-api.md section 2).
+RuntimeDirectory=model-scheduler self-model-switch
+RuntimeDirectoryMode=0750
 ExecStart=/opt/self-model-switch/current/.venv/bin/python run.py
 Restart=on-failure
 RestartSec=5

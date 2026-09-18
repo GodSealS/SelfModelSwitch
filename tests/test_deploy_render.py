@@ -222,6 +222,9 @@ def test_lab_render_writes_consistent_deployment_artifacts(tmp_path) -> None:
     scheduler_unit = (output / "model-scheduler.service").read_text()
     assert "BindsTo=mnt-model\\x2dssd.mount" in scheduler_unit
     assert "BindsTo=llama-swap.service" not in scheduler_unit
+    # P17/C08: the runtime dir that hosts control.sock is provisioned group-private
+    assert "RuntimeDirectory=model-scheduler self-model-switch" in scheduler_unit
+    assert "RuntimeDirectoryMode=0750" in scheduler_unit
 
 
 def test_production_rejects_unmeasured_or_placeholder_input(tmp_path) -> None:

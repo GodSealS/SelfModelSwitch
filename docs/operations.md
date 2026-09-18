@@ -48,6 +48,31 @@ the configured SSD mount identity and all declared model file hashes before it
 executes Docker. A failed check must remain a failed start; do not bypass it by
 running `docker run` manually.
 
+## Control socket and client group
+
+The v2 config (`schema_version: 2`) serves local clients over the Unix socket
+`control.socket_path` (default `/run/self-model-switch/control.sock`). Identity
+comes from the kernel's peer credential of the accepted socket only — never
+from a header or body (C08). The scheduler:
+
+* creates the socket itself as `model-scheduler`, mode `0660`, group
+  `control.peer_group` when configured, and refuses to start if the parent
+  directory is world-accessible;
+* admits only uids listed in `control.allowed_uids`; any other uid is closed
+  before one byte of HTTP is parsed. One allowed uid is one `uid:<decimal>`
+  owner; different processes of the same uid are the same owner (first
+  release does not claim same-uid isolation);
+* keeps `/internal/*` off the TCP listener — TCP control paths answer 404.
+
+Deployment checklist: create the client group, add service and client users to
+it (`getent group <peer_group>`), and note that `RuntimeDirectory` already
+provisions `/run/self-model-switch` at `0750`. The chown only succeeds when
+the service account can grant that group — membership, not root, is the
+requirement; a failure is a startup refusal with the reason in the log, not a
+silent permission downgrade. The two-real-UID gate case (S suite) runs on
+Linux with a provisioned second uid; it skips elsewhere and never counts as
+passed on a skip.
+
 ## SSD loss and recovery
 
 When the SSD mount disappears, scheduler admission must fail before models are
