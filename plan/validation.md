@@ -591,7 +591,8 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | status | software_only |
 | source_commit | `dfb8ec15045076812f267e5799ba7e925915a7e0`（P13 记录提交，起点） |
 | implementation_commit | `74d3f63385b8ec27a0ec92f4e63e3a9080b8bcc9` |
-| target_commit | 待同步 |
+| record_commit | `6f902d8504585ecc6099e9fff3a2d3fb93c7e0e3` |
+| target_commit | `6f902d8504585ecc6099e9fff3a2d3fb93c7e0e3`（fast-forward，工作区为空） |
 | candidate_sha256 | null（本任务不产出候选） |
 | python_version | 3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`） |
 | evidence_directory | 无新目标证据目录；fixture 钉扎 M00 路径，未重采活协议 body |
@@ -608,6 +609,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 | `pytest tests -m 'not thor' -q` | 0 | `536 passed, 1 deselected`（P13 基线 519） |
 | `ruff check .` | 0 | 通过 |
 | `run.py --check-config` | 0 | `schema_version=1` 旧四 ID |
+| 目标 `pytest tests/test_llama_adapter.py tests/test_gateway.py -q` | 0 | `30 passed`（Python 3.12.14，HEAD=`6f902d8`） |
 
 ### 3. 关键事实
 

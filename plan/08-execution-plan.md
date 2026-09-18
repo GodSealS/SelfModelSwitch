@@ -1022,8 +1022,8 @@ claims 固定为 `boot_id/owner/model_id/session_id/execution_id/expires_at` 的
 - [x] 新runtime无profile直接拒绝；scheduler进程依赖不含Torch/ORT；adapter无业务job/stage。
 **Verification:** `python -m pytest tests/test_llama_adapter.py tests/test_gateway.py -q`；目标记录真实协议fixture及同步/停止证据，fixture含敏感输入时先脱敏并保留hash关联。
 
-**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `dfb8ec1`（P13 记录提交）；实现提交 `74d3f63385b8ec27a0ec92f4e63e3a9080b8bcc9`；
-python=3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`）。
+**本轮执行记录（2026-09-18）:** status=software_only；起点 commit `dfb8ec1`（P13 记录提交）；实现提交 `74d3f63385b8ec27a0ec92f4e63e3a9080b8bcc9`；记录提交 `6f902d8504585ecc6099e9fff3a2d3fb93c7e0e3`；
+python=3.12.11（开发机）/3.12.14（目标 lab venv）。
 `pytest tests/test_llama_adapter.py tests/test_gateway.py -q` = 30 passed（实现前 adapter 模块不存在，14 项失败，即 RED）；
 `pytest tests/test_llama_adapter.py tests/test_gateway.py tests/test_backend_router.py -q` = 37 passed；
 `pytest tests -m 'not thor' -q` = 536 passed, 1 deselected（P13 基线 519）；`ruff check .` exit 0；`run.py --check-config` 仍为 v1 四 ID。
@@ -1031,7 +1031,8 @@ python=3.12.11（开发机 `/Users/monster/.local/share/selfmodelswitch/venv312`
 `backend_router.register` 拒绝 adapter 声明的 `profile_id` 与 runtime 不一致；`gateway.open` 显式 `follow_redirects=False`。`requirements.in`/`requirements.lock` 不含 torch/onnxruntime；adapter 源码无 job/stage。
 新增 `tests/fixtures/llama_cpp_v1.json`：路径与 M00 探测一致（`/health`、`/slots`、`/tokenize`、`/apply-template`、`/v1/chat/completions`），`trusted_for_device_quiescence=false`，`fallback_termination=independent_STOPPED`。fixture 不含媒体原文。
 **Files touched:** `model_scheduler/adapters/__init__.py`（新增）、`model_scheduler/adapters/llama_cpp.py`（新增）、`tests/test_llama_adapter.py`（新增）、`tests/fixtures/llama_cpp_v1.json`（新增）、`model_scheduler/backend_router.py`、`model_scheduler/gateway.py`、`tests/test_gateway.py`。
-未解决：①本轮未在目标机对活的 llama-server 重采协议 body hash，也未做真实推理/停止证据（属目标核验；fixture 目前为 M00 路径钉扎，`acceptance_status=protocol_pinned_from_m00`）；②execution 服务接线属 P14/P16；③vision 的 Blob 输入与完整 envelope 边界属 P20。
+**目标核验**：干净 checkout fast-forward 到 `6f902d8`；`pytest tests/test_llama_adapter.py tests/test_gateway.py -q` = 30 passed（Python 3.12.14）。未启动模型、未重采活 llama-server body hash。
+未解决：①本轮未在目标机对活的 llama-server 重采协议 body hash，也未做真实推理/停止证据（fixture 目前为 M00 路径钉扎，`acceptance_status=protocol_pinned_from_m00`）；②execution 服务接线属 P14/P16；③vision 的 Blob 输入与完整 envelope 边界属 P20。
 
 ### P16 — backend load/execute/cancel/stop完整接线（M04）
 
