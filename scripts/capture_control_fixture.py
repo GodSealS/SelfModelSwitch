@@ -350,9 +350,19 @@ def capture(
             payload = json.loads(answer["body_utf8"])
         except json.JSONDecodeError as exc:
             raise CaptureError(f"/running did not return JSON: {exc}") from exc
-        models = payload.get("running") if isinstance(payload, dict) else None
-        if not isinstance(models, list) or any(not isinstance(item, str) for item in models):
+        entries = payload.get("running") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
             raise CaptureError(f"/running did not return a running list: {payload!r}")
+        # Measured v217 shape: each entry is an object describing the upstream
+        # (model, name, proxy, state, ttl, cmd, description), not a bare id.
+        models: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise CaptureError(f"/running entry is not an object: {entry!r}")
+            name = entry.get("model")
+            if not isinstance(name, str) or not name:
+                raise CaptureError(f"/running entry has no model name: {entry!r}")
+            models.append(name)
         return models
 
     try:

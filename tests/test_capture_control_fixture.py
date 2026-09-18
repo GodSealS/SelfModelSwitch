@@ -213,7 +213,12 @@ def test_probe_files_refuse_non_loopback_endpoints() -> None:
 def test_capture_records_requests_answers_and_negative_samples(tmp_path: Path) -> None:
     module = _capture_module()
     seen: list[tuple[str, str]] = []
-    running_answers = [b'{"running": []}', b'{"running": ["qwen25vl-7b-q4"]}', b'{"running": []}']
+    # Measured v217 shape: /running lists upstream objects, not bare model ids.
+    loaded_entry = (
+        b'{"running": [{"model": "qwen25vl-7b-q4", "name": "", "proxy": "http://localhost:5800",'
+        b' "state": "ready", "ttl": 0, "cmd": "docker run ...", "description": ""}]}'
+    )
+    running_answers = [b'{"running": []}', loaded_entry, b'{"running": []}']
 
     def fake_http(base_url: str, method: str, path: str, *, timeout: float) -> dict:
         seen.append((method, path))
@@ -246,6 +251,8 @@ def test_capture_records_requests_answers_and_negative_samples(tmp_path: Path) -
     assert "running_empty" in steps
     assert "load_trigger" in steps
     assert "running_loaded" in steps
+    loaded = next(entry for entry in record["exchanges"] if entry["step"] == "running_loaded")
+    assert loaded["running"] == ["qwen25vl-7b-q4"]
     assert "unload" in steps
     assert record["negative_samples"][0]["counts_as_success"] is False
     assert record["negative_samples"][0]["status"] == 404
