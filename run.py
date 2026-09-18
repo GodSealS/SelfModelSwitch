@@ -153,11 +153,12 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
         ttl_seconds=policy.ttl_seconds, prepare_seconds=policy.prepare_limit_seconds,
         stop_grace_seconds=policy.stop_grace_seconds, cleanup_seconds=policy.cleanup_limit_seconds,
     )
+    idempotency = IdempotencyStore()
     runtime = build_managed_execution(
         boot_id=boot_id, deployment=registration, deployment_id=deployment_id, book=book,
         resources=resources, control=control, clients=clients, observers=observers,
         inference_base_urls=inference_base_urls, blobs=blobs, sessions=sessions,
-        tokens=tokens, idempotency=IdempotencyStore(),
+        tokens=tokens, idempotency=idempotency,
         scheduler_kwargs={
             "queue_capacity": config.scheduler.queue_capacity,
             "priority_aging_seconds": config.scheduler.priority_aging_seconds,
@@ -171,11 +172,12 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
     return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
                          lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
                          recovery=recovery, observers=dict(observers), config=config,
-                         extras={"runtime": runtime, "clients": clients})
+                         extras={"runtime": runtime, "clients": clients, "idempotency": idempotency})
 
 
 def serve_v2(context: RunContextV2) -> None:
     """Reconcile, recover blobs, then run both listeners over ONE lifespan."""
+    from model_scheduler.control_api import ControlAPI
     from model_scheduler.control_server import ControlServer, build_control_app, build_tcp_skeleton_app
 
     config = context.config
@@ -190,7 +192,10 @@ def serve_v2(context: RunContextV2) -> None:
         await context.blobs.recover(instances_running=False, boot_id=context.boot_id)
         app = build_tcp_skeleton_app(boot_id=context.boot_id, scheduler=context.scheduler,
                                       shutdown_grace_seconds=config.server.shutdown_grace_seconds)
-        control = ControlServer(build_control_app(boot_id=context.boot_id),
+        api = ControlAPI(boot_id=context.boot_id, blobs=context.blobs, scheduler=context.scheduler,
+                         service=context.service, tokens=context.tokens,
+                         idempotency=context.extras.get("idempotency"))
+        control = ControlServer(build_control_app(boot_id=context.boot_id, api=api),
                                 socket_path=config.control.socket_path,
                                 allowed_uids=config.control.allowed_uids,
                                 peer_group=config.control.peer_group)

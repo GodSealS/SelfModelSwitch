@@ -37,6 +37,7 @@ from model_scheduler.control_server import (
     build_tcp_skeleton_app,
     peer_uid_of,
 )
+from model_scheduler.idempotency import IdempotencyStore
 
 
 @pytest.fixture
@@ -259,6 +260,8 @@ def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) 
     assert sorted(context.book.specs) == ["embedding", "qwen-small"]
     # one scheduler behind one service behind one lifecycle: the context is the single join
     assert context.service._scheduler is context.scheduler
+    assert context.service._tokens is context.tokens  # one authority signs and verifies every token (P18)
+    assert isinstance(context.extras["idempotency"], IdempotencyStore)  # shared by the routes and the service
     assert context.lifecycle.instance("embedding") is None  # nothing loaded yet, and no guessed identity
 
 
