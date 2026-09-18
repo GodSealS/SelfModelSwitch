@@ -17,7 +17,8 @@ import sys
 from . import EXIT_FAILED, EXIT_INPUT, EXIT_OK
 from .collect import FactsError, collect_facts
 
-_NOT_YET = ("run", "merge", "verify")
+_NOT_YET = ("merge", "verify")
+ACCEPTANCE_LAYERS = frozenset({"S", "B", "O"})
 
 
 class InputError(RuntimeError):
@@ -97,6 +98,25 @@ def _source(args) -> int:
     return EXIT_OK
 
 
+def _run(args) -> int:
+    """`run --layers` validates its inputs and refuses until the orchestration exists.
+
+    The B executor (P23) and the O executor (P24) are logic with injected drivers;
+    the real layer run needs the deployment's official API driver and the P29
+    environment. Refusing here is honest: no partial run is written and no layer
+    can be claimed as executed.
+    """
+    layers = [layer.strip() for layer in args.layers.split(",") if layer.strip()]
+    if not layers or any(layer not in ACCEPTANCE_LAYERS for layer in layers):
+        raise InputError(f"--layers must be a comma-separated subset of {sorted(ACCEPTANCE_LAYERS)}, got {args.layers!r}")
+    if len(set(layers)) != len(layers):
+        raise InputError(f"--layers repeats a layer: {args.layers!r}")
+    require_fresh_output(args.output / "run.json")
+    print(f"run: layer orchestration for {sorted(layers)} is not wired yet: the B/O executors are delivered as "
+          "logic with injected drivers (P23/P24) and the real run belongs to P29", file=sys.stderr)
+    return EXIT_FAILED
+
+
 def _candidate(args) -> int:
     from .candidate import CandidateError, build_candidate
 
@@ -137,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
     source_parser.add_argument("--root", type=Path, required=True)
     source_parser.add_argument("--output", type=Path, required=True)
 
+    run_parser = sub.add_parser("run", help="execute acceptance layers against one frozen candidate")
+    run_parser.add_argument("--candidate", type=Path, required=True)
+    run_parser.add_argument("--layers", required=True, help="comma-separated subset of S,B,O")
+    run_parser.add_argument("--output", type=Path, required=True)
+
     candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
     candidate_parser.add_argument("--config", type=Path, required=True)
     candidate_parser.add_argument("--facts", type=Path, required=True)
@@ -165,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             return _source(args)
         if args.command == "candidate":
             return _candidate(args)
+        if args.command == "run":
+            return _run(args)
         raise InputError(f"`{args.command}` is not implemented yet: the plan assigns it to a later task")
     except (InputError, FactsError) as exc:
         print(f"{args.command}: {exc}", file=sys.stderr)
