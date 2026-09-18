@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -12,8 +13,10 @@ import pytest
 from model_scheduler.config import load_config
 from model_scheduler.control_recovery import ControlRecoveryClient
 from model_scheduler.contracts import MemorySample
+from model_scheduler.contracts_v2 import DeploymentSpec, Envelope, RuntimeSpec
+from model_scheduler.contracts_v2 import ModelSpec as RegisteredModelSpec
 from model_scheduler.llama_swap_client import ControlRequest, LlamaSwapControlContract
-from model_scheduler.runtime import RuntimeCompositionError, build_backend, build_scheduler
+from model_scheduler.runtime import RuntimeCompositionError, build_backend, build_scheduler, ledger_specs_from
 from app import create_app
 from run import main
 
@@ -42,6 +45,72 @@ def test_runtime_builder_defaults_to_a_fail_closed_storage_guard() -> None:
     scheduler = build_scheduler(config, Backend(), resources=Resources())
     assert scheduler.admission_guard is not None
     assert isinstance(scheduler.recovery, ControlRecoveryClient)
+
+
+def _registered_model(model_id: str, runtime_id: str = "llama-cpp-gguf-v1", *, port: int = 18081) -> RegisteredModelSpec:
+    return RegisteredModelSpec(
+        model_id=model_id,
+        runtime_id=runtime_id,
+        capabilities=("chat",),
+        assets=(),
+        port=port,
+        envelope=Envelope(4096, 2048, 512, 1, 0, 0, 0),
+        timeout_seconds=600,
+        reserved_bytes=1_150,
+        measured=True,
+        measurement_ref="a" * 64,
+        physical_resident_peak_bytes=2_000,
+    )
+
+
+def _registration(*models: RegisteredModelSpec) -> DeploymentSpec:
+    return DeploymentSpec(
+        runtimes=(
+            RuntimeSpec(
+                runtime_id="llama-cpp-gguf-v1",
+                profile_id="gguf-v1",
+                image_digest="sha256:" + "b" * 64,
+                adapter_sha256="c" * 64,
+                lock_sha256="d" * 64,
+                startup_args=(),
+            ),
+        ),
+        models=models,
+    )
+
+
+def test_ledger_specs_come_from_exactly_one_registration_source() -> None:
+    config = load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    registration = _registration(_registered_model("lab-a"))
+
+    assert set(ledger_specs_from(config=config)) == set(config.models)
+    assert set(ledger_specs_from(registration=registration)) == {"lab-a"}
+    with pytest.raises(ValueError):
+        ledger_specs_from()
+    with pytest.raises(ValueError):
+        ledger_specs_from(config=config, registration=registration)
+
+
+def test_ledger_specs_from_a_v2_registration_reject_duplicates_and_unknown_runtimes() -> None:
+    duplicated = _registration(_registered_model("lab-a"), _registered_model("lab-a", port=18082))
+    with pytest.raises(ValueError, match="duplicate"):
+        ledger_specs_from(registration=duplicated)
+
+    unknown_runtime = _registration(_registered_model("lab-a", runtime_id="hf-sharded-v1"))
+    with pytest.raises(ValueError, match="unknown runtimes"):
+        ledger_specs_from(registration=unknown_runtime)
+
+
+def test_build_scheduler_accounts_the_v1_legacy_margin_exactly_once() -> None:
+    config = load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    scheduler = build_scheduler(config, Backend(), resources=Resources(), storage_guard=lambda: True)
+    margin = config.scheduler.resource_safety_margin
+
+    assert scheduler.book.physical_enforced is False
+    for model_id, spec in scheduler.book.specs.items():
+        assert scheduler.book.required(model_id) == math.ceil(spec.reserved_bytes * (1 + margin)), model_id
+        assert scheduler.book.ledger_spec(model_id).physical_reserved_bytes is None
+    assert scheduler.book.committed == 0  # the legacy bootstrap follows an observed stop, so nothing is reserved
 
 
 def test_app_factory_composes_runtime_when_control_backend_is_injected() -> None:

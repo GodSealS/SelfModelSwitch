@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from .backend_control import LlamaSwapBackend, ManagedModel
 from .deploy import DeployError
 from .config import AppConfig, model_specs
+from .contracts_v2 import DeploymentSpec
 from .control_recovery import ControlRecoveryClient, DeploymentRecovery, ReconcileOutcome
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
 from .model_registry import Book
@@ -118,6 +119,27 @@ async def reconcile_startup(
     return StartupReconciliation(True, None, frozenset(confirmed), frozenset(), ())
 
 
+def ledger_specs_from(*, config: AppConfig | None = None, registration: DeploymentSpec | None = None) -> dict[str, Any]:
+    """Exactly one registration source becomes the book's ledger specs (C02).
+
+    The v1 configuration crosses the compatibility boundary with its legacy
+    percent margin; a v2 registration carries R (and its physical peak) already
+    and is passed through unchanged, so no margin is ever applied twice.
+    """
+    if (config is None) == (registration is None):
+        raise ValueError("exactly one of config or registration is required")
+    if config is not None:
+        return model_specs(config)
+    models = {model.model_id: model for model in registration.models}
+    if len(models) != len(registration.models):
+        raise ValueError("the registration declares duplicate model ids")
+    runtimes = {runtime.runtime_id for runtime in registration.runtimes}
+    unknown = {model.runtime_id for model in registration.models} - runtimes
+    if unknown:
+        raise ValueError(f"models reference unknown runtimes: {sorted(unknown)}")
+    return models
+
+
 def build_scheduler(
     config: AppConfig,
     backend: Any,
@@ -140,7 +162,7 @@ def build_scheduler(
     if budget <= 0:
         raise ValueError("system memory cannot satisfy configured reserves")
     book = Book(
-        model_specs(config),
+        ledger_specs_from(config=config),
         model_budget=budget,
         free_floor=config.scheduler.min_free_memory_bytes,
         margin=config.scheduler.resource_safety_margin,

@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Outcome, State
-from model_scheduler.model_registry import Book, Conflict, StaleOperation
+from model_scheduler.contracts_v2 import Envelope
+from model_scheduler.contracts_v2 import ModelSpec as RegisteredModelSpec
+from model_scheduler.contracts_v2 import physical_reserved_bytes_from_peak, reserved_bytes_from_peak
+from model_scheduler.model_registry import STOP_RESAMPLE_GRACE_SECONDS, Book, Conflict, StaleOperation
 
 
 def make_book(concurrency: int = 1) -> Book:
@@ -117,3 +120,179 @@ def test_switch_freeze_blocks_new_leases_without_revoking_existing_lease() -> No
         book.acquire_ready("a", "new", 1)
     book.unfreeze_switch(["a"])
     assert book.acquire_ready("a", "new", 1).model_id == "a"
+
+
+# ---------------------------------------------------------------------------
+# P08: the unified spec boundary and the two C02 ledgers.
+# ---------------------------------------------------------------------------
+
+
+def registered(model_id: str, *, measured_peak: int, physical_peak: int | None, port: int = 18081, parallel: int = 1) -> RegisteredModelSpec:
+    return RegisteredModelSpec(
+        model_id=model_id,
+        runtime_id="llama-cpp-gguf-v1",
+        capabilities=("chat",),
+        assets=(),
+        port=port,
+        envelope=Envelope(
+            ctx_size=4096,
+            max_input_tokens=2048,
+            max_output_tokens=512,
+            max_parallel=parallel,
+            max_image_tokens=0,
+            max_image_edge_pixels=0,
+            max_images=0,
+        ),
+        timeout_seconds=600,
+        reserved_bytes=reserved_bytes_from_peak(measured_peak),
+        measured=physical_peak is not None,
+        measurement_ref="a" * 64 if physical_peak is not None else None,
+        physical_resident_peak_bytes=physical_peak,
+    )
+
+
+def test_v1_legacy_margin_is_applied_exactly_once() -> None:
+    specs = {"a": ModelSpec("a", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=2)}
+    book = Book(specs, model_budget=1000, free_floor=20, margin=0.15)
+
+    assert book.required("a") == 115  # ceil(100 * 1.15), never multiplied twice
+    assert book.ledger_spec("a").effective_reserved_bytes == 115
+    assert book.committed == 115
+    assert book.ledger_spec("a").physical_reserved_bytes is None
+    assert book.physical_enforced is False
+    assert book.ledger_spec("a").max_concurrency == 2
+
+
+def test_v2_registration_is_accounted_without_a_second_margin() -> None:
+    spec = registered("lab-a", measured_peak=1000, physical_peak=2000)
+    book = Book({"lab-a": spec}, model_budget=10_000, free_floor=20, margin=0.15)
+
+    assert spec.reserved_bytes == reserved_bytes_from_peak(1000) == 1150
+    assert book.required("lab-a") == 1150
+    assert book.physical_required("lab-a") == physical_reserved_bytes_from_peak(2000) == 2300
+    assert book.physical_enforced is True
+
+
+def test_both_ledgers_hold_unknown_error_and_unterminated_launches() -> None:
+    spec = registered("lab-a", measured_peak=1000, physical_peak=2000, parallel=3)
+    book = Book({"lab-a": spec}, model_budget=10_000, free_floor=0, margin=0)
+
+    assert book.runtime["lab-a"].state is State.UNKNOWN
+    assert (book.committed, book.physical_committed) == (1150, 2300)  # never observed: still on both books
+
+    book.bootstrap_stopped("lab-a")
+    assert (book.committed, book.physical_committed) == (0, 0)  # an observed stop releases both
+
+    operation = book.begin_load("lab-a", MemorySample(10_000, 9_000, 0), 0)
+    assert book.runtime["lab-a"].state is State.LOADING
+    assert (book.committed, book.physical_committed) == (1150, 2300)  # an unterminated launch keeps both
+
+    book.failed(operation, "load_timeout")
+    assert book.runtime["lab-a"].state is State.ERROR
+    assert (book.committed, book.physical_committed) == (1150, 2300)  # an error keeps both
+
+    cleanup = book.begin_cleanup(["lab-a"])[0]
+    book.stopped(cleanup)
+    assert (book.committed, book.physical_committed) == (0, 0)  # only a proven stop releases both
+
+
+def test_a_failed_stop_keeps_both_ledgers() -> None:
+    specs = {"lab-a": registered("lab-a", measured_peak=1000, physical_peak=2000)}
+    book = Book(specs, model_budget=10_000, free_floor=0, margin=0)
+    book.bootstrap_stopped("lab-a")
+    operation = book.begin_load("lab-a", MemorySample(10_000, 9_000, 0), 0)
+    book.loaded(operation, 0)
+    eviction = book.begin_eviction(["lab-a"])[0]
+
+    book.failed(eviction, "stop_timeout")  # a cancelled task is not evidence that work stopped
+
+    assert book.runtime["lab-a"].state is State.ERROR
+    assert (book.committed, book.physical_committed) == (1150, 2300)
+
+
+def test_model_budget_equality_and_one_byte_boundary() -> None:
+    def two_models(second: int) -> Book:
+        specs = {
+            "a": ModelSpec("a", "http://127.0.0.1:10001", frozenset({Capability.CHAT}), 100, max_concurrency=1),
+            "b": ModelSpec("b", "http://127.0.0.1:10002", frozenset({Capability.CHAT}), second, max_concurrency=1),
+        }
+        book = Book(specs, model_budget=200, free_floor=20, margin=0)
+        for model_id in specs:
+            book.bootstrap_stopped(model_id)
+        load(book, "a")
+        return book
+
+    exact = two_models(100)
+    assert exact.committed + exact.required("b") == exact.model_budget
+    assert exact.can_load("b", MemorySample(1_000, 120, 0), 0.5)
+    assert not exact.can_load("b", MemorySample(1_000, 119, 0), 0.5)  # one byte short of N + F
+
+    over = two_models(101)
+    assert over.committed + over.required("b") == over.model_budget + 1
+    assert not over.can_load("b", MemorySample(1_000, 999, 0), 0.5)  # one byte over B
+
+
+def test_physical_ledger_equality_and_one_byte_boundary() -> None:
+    def two_models(budget: int) -> Book:
+        specs = {
+            "lab-a": registered("lab-a", measured_peak=1000, physical_peak=2000),
+            "lab-b": registered("lab-b", measured_peak=1000, physical_peak=2000, port=18082),
+        }
+        book = Book(specs, model_budget=budget, free_floor=0, margin=0)
+        for model_id in specs:
+            book.bootstrap_stopped(model_id)
+        operation = book.begin_load("lab-a", MemorySample(10_000, 9_000, 0), 0)
+        book.loaded(operation, 0)
+        return book
+
+    exact = two_models(4600)  # 2300 + 2300 == B, while the model ledger only commits 1150 + 1150
+    assert exact.committed + exact.required("lab-b") == 2300
+    assert exact.physical_committed + 2300 == exact.model_budget
+    assert exact.can_load("lab-b", MemorySample(10_000, 10_000, 0), 0.5)
+
+    tight = two_models(4599)
+    assert tight.committed + tight.required("lab-b") <= tight.model_budget
+    assert not tight.can_load("lab-b", MemorySample(10_000, 10_000, 0), 0.5)  # the physical gate is one byte over
+
+
+def test_an_unmeasured_model_is_refused_once_the_physical_ledger_governs() -> None:
+    specs = {
+        "lab-a": registered("lab-a", measured_peak=1000, physical_peak=2000),
+        "lab-b": registered("lab-b", measured_peak=1000, physical_peak=None, port=18082),
+    }
+    book = Book(specs, model_budget=100_000, free_floor=0, margin=0)
+    for model_id in specs:
+        book.bootstrap_stopped(model_id)
+
+    assert book.physical_enforced is True
+    assert book.physical_required("lab-b") is None
+    assert book.can_load("lab-a", MemorySample(10_000, 10_000, 0), 0.5)
+    assert not book.can_load("lab-b", MemorySample(10_000, 10_000, 0), 0.5)
+
+
+def test_sample_age_two_second_boundary_and_future_timestamps() -> None:
+    book = make_book()
+    load(book, "a", 0)
+    sample = MemorySample(1_000, 900, 10.0)
+
+    assert book.sample_valid(sample, 12.0)
+    assert book.can_load("b", sample, 12.0)
+    assert not book.sample_valid(sample, 12.0001)
+    assert not book.can_load("b", sample, 12.0001)
+    assert not book.sample_valid(sample, 9.999)  # a future timestamp is not a sample
+    assert not book.can_load("b", sample, 9.999)
+
+
+def test_a_proven_stop_needs_a_sample_newer_than_the_stop() -> None:
+    book = make_book()
+    load(book, "a")
+    operations = book.begin_eviction(["a"])
+    book.stopped(operations[0], now=50.0)
+
+    assert book.runtime["a"].state is State.UNLOADED
+    assert book.committed == 0
+    assert book.runtime["a"].stopped_at == 50.0
+    assert not book.can_load("a", MemorySample(1_000, 900, 49.5), 50.6)  # taken before the stop
+    assert book.can_load("a", MemorySample(1_000, 900, 50.5), 51.0)
+    assert book.stop_settled("a", 50.0 + STOP_RESAMPLE_GRACE_SECONDS)
+    assert not book.stop_settled("a", 50.0 + STOP_RESAMPLE_GRACE_SECONDS - 0.001)

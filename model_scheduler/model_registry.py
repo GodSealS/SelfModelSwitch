@@ -1,17 +1,34 @@
-"""Atomic, I/O-free state transitions for model residency and leases.
+"""Atomic, I/O-free state transitions for model residency, leases and the two ledgers.
 
 Every method is called while the scheduler's single asyncio.Condition is held.
 The class intentionally performs no await or external observation: a state change
 is committed before I/O starts, and async callers reconcile results with the
 operation token afterwards.
+
+The book keeps the C02 accounting for every model that is not proven stopped:
+
+* the model budget B counts `effective_reserved_bytes` (R). A v2 registration's
+  measured `reserved_bytes` is already R and is used as-is; a legacy v1 peak gets
+  the historical `margin` applied exactly once at that compatibility boundary.
+* the static physical budget counts `ceil(physical_resident_peak*1.15)` of the
+  same set. It only exists once at least one registration carries a measured
+  physical peak; an unmeasured model in such a book is refused instead of being
+  guessed at, and a legacy book (no physical figures) keeps its single ledger.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from typing import Any
 from uuid import uuid4
 
 from .contracts import Lease, MemorySample, ModelSpec, Operation, Outcome, State
+from .contracts_v2 import ModelSpec as RegisteredModelSpec
+from .contracts_v2 import effective_reserved_bytes, physical_reserved_bytes_from_peak
+
+# C02: after a proven stop the next admission needs a sample taken after the
+# stop, and the scheduler waits at most this long for the memory to come back.
+STOP_RESAMPLE_GRACE_SECONDS = 10.0
 
 
 class Conflict(RuntimeError):
@@ -37,35 +54,112 @@ class Runtime:
     total_requests: int = 0
     total_tokens: int = 0
     usage_unknown_requests: int = 0
+    stopped_at: float | None = None
+
+
+@dataclass(frozen=True)
+class LedgerSpec:
+    """The single internal registration shape the book accounts for (C02)."""
+
+    model_id: str
+    effective_reserved_bytes: int
+    physical_reserved_bytes: int | None = None
+    max_concurrency: int = 1
+    pinned: bool = False
+    evictable: bool = True
+    preload: bool = False
+    ttl_seconds: float = 0
+    priority: int = 0
+
+    @classmethod
+    def from_registration(cls, spec: Any, *, legacy_v1_margin: float) -> LedgerSpec:
+        if isinstance(spec, RegisteredModelSpec):
+            peak = spec.physical_resident_peak_bytes
+            return cls(
+                model_id=spec.model_id,
+                effective_reserved_bytes=effective_reserved_bytes(spec.reserved_bytes),
+                physical_reserved_bytes=None if peak is None else physical_reserved_bytes_from_peak(peak),
+                max_concurrency=spec.envelope.max_parallel,
+            )
+        if not isinstance(spec, ModelSpec):
+            raise ValueError(f"unsupported registration for {getattr(spec, 'model_id', spec)!r}")
+        return cls(
+            model_id=spec.model_id,
+            effective_reserved_bytes=effective_reserved_bytes(spec.reserved_bytes, legacy_v1_margin=legacy_v1_margin),
+            max_concurrency=spec.max_concurrency,
+            pinned=spec.pinned,
+            evictable=spec.evictable,
+            preload=spec.preload,
+            ttl_seconds=spec.ttl_seconds,
+            priority=spec.priority,
+        )
 
 
 class Book:
     """The one authoritative accounting book for all managed models."""
 
-    def __init__(self, specs: dict[str, ModelSpec], *, model_budget: int, free_floor: int, margin: float = 0.15, max_sample_age: float = 2, half_life: float = 1800, request_weight: float = 1, token_weight: float = 0.0001):
+    def __init__(self, specs: dict[str, Any], *, model_budget: int, free_floor: int, margin: float = 0.15, max_sample_age: float = 2, half_life: float = 1800, request_weight: float = 1, token_weight: float = 0.0001):
         if model_budget <= 0 or free_floor < 0 or not 0 <= margin <= 1:
             raise ValueError("invalid memory policy")
         if max_sample_age <= 0 or half_life <= 0 or request_weight < 0 or token_weight < 0:
             raise ValueError("invalid time or heat policy")
-        if not specs or any(mid != spec.model_id or spec.reserved_bytes <= 0 or spec.max_concurrency <= 0 for mid, spec in specs.items()):
+        if not specs or any(mid != spec.model_id for mid, spec in specs.items()):
             raise ValueError("invalid model spec")
         self.model_budget, self.free_floor, self.margin = model_budget, free_floor, margin
         self.specs = specs.copy()
-        self.runtime = {mid: Runtime(reservation=self.required_for(spec)) for mid, spec in specs.items()}
+        self.ledger = {mid: LedgerSpec.from_registration(spec, legacy_v1_margin=margin) for mid, spec in specs.items()}
+        if any(entry.max_concurrency <= 0 for entry in self.ledger.values()):
+            raise ValueError("invalid model spec")
+        self.runtime = {mid: Runtime(reservation=entry.effective_reserved_bytes) for mid, entry in self.ledger.items()}
+        self.physical_enforced = any(entry.physical_reserved_bytes is not None for entry in self.ledger.values())
         self.max_sample_age, self.half_life = max_sample_age, half_life
         self.request_weight, self.token_weight = request_weight, token_weight
         self.epoch = 0
         self.recovering = False
 
-    def required_for(self, spec: ModelSpec) -> int:
-        return math.ceil(spec.reserved_bytes * (1 + self.margin))
+    def ledger_spec(self, model_id: str) -> LedgerSpec:
+        return self.ledger[model_id]
+
+    def required_for(self, spec: Any) -> int:
+        return self.required(spec.model_id)
 
     def required(self, model_id: str) -> int:
-        return self.required_for(self.specs[model_id])
+        return self.ledger[model_id].effective_reserved_bytes
+
+    def physical_required(self, model_id: str) -> int | None:
+        return self.ledger[model_id].physical_reserved_bytes
 
     @property
     def committed(self) -> int:
         return sum(item.reservation for item in self.runtime.values())
+
+    @property
+    def physical_committed(self) -> int:
+        """The static physical figure of every model that is not proven stopped."""
+        return sum(
+            self.ledger[model_id].physical_reserved_bytes or 0
+            for model_id, runtime in self.runtime.items()
+            if runtime.reservation > 0
+        )
+
+    def physical_admissible(self, model_id: str) -> bool:
+        """C02 static physical gate; a legacy book has no physical ledger to check."""
+        if not self.physical_enforced:
+            return True
+        figure = self.ledger[model_id].physical_reserved_bytes
+        if figure is None:
+            return False  # an unmeasured model cannot be accounted, so it is not admitted
+        others = sum(
+            self.ledger[other_id].physical_reserved_bytes or 0
+            for other_id, runtime in self.runtime.items()
+            if other_id != model_id and runtime.reservation > 0
+        )
+        return others + figure <= self.model_budget
+
+    def stop_settled(self, model_id: str, now: float) -> bool:
+        """True once the post-stop reclamation window has elapsed (C02: at most 10s)."""
+        stopped_at = self.runtime[model_id].stopped_at
+        return stopped_at is not None and now - stopped_at >= STOP_RESAMPLE_GRACE_SECONDS
 
     def bootstrap_stopped(self, model_id: str) -> None:
         runtime = self.runtime[model_id]
@@ -76,9 +170,24 @@ class Book:
     def sample_valid(self, sample: MemorySample, now: float) -> bool:
         return 0 <= now - sample.sampled_at <= self.max_sample_age and sample.total_bytes > 0 and 0 <= sample.available_bytes <= sample.total_bytes
 
+    def sample_after_stop(self, model_id: str, sample: MemorySample) -> bool:
+        """C02: a sample taken before the last proven stop cannot admit a load."""
+        stopped_at = self.runtime[model_id].stopped_at
+        return stopped_at is None or sample.sampled_at > stopped_at
+
     def can_load(self, model_id: str, sample: MemorySample, now: float) -> bool:
         runtime, required = self.runtime[model_id], self.required(model_id)
-        return (not self.recovering and runtime.state is State.UNLOADED and not runtime.leases and not runtime.admission_blocked and self.sample_valid(sample, now) and sample.available_bytes >= self.free_floor + required and self.committed + required <= self.model_budget)
+        return (
+            not self.recovering
+            and runtime.state is State.UNLOADED
+            and not runtime.leases
+            and not runtime.admission_blocked
+            and self.sample_valid(sample, now)
+            and self.sample_after_stop(model_id, sample)
+            and sample.available_bytes >= self.free_floor + required
+            and self.committed + required <= self.model_budget
+            and self.physical_admissible(model_id)
+        )
 
     def begin_load(self, model_id: str, sample: MemorySample, now: float) -> Operation:
         if not self.can_load(model_id, sample, now):
@@ -116,8 +225,8 @@ class Book:
         runtime.heat_value, runtime.heat_updated_at = self._heat(runtime, now) + amount, now
 
     def acquire_ready(self, model_id: str, request_id: str, now: float) -> Lease:
-        runtime, spec = self.runtime[model_id], self.specs[model_id]
-        if self.recovering or runtime.state is not State.READY or runtime.admission_blocked or len(runtime.leases) >= spec.max_concurrency:
+        runtime = self.runtime[model_id]
+        if self.recovering or runtime.state is not State.READY or runtime.admission_blocked or len(runtime.leases) >= self.ledger[model_id].max_concurrency:
             raise Conflict("model not admissible")
         if any(item.request_id == request_id for candidate in self.runtime.values() for item in candidate.leases.values()):
             raise Conflict("request already owns a lease")
@@ -130,7 +239,7 @@ class Book:
     def can_admit_ready(self, model_id: str, sample: MemorySample, now: float) -> bool:
         runtime = self.runtime[model_id]
         return (not self.recovering and runtime.state is State.READY and not runtime.admission_blocked
-                and len(runtime.leases) < self.specs[model_id].max_concurrency
+                and len(runtime.leases) < self.ledger[model_id].max_concurrency
                 and self.sample_valid(sample, now) and sample.available_bytes >= self.free_floor)
 
     def release(self, lease: Lease, outcome: Outcome, now: float, tokens: int | None = None) -> bool:
@@ -156,7 +265,7 @@ class Book:
         if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):
             raise Conflict("invalid eviction batch")
         for model_id in model_ids:
-            runtime, spec = self.runtime[model_id], self.specs[model_id]
+            runtime, spec = self.runtime[model_id], self.ledger[model_id]
             if runtime.state is not State.READY or runtime.leases or runtime.operation_id or spec.pinned or (automatic and not spec.evictable):
                 raise Conflict("protected or changed candidate")
         result: list[Operation] = []
@@ -176,7 +285,7 @@ class Book:
         if self.recovering or not model_ids or len(set(model_ids)) != len(model_ids):
             raise Conflict("invalid switch freeze")
         for model_id in model_ids:
-            runtime, spec = self.runtime[model_id], self.specs[model_id]
+            runtime, spec = self.runtime[model_id], self.ledger[model_id]
             if (runtime.state is not State.READY or runtime.admission_blocked
                     or runtime.operation_id or spec.pinned or not spec.evictable):
                 raise Conflict("switch candidate changed")
@@ -211,15 +320,17 @@ class Book:
             raise Conflict("cannot roll back")
         runtime.state, runtime.admission_blocked, runtime.operation_id = State.READY, False, None
 
-    def stopped(self, operation: Operation) -> None:
+    def stopped(self, operation: Operation, now: float | None = None) -> None:
+        """Release both ledgers only here: `now` records when the stop was proven."""
         runtime = self._operation(operation)
         if runtime.state is not State.EVICTING or runtime.leases:
             raise Conflict("not safely stopping")
         runtime.state, runtime.operation_id, runtime.reservation = State.UNLOADED, None, 0
         runtime.admission_blocked, runtime.idle_since, runtime.last_error = False, None, None
+        runtime.stopped_at = now
 
     def ttl_due(self, model_id: str, now: float) -> bool:
-        runtime, spec = self.runtime[model_id], self.specs[model_id]
+        runtime, spec = self.runtime[model_id], self.ledger[model_id]
         return (runtime.state is State.READY and not runtime.leases and not runtime.admission_blocked
                 and not spec.pinned and spec.evictable and spec.ttl_seconds > 0
                 and runtime.idle_since is not None and now - runtime.idle_since >= spec.ttl_seconds)
