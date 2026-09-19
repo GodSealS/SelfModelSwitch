@@ -1324,3 +1324,7 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 **因此解除阻塞的第一步应是 P21 遗留的 `calibrate` fresh-run 路径**（用官方启动路径拉起模型 + `MemorySampler` 采样 + stop/quiescence 证明），而不是先造镜像：只有它能把 `physical_resident_peak_bytes` 从 null 变成实测值，从而让 `candidate` 写出第一个真实候选。其后依次是：②镜像按 digest 入库；③真实 `CaseDriver` 与 `run --layers` 编排接线；④重建候选并完整重跑 S/B/O。
 
 本轮**未执行**：fresh-run 校准（需要实现 + 一次独占维护窗口，属下一次会话的第一个任务），也未改动任何镜像/tag。
+
+## P29 补记（2026-09-19）
+
+- **真机 bring-up（2026-09-19，lab）**：llama-swap（cmd 由官方 `render_container_launch` 生成、显式 `proxy` 指向登记端口）+ `run.py`（v2，私有 0700 控制 socket、仅 UID 白名单）已起来；**首次经官方控制 API 完成真实受管执行**：`load active` → `chat succeeded`（`compute_quiescent=True`，输出 Blob）→ `vision succeeded` → `stop closed`，无残留容器。真机共暴露四个产品缺陷并全部修复（capabilities 枚举读取、`acquire` 的 priority、观察者镜像引用、`unload` 的 pinned），驱动的五处按真实 API 修正（operation、幂等键、close token、等 ACTIVE、心跳）。
