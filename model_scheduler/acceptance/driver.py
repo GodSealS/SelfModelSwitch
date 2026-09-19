@@ -277,6 +277,9 @@ class ControlApiCaseDriver:
                                   f"{self.deadline_seconds}s (state {view.get('state')!r})")
             self.sleep(POLL_INTERVAL_SECONDS)
             waited += POLL_INTERVAL_SECONDS
+            # The session must stay alive for the whole execution, not just until it is
+            # submitted: an idle expiry cancels the execution mid-flight.
+            self._beat_if_due(model_id)
             view = self._require(self.transport.request("GET", f"/internal/executions/{execution_id}"),
                                  f"execution read {execution_id}")
         return {"execution_id": execution_id, "state": view.get("state"), "dispatch_state": view.get("dispatch_state"),
