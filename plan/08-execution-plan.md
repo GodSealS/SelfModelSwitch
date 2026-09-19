@@ -1415,6 +1415,11 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
   - **决定性观测（同日，进程内打点）**：执行**确实被派发**——记录从 `queued` 变为 `running`（`dispatch_started/claimed=True`），但同时 `ExecutionService._quiescing` 立刻出现 `['qwen-small']`，随后执行一直 `running`、会话过期后转 `cancelling`。即：**分发没问题，问题是生命周期在派发瞬间判定该实例需要兜底停止（quiesce）**，使执行无法完成。根因方向：**受管观察者无法确认 llama-swap 拉起的容器**（身份标签/端口/健康/启动者之一不匹配），于是把实例视为"未验证"并欠一次 stop。
   - **两个结论（同日，重启后复测）**：
     1. **卡住的 quiescer 会冻结后续派发**（产品问题）：`ExecutionService._dispatch_loop` 遇 `entry.model_id in self._quiescing` 直接跳过，因此长跑进程一旦进入 quiesce 且未清除，之后所有执行都停在 `queued`。重启后同一条请求立即从 `queued` 变为 **`running`** → 需给 quiescer 加超时/清理路径并补单测（"quiesce 卡死不得永久冻结派发"）。
+  - **突破（同日）**：模型容器日志证明**推理真的完成了**——
+    `slot launch_slot_: id 1 | task 1 | processing task` → `prompt eval 235.99 ms / 20 tokens` →
+    `eval 364.31 ms / 10 tokens` → `total time = 600.30 ms / 30 tokens` → `release: stop processing`。
+    即：**受管链路已走到模型并拿到回答**，卡在**结果结算/发布**（`_after_execute` → 输出 Blob 写入/发布 → 终态）而非推理本身。
+  - **据此修正方向**：不必再查适配器的调用超时（模型已答），下一步打点 `_after_execute` 与 `_publish_and_settle`：确认卡在 `report_output`/Blob 写入、quiescence 确认，还是终态发布；并补单测（"后端有响应时执行必须结算，不得停在 running"）。
   - **最后一层观测（同日）**：提交后 25 s 打点，活动协程里**没有** `_run`/`_execute`/`_admit`（只有 `_dispatch_loop` 与 `_run_session_lifecycle`），而记录停在 `running` 且 `dispatch_claimed=True`——即：**记录被认领后执行任务已退出或从未创建，但状态机没有超时兜底**（`_on_timeout` 未生效），执行因此永久停在 `running`。下一步：核对 `ExecutionService._run` 的异常/提前返回路径与 `_on_timeout` 的定时器（缺失或未被 await），补单测（"认领后无活任务必须在时限内终态，不得永远 running"）。
     2. **执行进入 `running` 后仍不终态**（150 s）：模型本身 0.5 s 就能回答（直连已证），故卡在受管 adapter 的调用/结果发布环节（`ExecutionService._execute`）。下一步用同样的 `task.get_stack()` 打出该执行协程的栈，确认卡在哪个 await。
   - **再收缩（同日）**：观察者本身能确认实例（会话期间 `/api/status` 曾显示 `qwen-small.state=ready`，`_identity` 所需的 deployment/model/runtime/config-sha256 标签齐备）。真正触发 quiesce 的是**模型被卸载**——llama-swap 日志里反复出现 `POST /api/models/unload/qwen-small`，模型在派发前后就消失了，生命周期因此判定需兜底停止。下一步：查清卸载来源（受管 lifecycle 的空闲/TTL 策略 vs llama-swap 自身的空闲卸载），让模型在会话/执行期间保持常驻（或让派发等待重新加载完成），并补单测。
