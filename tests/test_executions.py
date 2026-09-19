@@ -262,6 +262,23 @@ async def test_queue_policy_is_per_session_capped_and_deadlined(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_an_unknown_backend_failure_names_itself_in_the_terminal(tmp_path) -> None:
+    """'the backend raised' is not diagnosable; the real reason must survive."""
+    stack = await start_stack(tmp_path, backend=FakeExec(raises=RuntimeError("upstream said 500: too long")))
+    view = await submit(stack)
+
+    assert await eventually(lambda: record_of(stack, view["execution_id"]).terminal_code is not None)
+    # The outcome stays unproven until the device-side proof lands: no terminal is invented.
+    await stack.service.report_terminal(view["execution_id"], terminal_evidence(stack, view))
+    terminal = await stack.service.view(view["execution_id"], owner="uid:1000")
+
+    assert terminal["state"] == "failed"
+    # The reason must be readable: a generic sentence would leave it undiagnosable.
+    assert "RuntimeError" in terminal["error"]["message"]
+    assert "upstream said 500: too long" in terminal["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_deadline_is_capped_by_the_session_hard_deadline(tmp_path) -> None:
     stack = await start_stack(tmp_path, hard_deadline_seconds=10.0, backend=FakeExec(gate=asyncio.Event()))
     view = await submit(stack)

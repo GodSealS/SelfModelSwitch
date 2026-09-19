@@ -700,8 +700,9 @@ class ExecutionService:
         except asyncio.CancelledError:  # pragma: no cover - service never cancels execute
             await self._terminate_uncertain(record, "the execution task was cancelled")
             return
-        except Exception:
-            await self._terminate_uncertain(record, "the backend raised without a trusted terminal")
+        except Exception as exc:  # noqa: BLE001 - an unproven failure keeps its reason
+            failure = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            await self._terminate_uncertain(record, f"the backend raised without a trusted terminal ({failure})")
             return
         backend = self._backend_for(record.model_id)
         body: bytes | None = None
