@@ -154,6 +154,7 @@ def container_fact(model_id: str, container_id: str, *, running: bool) -> dict:
         "Id": container_id,
         "Image": "sha256:" + "d" * 64,
         "Config": {
+            "Image": "test-image@sha256:" + "d" * 64,
             "Labels": {
                 DEPLOYMENT_LABEL: DEPLOYMENT,
                 MODEL_LABEL: model_id,

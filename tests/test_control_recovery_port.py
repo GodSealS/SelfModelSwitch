@@ -134,8 +134,9 @@ class FakeDocker:
 def container_fact(*, running: bool, deployment: str = DEPLOYMENT, container_id: str = CONTAINER_ID, started_at: str = STARTED_AT) -> dict:
     return {
         "Id": container_id,
-        "Image": "sha256:" + "d" * 64,
+        "Image": "sha256:" + "d" * 64,          # the bare ID, as docker reports it
         "Config": {
+            "Image": "test-image@sha256:" + "d" * 64,   # the reference the container was started with
             "Labels": {
                 DEPLOYMENT_LABEL: deployment,
                 MODEL_LABEL: "qwen-small",

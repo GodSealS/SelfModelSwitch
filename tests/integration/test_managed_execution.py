@@ -404,6 +404,7 @@ LAB_MODEL = "lab-qwen"
 LAB_DEPLOYMENT = "orin-lab"
 LAB_RUNTIME = "llama-cpp-gguf-v1"
 LAB_CONFIG_SHA = "f" * 64
+LAB_IMAGE = "repo/llama@sha256:" + "c" * 64   # what the lab deployment launches
 
 
 def lab_deployment():
@@ -447,8 +448,8 @@ class LabDocker:
         self.facts[container_id] = {
             "Id": container_id,
             "Image": "sha256:" + "d" * 64,
-            "Config": {"Labels": {DEPLOYMENT_LABEL: LAB_DEPLOYMENT, MODEL_LABEL: LAB_MODEL,
-                                  RUNTIME_LABEL: LAB_RUNTIME, CONFIG_LABEL: LAB_CONFIG_SHA}},
+            "Config": {"Image": LAB_IMAGE, "Labels": {DEPLOYMENT_LABEL: LAB_DEPLOYMENT, MODEL_LABEL: LAB_MODEL,
+                                                      RUNTIME_LABEL: LAB_RUNTIME, CONFIG_LABEL: LAB_CONFIG_SHA}},
             "State": {"Running": True, "Status": "running", "ExitCode": 0,
                       "StartedAt": f"2026-09-18T05:0{self.booted}:00.000000000Z"},
         }
@@ -483,7 +484,7 @@ class LabDocker:
         fact = self.facts[container_id]
         return InstanceIdentity(container_id=container_id, started_at=canonical_utc(fact["State"]["StartedAt"]),
                                 deployment_id=LAB_DEPLOYMENT, model_id=LAB_MODEL, runtime_id=LAB_RUNTIME,
-                                candidate_digest=LAB_CONFIG_SHA, image_digest=fact["Image"])
+                                candidate_digest=LAB_CONFIG_SHA, image_digest=fact["Config"]["Image"])
 
 
 class LabSwap:
