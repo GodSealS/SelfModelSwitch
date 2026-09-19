@@ -1419,6 +1419,8 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
     `slot launch_slot_: id 1 | task 1 | processing task` → `prompt eval 235.99 ms / 20 tokens` →
     `eval 364.31 ms / 10 tokens` → `total time = 600.30 ms / 30 tokens` → `release: stop processing`。
     即：**受管链路已走到模型并拿到回答**，卡在**结果结算/发布**（`_after_execute` → 输出 Blob 写入/发布 → 终态）而非推理本身。
+  - **根因定位（同日）**：`execution_service._after_execute` 的受管分支（`execution_service.py:729-744`）——后端若**不声明设备静默**（`backend.claims_device_quiescence()` 为假/不存在），则 `record.awaiting_quiescence=True` 并 `_ensure_quiescer(model_id)`：**必须先拿到"实例已停止"的证明才允许结算**（P15：HTTP 结束 ≠ 设备空闲）。模型确实在容器内答完了（30 tokens），但静默证明始终没到达 → 执行停在 `running`，quiescer 挂住，并进一步**冻结后续派发**（见上）。
+  - **修正方向（明确）**：两条路二选一并补单测——①让受管适配器在真正拿到设备静默时 `claims_device_quiescence()` 返回真（P15 的证据来自实例停止：容器消失 + 端口关闭 + 无残留进程）；②或让 llama-swap 的 unload 可被观察者证明（当前日志里 unload 返回 200，但观察者的停止证明链未闭合）。同时给 quiescer 加超时/失败路径（不得永久冻结派发）。
   - **据此修正方向**：不必再查适配器的调用超时（模型已答），下一步打点 `_after_execute` 与 `_publish_and_settle`：确认卡在 `report_output`/Blob 写入、quiescence 确认，还是终态发布；并补单测（"后端有响应时执行必须结算，不得停在 running"）。
   - **最后一层观测（同日）**：提交后 25 s 打点，活动协程里**没有** `_run`/`_execute`/`_admit`（只有 `_dispatch_loop` 与 `_run_session_lifecycle`），而记录停在 `running` 且 `dispatch_claimed=True`——即：**记录被认领后执行任务已退出或从未创建，但状态机没有超时兜底**（`_on_timeout` 未生效），执行因此永久停在 `running`。下一步：核对 `ExecutionService._run` 的异常/提前返回路径与 `_on_timeout` 的定时器（缺失或未被 await），补单测（"认领后无活任务必须在时限内终态，不得永远 running"）。
     2. **执行进入 `running` 后仍不终态**（150 s）：模型本身 0.5 s 就能回答（直连已证），故卡在受管 adapter 的调用/结果发布环节（`ExecutionService._execute`）。下一步用同样的 `task.get_stack()` 打出该执行协程的栈，确认卡在哪个 await。
