@@ -92,6 +92,29 @@ class UnixControlTransport:
         return ApiResponse(status, document)
 
 
+def operation_of(request: Mapping[str, Any]) -> str:
+    """The operation the API accepts, read from the request the fixture defines.
+
+    The executor hands the driver the fixture payload only, so the operation is
+    derived here — and an undecidable payload is refused, never guessed.
+    """
+    if not isinstance(request, Mapping):
+        raise DriverError("the request must be an object")
+    messages = request.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            content = message.get("content") if isinstance(message, Mapping) else None
+            if isinstance(content, list) and any(isinstance(part, Mapping) and part.get("type") == "image_url"
+                                                 for part in content):
+                return "vision"
+        return "chat"
+    if "input" in request and "query" not in request:
+        return "embeddings"
+    if "query" in request and "documents" in request:
+        return "rerank"
+    raise DriverError("cannot derive the operation: the API accepts chat, embeddings, rerank or vision")
+
+
 @dataclass
 class Session:
     """What the executor needs to know about the live session it opened."""
@@ -171,7 +194,7 @@ class ControlApiCaseDriver:
         key = self._next_id("execution")
         document = self._require(self.transport.request(
             "POST", "/internal/executions",
-            {"session_token": session.token, "operation": "inference",
+            {"session_token": session.token, "operation": operation_of(request),
              "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
             f"execution create for {model_id!r}")
         execution_id = document.get("execution_id")
@@ -186,7 +209,7 @@ class ControlApiCaseDriver:
         key = self._next_id("execution")
         created = self._require(self.transport.request(
             "POST", "/internal/executions",
-            {"session_token": session.token, "operation": "inference",
+            {"session_token": session.token, "operation": operation_of(request),
              "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
             f"execution create for {model_id!r}")
         execution_id = created.get("execution_id")

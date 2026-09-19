@@ -105,7 +105,7 @@ def test_a_load_opens_a_session_and_execute_polls_to_terminal() -> None:
     create = transport.requests[0][2]
     assert create == {"model_id": "qwen-small", "idempotency_key": "session-1", "correlation_id": "acceptance"}
     execution = transport.requests[1][2]
-    assert execution["session_token"] == "tok-1" and execution["operation"] == "inference"
+    assert execution["session_token"] == "tok-1" and execution["operation"] == "chat"
     assert execution["input"] == {"inline": {"messages": [{"role": "user", "content": "hi"}]}}
     assert executed["state"] == "succeeded" and executed["compute_quiescent"] is True
     assert executed["instance"]["container_id"] == "abc" and executed["fence"]["attempt"] == 1  # attribution
@@ -150,6 +150,29 @@ def test_a_second_load_is_refused_and_stop_closes_the_session() -> None:
     assert stopped["state"] == "closed"
     assert transport.requests[-1][1].endswith("/internal/sessions/session-1/close")
     assert driver.cleanup("qwen-small")["state"] == "closed"  # nothing left open is not an error
+
+
+def test_the_operation_is_derived_from_the_request_or_refused() -> None:
+    from model_scheduler.acceptance.driver import DriverError, operation_of
+
+    assert operation_of({"messages": [{"role": "user", "content": "hi"}]}) == "chat"
+    assert operation_of({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]}]}) == "vision"
+    assert operation_of({"input": ["a", "b"]}) == "embeddings"
+    assert operation_of({"query": "q", "documents": ["d"]}) == "rerank"
+    with pytest.raises(DriverError, match="cannot derive the operation"):
+        operation_of({"unexpected": True})  # never guessed
+
+
+def test_an_image_request_is_sent_as_the_vision_operation() -> None:
+    transport = _Transport(execution_states=["succeeded"])
+    driver = _driver(transport)
+    driver.load("qwen-small", cold=True)
+
+    driver.execute("qwen-small", {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "x"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]}]})
+
+    assert transport.requests[1][2]["operation"] == "vision"
 
 
 def test_boot_id_comes_from_the_peer_endpoint() -> None:
