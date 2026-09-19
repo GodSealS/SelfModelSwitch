@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import socket
+import time
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -124,6 +125,7 @@ class Session:
     token: str
     model_id: str
     view: Mapping[str, Any]
+    last_heartbeat: float = 0.0
 
 
 @dataclass
@@ -135,6 +137,7 @@ class ControlApiCaseDriver:
     sleep: Callable[[float], None] = field(default=lambda seconds: __import__("time").sleep(seconds))
     deadline_seconds: float = 1800.0
     ready_timeout_seconds: float = 1800.0
+    heartbeat_interval_seconds: float = 10.0  # the C04 policy's own heartbeat cadence
     _sessions: dict[str, Session] = field(default_factory=dict, init=False)
     _counter: int = field(default=0, init=False)
     _executions: dict[str, str] = field(default_factory=dict, init=False)  # execution_id -> model_id
@@ -190,7 +193,7 @@ class ControlApiCaseDriver:
             raise DriverError(f"session create for {model_id!r} returned no session_id")
         if not isinstance(token, str) or not token:
             raise DriverError(f"session create for {model_id!r} returned no owner_token")
-        session = Session(session_id, token, model_id, document)
+        session = Session(session_id, token, model_id, document, last_heartbeat=time.monotonic())
         self._sessions[model_id] = session
         # A `load` means the model is loaded *and usable*: wait until the session is
         # really ACTIVE. Submitting earlier is refused by the API ("only an ACTIVE
@@ -216,10 +219,30 @@ class ControlApiCaseDriver:
             waited += POLL_INTERVAL_SECONDS
             view = self._require(self.transport.request("GET", f"/internal/sessions/{session.session_id}"),
                                  f"session read {session.session_id}")
+            # A session idle-expires by policy (C04): keep it alive while it prepares,
+            # otherwise a cold start outlives the TTL and the execution is cancelled.
+            if time.monotonic() - session.last_heartbeat >= self.heartbeat_interval_seconds:
+                view = self.heartbeat(session.model_id)["view"]
+
+    def heartbeat(self, model_id: str) -> Mapping[str, Any]:
+        """Keep the session alive: the C04 policy expires an idle session in 30 s."""
+        session = self._session_for(model_id)
+        document = self._require(self.transport.request(
+            "POST", f"/internal/sessions/{session.session_id}/heartbeat", {"session_token": session.token}),
+            f"session heartbeat for {model_id!r}")
+        session.view = document
+        session.last_heartbeat = time.monotonic()
+        return {"session_id": session.session_id, "state": document.get("state"), "view": document}
+
+    def _beat_if_due(self, model_id: str) -> None:
+        session = self._session_for(model_id)
+        if time.monotonic() - session.last_heartbeat >= self.heartbeat_interval_seconds:
+            self.heartbeat(model_id)
 
     def start(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution without waiting for it (the cancel case needs one)."""
         session = self._session_for(model_id)
+        self._beat_if_due(model_id)
         key = self._next_id("execution")
         document = self._require(self.transport.request(
             "POST", "/internal/executions",
@@ -235,6 +258,7 @@ class ControlApiCaseDriver:
     def execute(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution and poll it to a terminal state; nothing is retried."""
         session = self._session_for(model_id)
+        self._beat_if_due(model_id)
         key = self._next_id("execution")
         created = self._require(self.transport.request(
             "POST", "/internal/executions",

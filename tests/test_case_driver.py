@@ -46,6 +46,10 @@ class _Transport:
                                      "phase": "queued", "boot_id": "boot-x", "model_id": body["model_id"],
                                      "expires_in_ms": 30000, "hard_remaining_ms": 60000,
                                      "owner_token": f"tok-{self._sessions}", "error": None})
+        if path.startswith("/internal/sessions/") and method == "POST" and path.endswith("/heartbeat"):
+            return ApiResponse(200, {"session_id": path.split("/")[3], "state": "active", "phase": None,
+                                     "boot_id": "boot-x", "model_id": "qwen-small", "expires_in_ms": 30000,
+                                     "hard_remaining_ms": 60000, "owner_token": None, "error": None})
         if path.startswith("/internal/sessions/") and method == "GET":
             return ApiResponse(200, {"session_id": path.split("/")[3], "state": self.session_settled,
                                      "phase": None, "boot_id": "boot-x", "model_id": "qwen-small",
@@ -199,6 +203,20 @@ def test_an_image_request_is_sent_as_the_vision_operation() -> None:
 
     creates = [body for method, path, body in transport.requests if path == "/internal/executions"]
     assert creates and creates[0]["operation"] == "vision"
+
+
+def test_a_waiting_load_heartbeats_the_session() -> None:
+    """The C04 policy expires an idle session in 30 s; a cold start takes longer."""
+    transport = _Transport()
+    driver = _driver(transport)
+    driver.heartbeat_interval_seconds = 0.0  # every poll must beat, deterministically
+
+    driver.load("qwen-small", cold=True)
+
+    beats = [path for method, path, _b in transport.requests if path.endswith("/heartbeat")]
+    assert beats, "the wait must heartbeat instead of letting the session idle out"
+    beat = next(body for method, path, body in transport.requests if path.endswith("/heartbeat"))
+    assert beat == {"session_token": "tok-1"}  # the token the API requires
 
 
 def test_boot_id_comes_from_the_peer_endpoint() -> None:
