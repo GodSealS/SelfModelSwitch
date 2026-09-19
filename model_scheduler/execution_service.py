@@ -84,6 +84,17 @@ class NotDispatched(Exception):
         self.code = code
 
 
+def _capability_names(spec: Any) -> set[str]:
+    """The model's capability names, whatever the registration carried.
+
+    The v1 configuration crosses with `Capability` members; a v2 registration
+    carries plain strings (it may declare `vision`, which v1's enum never had).
+    Reading either as an enum is the defect the target bring-up found.
+    """
+    return {capability.value if hasattr(capability, "value") else str(capability)
+            for capability in spec.capabilities}
+
+
 def _error(code: str, message: str) -> ErrorDetail:
     return ErrorDetail(code=code, message=message, retryable=code in cp.RETRYABLE_ERROR_CODES)
 
@@ -261,7 +272,7 @@ class ExecutionService:
                     raise ExecutionError("session_not_active", "only an ACTIVE session may submit")
                 if not self._sessions.is_live(session_id, self._clock()):
                     raise ExecutionError("session_expired", "the session is no longer live")
-                capabilities = {capability.value for capability in self._book.specs[session.model_id].capabilities}
+                capabilities = _capability_names(self._book.specs[session.model_id])
                 if parsed.operation not in capabilities:
                     raise ExecutionError("capability_mismatch", "the model does not register this operation")
                 pending = sum(1 for entry in self._records.values()
@@ -600,7 +611,7 @@ class ExecutionService:
                 return (CANCELLED, "session_not_active", "the session is gone")
             if session.phase != ACTIVE or not self._sessions.is_live(record.session_id, self._clock()):
                 return (CANCELLED, "session_expired", "the session is no longer live")
-            capabilities = {capability.value for capability in self._book.specs[record.model_id].capabilities}
+            capabilities = _capability_names(self._book.specs[record.model_id])
             if record.operation not in capabilities:
                 return (FAILED, "capability_mismatch", "the model no longer registers this operation")
             if record.input.inline is not None and len(canonical_json_bytes(record.input.inline)) > cp.MAX_INLINE_INPUT_BYTES:

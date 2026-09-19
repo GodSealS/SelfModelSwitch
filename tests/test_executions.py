@@ -601,3 +601,17 @@ async def test_each_execution_holds_exactly_one_lease(tmp_path) -> None:
         await stack.service.report_terminal(view["execution_id"], terminal_evidence(stack, view))
     await eventually(lambda: not stack.leases())
     assert stack.book.runtime["chat"].total_requests == 2
+
+def test_capability_names_read_both_registrations() -> None:
+    """The v2 bring-up bug: plain strings and enum members must both read cleanly."""
+    from dataclasses import dataclass
+
+    from model_scheduler.contracts import Capability
+    from model_scheduler.execution_service import _capability_names
+
+    @dataclass
+    class _Spec:
+        capabilities: object
+
+    assert _capability_names(_Spec(frozenset({Capability.CHAT, Capability.EMBEDDINGS}))) == {"chat", "embeddings"}
+    assert _capability_names(_Spec(("vision", "chat"))) == {"vision", "chat"}  # v2: no `.value` to read
