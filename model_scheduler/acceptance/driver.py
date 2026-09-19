@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 import socket
 from typing import Any, Callable, Mapping, Protocol
+from uuid import uuid4
 
 from ..control_protocol_v1 import PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER
 
@@ -140,8 +141,13 @@ class ControlApiCaseDriver:
     # -- helpers -----------------------------------------------------------
 
     def _next_id(self, prefix: str) -> str:
+        """A unique idempotency key per logical call.
+
+        Reusing a key is a *replay*: the API answers with the object's current
+        state and never re-issues the owner token, which would strand the driver.
+        """
         self._counter += 1
-        return f"{prefix}-{self._counter}"
+        return f"{prefix}-{uuid4().hex[:16]}-{self._counter}"
 
     def _require(self, response: ApiResponse, what: str) -> Mapping[str, Any]:
         if not response.ok:
@@ -239,7 +245,8 @@ class ControlApiCaseDriver:
     def stop(self, model_id: str) -> Mapping[str, Any]:
         """Close the session; the deployment stops what it started."""
         session = self._session_for(model_id)
-        closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close", {}),
+        closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close",
+                                                       {"session_token": session.token}),
                                f"session close for {model_id!r}")
         del self._sessions[model_id]
         return {"session_id": session.session_id, "state": closed.get("state"), "view": closed}
@@ -249,6 +256,7 @@ class ControlApiCaseDriver:
         session = self._sessions.pop(model_id, None)
         if session is None:
             return {"session_id": None, "state": "closed", "note": "no session was open"}
-        closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close", {}),
+        closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close",
+                                                       {"session_token": session.token}),
                                f"cleanup close for {model_id!r}")
         return {"session_id": session.session_id, "state": closed.get("state"), "view": closed}

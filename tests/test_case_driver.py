@@ -103,9 +103,11 @@ def test_a_load_opens_a_session_and_execute_polls_to_terminal() -> None:
         ("POST", "/internal/sessions"), ("POST", "/internal/executions"),
         ("GET", "/internal/executions/execution-2")]  # create said running, one read said succeeded
     create = transport.requests[0][2]
-    assert create == {"model_id": "qwen-small", "idempotency_key": "session-1", "correlation_id": "acceptance"}
+    assert create["model_id"] == "qwen-small" and create["correlation_id"] == "acceptance"
+    assert create["idempotency_key"].startswith("session-") and len(create["idempotency_key"]) > len("session-")
     execution = transport.requests[1][2]
     assert execution["session_token"] == "tok-1" and execution["operation"] == "chat"
+    assert create["idempotency_key"] != transport.requests[1][2]["idempotency_key"]  # keys never collide
     assert execution["input"] == {"inline": {"messages": [{"role": "user", "content": "hi"}]}}
     assert executed["state"] == "succeeded" and executed["compute_quiescent"] is True
     assert executed["instance"]["container_id"] == "abc" and executed["fence"]["attempt"] == 1  # attribution
@@ -149,6 +151,7 @@ def test_a_second_load_is_refused_and_stop_closes_the_session() -> None:
     stopped = driver.stop("qwen-small")
     assert stopped["state"] == "closed"
     assert transport.requests[-1][1].endswith("/internal/sessions/session-1/close")
+    assert transport.requests[-1][2] == {"session_token": "tok-1"}  # the API refuses a close without it
     assert driver.cleanup("qwen-small")["state"] == "closed"  # nothing left open is not an error
 
 
