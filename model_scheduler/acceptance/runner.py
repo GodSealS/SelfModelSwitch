@@ -44,8 +44,8 @@ from .device_activity import ManagedComputeSampler
 from .fixtures import FillerSpec
 
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
-FIXTURE_MATERIAL_NAME = "fixtures.json"
-FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "evaluator", "fixtures", "fillers"})
+FIXTURE_MATERIAL_NAME = "fillers.json"
+FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
 FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "unit"})
 EXIT_INPUT = 2
 EXIT_FAILED = 3

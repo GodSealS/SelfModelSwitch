@@ -305,6 +305,32 @@ def test_a_text_boundary_is_built_from_the_measured_token_ratio() -> None:
     assert chat.boundary["input_tokens"] == ENVELOPE.max_input_tokens  # the declaration never moves
 
 
+def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> None:
+    """The candidate names the material; the run refuses anything else."""
+    from model_scheduler.acceptance.runner import LayerError, load_filler_specs
+
+    (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
+        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 1.0}]}), encoding="utf-8")
+
+    class _Candidate:
+        fixture_refs = []
+
+    specs = load_filler_specs(tmp_path, _Candidate())
+
+    assert specs["qwen-small"].unit == "a" and specs["qwen-small"].tokens_per_unit == 1.0
+
+    class _Naming(_Candidate):
+        fixture_refs = [type("Ref", (), {"relative_path": "gone.json", "size_bytes": 1, "sha256": "0" * 64})()]
+
+    with pytest.raises(LayerError, match="is missing"):
+        load_filler_specs(tmp_path, _Naming())
+
+    (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
+        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 0}]}), encoding="utf-8")
+    with pytest.raises(LayerError, match="measured positive number"):  # an assumed ratio is not a measurement
+        load_filler_specs(tmp_path, _Candidate())
+
+
 def test_a_boundary_without_a_measured_ratio_is_refused() -> None:
     with pytest.raises(fx.FixtureError, match="measured tokens-per-unit"):
         fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)
