@@ -162,6 +162,42 @@ def test_a_case_without_attributable_device_activity_stays_unknown() -> None:
     assert bc.summarize(attempts)["passed"] is False  # unknown never converts to passed
 
 
+def test_the_raw_rows_a_driver_returns_become_the_case_material(tmp_path) -> None:
+    """A driver that sampled the device hands the rows over; the executor persists them.
+
+    The rows are the evidence the evaluator later recomputes from, so they must
+    reach the run's material even though only their counts travel on the attempt.
+    """
+    from model_scheduler.acceptance.collector import FileCollector
+
+    class SamplingDriver(FakeDriver):
+        def execute(self, model_id, request):
+            result = dict(super().execute(model_id, request))
+            result["samples"] = ({"kind": "tegrastats", "raw": "RAM 1/2MB GR3D_FREQ 41%"},
+                                 {"kind": "tegrastats", "raw": "RAM 2/2MB GR3D_FREQ 87%"},
+                                 {"kind": "proc_maps", "raw": "7f00 r-xp libcudart.so.12"})
+            return result
+
+    driver = SamplingDriver()
+    collector = FileCollector(tmp_path, run_id="run-1", candidate_sha256="a" * 64, device_digest="b" * 64,
+                              boot_id="boot-1")
+
+    executor = bc.CaseExecutor(driver, collector=collector, cold_starts=3, reload_rounds=3)
+    executor.run_model(model_id="qwen-small", capabilities=("chat",), envelope=ENVELOPE)
+
+    rows = [json.loads(line) for line in (tmp_path / "samples" / "tegrastats.jsonl").read_text().splitlines()
+            if line.strip()]
+    maps = [json.loads(line) for line in (tmp_path / "samples" / "proc_maps.jsonl").read_text().splitlines()
+            if line.strip()]
+    # infer + envelope + cap:chat are the three inference calls of this model
+    assert len(rows) == 3 * 2 and len(maps) == 3
+    assert rows[-1]["kind"] == "tegrastats" and rows[-1]["raw"] == "RAM 2/2MB GR3D_FREQ 87%"
+    assert maps[0]["raw"] == "7f00 r-xp libcudart.so.12"  # attributable to the instance that ran it
+    attribution = collector.attribution()
+    assert attribution["gr3d_peak_pct"] == 87 and attribution["cuda_library_mapped"] is True
+    assert attribution["raw_samples"] == {"proc_maps": 3, "tegrastats": 6}
+
+
 def test_a_crash_leaves_a_failed_attempt_and_a_cleanup_record(tmp_path) -> None:
     from model_scheduler.acceptance.collector import FileCollector
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import threading
 import time
+from typing import Any, Mapping
 
 import pytest
 
@@ -300,3 +301,123 @@ def test_the_transport_speaks_http_over_a_unix_socket_and_sends_the_version_head
     assert response.status == 201 and response.document["owner_token"] == "tok-9"
     assert f"{PROTOCOL_VERSION_HEADER}: 1" in seen["head"]
     assert json.loads(seen["body"]) == {"model_id": "qwen-small"}
+
+
+class _ResultBlobTransport(_Transport):
+    """The real terminal view: the result *references* an output blob, it never ships it."""
+
+    def __init__(self, blob: Mapping[str, Any] | None = None, *, publish_result: bool = True,
+                 **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.blob_payload = blob
+        self.publish_result = publish_result
+
+    def request(self, method: str, path: str, body=None) -> ApiResponse:
+        if method == "GET" and path.startswith("/internal/blobs/"):
+            self.requests.append((method, path, body))  # the base transport only sees \/internal\/ routes
+            if self.blob_payload is None:
+                return ApiResponse(404, {"error": {"code": "not_found", "message": "no such blob"}})
+            raw = json.dumps(self.blob_payload).encode("utf-8")
+            return ApiResponse(200, {}, raw=raw)
+        if path.startswith("/internal/executions/") and method == "GET":
+            response = super().request(method, path, body)
+            document = dict(response.document)
+            if self.publish_result:
+                document["result"] = {"blob_id": "blob-1", "owner": "uid:1000", "sha256": "b" * 64,
+                                      "size_bytes": 21, "media_type": "application/json"}
+            return ApiResponse(response.status, document, raw=json.dumps(document).encode("utf-8"))
+        return super().request(method, path, body)
+
+
+class _Sampler:
+    """The injected boundary of the device: no subprocess, no tegrastats, pure rows."""
+
+    def __init__(self, rows: tuple[dict, ...] = (), **kwargs: Any) -> None:
+        self.rows = rows
+        self.instance = kwargs.get("instance")
+        self.started = False
+        self.stopped = False
+
+    def start(self, *, instance=None) -> None:
+        self.started = True
+        self.instance = instance
+
+    def stop(self) -> tuple[dict, ...]:
+        self.stopped = True
+        return self.rows
+
+
+def _chat_payload() -> dict:
+    return {"messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_the_output_of_an_execution_is_the_published_blob_not_the_view() -> None:
+    transport = _ResultBlobTransport({"message": {"content": "hello"}}, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["output"] == {"message": {"content": "hello"}}
+    assert ("GET", "/internal/blobs/blob-1") in [(method, path) for method, path, _b in transport.requests]
+
+
+def test_an_execution_without_a_result_reference_has_no_output() -> None:
+    transport = _ResultBlobTransport(None, publish_result=False, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["output"] is None  # a claimed output without its blob is never invented
+    assert not [path for _m, path, _b in transport.requests if path.startswith("/internal/blobs/")]
+
+
+def test_a_missing_output_blob_is_reported_instead_of_dropped() -> None:
+    transport = _ResultBlobTransport(None, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    with pytest.raises(DriverError, match="cannot be read"):
+        driver.execute("qwen-small", _chat_payload())
+
+
+def test_an_execution_is_attributed_to_the_instance_that_ran_it() -> None:
+    transport = _ResultBlobTransport({"message": {"content": "hi"}}, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["provider"] == "llama-cpp-1/sms-llama-cpp@sha256:" + "a" * 64
+    assert executed["instance"]["container_id"] == "abc"
+
+
+def test_device_activity_is_derived_from_raw_rows_never_from_a_boolean() -> None:
+    transport = _ResultBlobTransport({"message": {"content": "hi"}}, execution_states=["succeeded"])
+    rows = ({"kind": "tegrastats", "raw": "RAM 100/32000MB GR3D_FREQ 41%"},
+            {"kind": "tegrastats", "raw": "RAM 200/32000MB GR3D_FREQ 87%"},
+            {"kind": "proc_maps", "raw": "7f00 r-xp libcudart.so.12"})
+    sampler = _Sampler(rows)
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None, sampler_factory=lambda: sampler)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["device_activity"] == {"gr3d_peak_pct": 87, "cuda_library_mapped": True,
+                                          "raw_samples": {"proc_maps": 1, "tegrastats": 2}}
+    assert sampler.started and sampler.stopped
+    assert sampler.instance is not None and sampler.instance["container_id"] == "abc"
+    # the rows travel with the result so the executor can persist them as material
+    assert executed["samples"] == rows
+
+
+def test_a_case_without_samples_records_no_device_activity() -> None:
+    transport = _ResultBlobTransport({"message": {"content": "hi"}}, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None, sampler_factory=lambda: _Sampler(()))
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["device_activity"] is None  # unattributable, therefore never passed
+    assert executed["samples"] == ()

@@ -218,6 +218,22 @@ class CaseExecutor:
 
     # -- recording ---------------------------------------------------------
 
+    def _record_samples(self, samples: Any) -> None:
+        """Persist the raw rows the driver harvested; they are the case's material.
+
+        Only the counts stay on the attempt: the rows themselves belong to the
+        run's samples, which is exactly what the evaluator recomputes from.
+        """
+        if self.collector is None or not samples:
+            return
+        for row in samples:
+            if not isinstance(row, Mapping):
+                raise BackendCaseError("a device sample must be a mapping of kind and raw value")
+            kind, raw = row.get("kind"), row.get("raw")
+            if not isinstance(kind, str) or not kind:
+                raise BackendCaseError("a device sample needs a kind, otherwise it cannot be recomputed")
+            self.collector.record_sample(kind, raw)
+
     def _attempt(self, model_id: str, case_id: str, attempt: int, kind: str, action, *,
                  fixture: Fixture | None = None, capability: str | None = None) -> Attempt:
         started_utc = _utc(self._clock)
@@ -231,7 +247,8 @@ class CaseExecutor:
         status = "unknown"
         try:
             result = dict(action() or {})
-            facts = result
+            facts = _without_samples(result)
+            self._record_samples(result.get("samples"))
             if result.get("error"):
                 failure = str(result["error"])
                 status = "failed"
@@ -305,6 +322,11 @@ def _basic_payload(fixture: Fixture) -> Mapping[str, Any]:
         payload["documents"] = payload["documents"][:2]
         payload["query"] = "tok000001 tok000002"
     return payload
+
+
+def _without_samples(result: Mapping[str, Any]) -> dict:
+    """The facts a case records: the attempt stays readable, the rows go to disk."""
+    return {key: value for key, value in result.items() if key != "samples"}
 
 
 def summarize(attempts: Sequence[Attempt]) -> dict:

@@ -25,7 +25,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from ..control_protocol_v1 import InstanceIdentity
 from ..ports_v3 import Clock, EventRecord
@@ -58,6 +58,32 @@ class _SystemClock:
 
     def utc_now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+
+def derive_attribution(rows: Iterable[Mapping[str, Any]]) -> dict:
+    """Device activity recomputed from raw rows; both the collector and the driver use it.
+
+    The window that matters belongs to the caller: a driver that samples one
+    execution derives that execution's activity, while the collector derives the
+    activity of every sample it persisted. Neither ever accepts a boolean.
+    """
+    counts: dict[str, int] = {}
+    gr3d_peak: int | None = None
+    cuda_mapped = False
+    for row in rows:
+        kind = str(row.get("kind") or "")
+        raw = str(row.get("raw", ""))
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind == "tegrastats":
+            found = _GR3D_PERCENT.search(raw)
+            if found is not None:
+                gr3d_peak = max(gr3d_peak or 0, int(found.group(1)))
+        elif kind == "proc_maps" and any(marker in raw for marker in CUDA_LIBRARY_MARKERS):
+            cuda_mapped = True
+    if not counts:
+        raise CollectorError("device attribution needs at least one raw sample: a boolean claim is not evidence")
+    return {"gr3d_peak_pct": gr3d_peak, "cuda_library_mapped": cuda_mapped,
+            "raw_samples": dict(sorted(counts.items()))}
 
 
 def _instance_facts(instance: InstanceIdentity | Mapping[str, Any] | None) -> dict | None:
@@ -161,18 +187,13 @@ class FileCollector:
         """Device activity derived from raw samples; a boolean is never the evidence."""
         if not self._sample_counts:
             raise CollectorError("device attribution needs at least one raw sample: a boolean claim is not evidence")
-        gr3d_peak: int | None = None
-        cuda_mapped = False
-        for row in self._read_samples("tegrastats"):
-            found = _GR3D_PERCENT.search(str(row.get("raw", "")))
-            if found is not None:
-                gr3d_peak = max(gr3d_peak or 0, int(found.group(1)))
-        for row in self._read_samples("proc_maps"):
-            text = str(row.get("raw", ""))
-            if any(marker in text for marker in CUDA_LIBRARY_MARKERS):
-                cuda_mapped = True
-        return {"gr3d_peak_pct": gr3d_peak, "cuda_library_mapped": cuda_mapped,
-                "raw_samples": dict(sorted(self._sample_counts.items()))}
+        return derive_attribution(self._all_samples())
+
+    def _all_samples(self) -> list[dict]:
+        rows: list[dict] = []
+        for path in sorted((self.directory / "samples").glob("*.jsonl")):
+            rows.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        return rows
 
     def _read_samples(self, kind: str) -> list[dict]:
         path = self.directory / "samples" / f"{kind}.jsonl"

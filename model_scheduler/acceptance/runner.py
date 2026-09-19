@@ -17,7 +17,11 @@ Two rules shape it:
 from __future__ import annotations
 
 from pathlib import Path
+import atexit
 import os
+import shutil
+import tempfile
+from itertools import count
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
@@ -34,6 +38,7 @@ from ..evidence_contracts import (
     parse_candidate,
 )
 from .collector import FileCollector, collector_sha256
+from .device_activity import ManagedComputeSampler
 
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
 EXIT_INPUT = 2
@@ -72,8 +77,25 @@ def _document_of(report: AcceptanceReportV3) -> dict:
     }
 
 
+def compute_sampler_factory(scratch: Path) -> Callable[[], ManagedComputeSampler]:
+    """One sampler per execution, each over a scratch log it removes once read.
+
+    The scratch sits outside the run output on purpose: only the rows the sampler
+    harvests become case material, never the file they were captured in. The real
+    tools (tegrastats, docker, /proc) are reached by the sampler itself, so this
+    factory stays testable.
+    """
+    counter = count(1)
+
+    def factory() -> ManagedComputeSampler:
+        return ManagedComputeSampler(scratch / f"tegrastats-{next(counter)}.log")
+
+    return factory
+
+
 def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None = None,
                 transport: Any = None, executor: Any = None, run_id: str | None = None,
+                sampler_factory: Callable[[], Any] | None = None,
                 collector_factory: Callable[..., FileCollector] = FileCollector,
                 clock: Callable[[], float] | None = None) -> dict:
     """Execute the B matrix of every registered model and persist its v3 report."""
@@ -97,7 +119,14 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
     device = device_digest(candidate.device)
 
     link = transport if transport is not None else UnixControlTransport(socket)
-    driver = ControlApiCaseDriver(link)
+    if sampler_factory is None:
+        scratch = Path(tempfile.mkdtemp(prefix="sms-acceptance-device-"))
+    else:
+        scratch = None
+    factory = sampler_factory if sampler_factory is not None else compute_sampler_factory(scratch)
+    driver = ControlApiCaseDriver(link, sampler_factory=factory)
+    if scratch is not None:
+        atexit.register(shutil.rmtree, scratch, True)  # a device window is scratch, never evidence
     try:
         boot_id = driver.boot_id()
     except Exception as exc:

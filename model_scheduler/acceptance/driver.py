@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from ..control_protocol_v1 import PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER
+from .collector import derive_attribution
 
 EXECUTION_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -36,10 +37,28 @@ class DriverError(RuntimeError):
 class ApiResponse:
     status: int
     document: Mapping[str, Any]
+    raw: bytes = b""  # a blob read is bytes; the parsed document is its JSON twin
 
     @property
     def ok(self) -> bool:
         return 200 <= self.status < 300
+
+
+def provider_of(instance: Mapping[str, Any] | None) -> str | None:
+    """Who ran this action: the runtime identity the deployment reported.
+
+    Nothing is inferred from the model being "probably loaded" — either the API
+    handed back an instance identity, or the action has no provider and stays
+    unattributable.
+    """
+    if not isinstance(instance, Mapping):
+        return None
+    runtime_id, image_digest = instance.get("runtime_id"), instance.get("image_digest")
+    if not isinstance(runtime_id, str) or not runtime_id:
+        return None
+    if not isinstance(image_digest, str) or not image_digest:
+        return None
+    return f"{runtime_id}/{image_digest}"
 
 
 class ControlTransport(Protocol):
@@ -91,7 +110,7 @@ class UnixControlTransport:
                 raise DriverError(f"status {status} with an unreadable body: {exc}") from exc
             if isinstance(parsed, dict):
                 document = parsed
-        return ApiResponse(status, document)
+        return ApiResponse(status, document, body_bytes)
 
 
 def operation_of(request: Mapping[str, Any]) -> str:
@@ -135,6 +154,7 @@ class ControlApiCaseDriver:
     transport: ControlTransport
     owner: str = "acceptance"
     sleep: Callable[[float], None] = field(default=lambda seconds: __import__("time").sleep(seconds))
+    sampler_factory: Callable[[], Any] | None = None  # see acceptance.device_activity
     deadline_seconds: float = 1800.0
     ready_timeout_seconds: float = 1800.0
     heartbeat_interval_seconds: float = 10.0  # the C04 policy's own heartbeat cadence
@@ -261,7 +281,27 @@ class ControlApiCaseDriver:
         return {"execution_id": execution_id, "view": document}
 
     def execute(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Create an execution and poll it to a terminal state; nothing is retried."""
+        """Create an execution and poll it to a terminal state; nothing is retried.
+
+        The window is what makes the case attributable: device samples are taken
+        *around* this execution only, and the answer itself is read from the blob
+        the service published — a view that merely says `succeeded` is never an
+        output.
+        """
+        sampler = None if self.sampler_factory is None else self.sampler_factory()
+        try:
+            view, execution_id = self._execute_view(model_id, request, sampler=sampler)
+        finally:
+            rows = () if sampler is None else tuple(sampler.stop())
+        instance = view.get("instance")
+        return {"execution_id": execution_id, "state": view.get("state"), "dispatch_state": view.get("dispatch_state"),
+                "compute_quiescent": view.get("compute_quiescent"), "result": view.get("result"),
+                "output": self._published_output(view.get("result")),
+                "provider": provider_of(instance), "instance": instance,
+                "device_activity": derive_attribution(rows) if rows else None, "samples": rows,
+                "fence": view.get("fence"), "error": view.get("error"), "view": view}
+
+    def _execute_view(self, model_id: str, request: Mapping[str, Any], *, sampler: Any) -> tuple[Mapping[str, Any], str]:
         session = self._session_for(model_id)
         self._beat_if_due(model_id)
         key = self._next_id("execution")
@@ -274,6 +314,8 @@ class ControlApiCaseDriver:
         if not isinstance(execution_id, str) or not execution_id:
             raise DriverError(f"execution create for {model_id!r} returned no execution_id")
         self._executions[execution_id] = model_id
+        if sampler is not None:
+            sampler.start(instance=created.get("instance"))
         view = created
         waited = 0.0
         while str(view.get("state")) not in EXECUTION_TERMINAL_STATES:
@@ -287,10 +329,31 @@ class ControlApiCaseDriver:
             self._beat_if_due(model_id)
             view = self._require(self.transport.request("GET", f"/internal/executions/{execution_id}"),
                                  f"execution read {execution_id}")
-        return {"execution_id": execution_id, "state": view.get("state"), "dispatch_state": view.get("dispatch_state"),
-                "compute_quiescent": view.get("compute_quiescent"), "result": view.get("result"),
-                "instance": view.get("instance"), "fence": view.get("fence"), "error": view.get("error"),
-                "view": view}
+        return view, execution_id
+
+    def _published_output(self, result: Any) -> Mapping[str, Any] | None:
+        """Read what the execution actually produced: the blob it references.
+
+        A result that points nowhere leaves no output, and a blob that will not
+        parse is an error rather than a renamed empty dict: without real content
+        there is nothing for the capability checks to examine.
+        """
+        if not isinstance(result, Mapping):
+            return None
+        blob_id = result.get("blob_id")
+        if not isinstance(blob_id, str) or not blob_id:
+            return None
+        response = self.transport.request("GET", f"/internal/blobs/{blob_id}")
+        if not response.ok:
+            detail = response.document.get("error", response.document)
+            raise DriverError(f"the output blob {blob_id} cannot be read: {response.status} {detail}")
+        if not response.raw:
+            return None
+        try:
+            document = json.loads(response.raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DriverError(f"the output blob {blob_id} is not readable JSON: {exc}") from exc
+        return document if isinstance(document, dict) else None
 
     def cancel(self, model_id: str, execution_id: str) -> Mapping[str, Any]:
         session = self._session_for(model_id)
