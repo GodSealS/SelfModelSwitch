@@ -46,7 +46,7 @@ from .fixtures import FillerSpec
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
 FIXTURE_MATERIAL_NAME = "fillers.json"
 FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
-FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "unit"})
+FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens", "unit"})
 EXIT_INPUT = 2
 EXIT_FAILED = 3
 
@@ -117,7 +117,12 @@ def load_filler_specs(root: Path, candidate: Any) -> dict[str, FillerSpec]:
         if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
             raise LayerError(f"{where}: tokens_per_unit must be a measured positive number, not an assumption",
                              exit_code=EXIT_INPUT)
-        specs[model_id] = FillerSpec(unit=str(entry["unit"]), tokens_per_unit=float(ratio))
+        overhead = entry.get("template_overhead_tokens")
+        if isinstance(overhead, bool) or not isinstance(overhead, int) or overhead < 0:
+            raise LayerError(f"{where}: template_overhead_tokens must be the measured non-negative count",
+                             exit_code=EXIT_INPUT)
+        specs[model_id] = FillerSpec(unit=str(entry["unit"]), tokens_per_unit=float(ratio),
+                                     template_overhead_tokens=overhead)
     return specs
 
 

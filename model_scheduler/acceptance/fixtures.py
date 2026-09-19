@@ -56,28 +56,36 @@ class Fixture:
 
 @dataclass(frozen=True)
 class FillerSpec:
-    """How many real tokens one filler unit costs, as measured for that model.
+    """What one real request costs, as measured for that model's tokenizer.
 
-    The count is a measurement of the model's own tokenizer, not an assumption:
-    with 7 tokens per `tok000123` unit a request declared for 28 672 tokens was
-    really 200 723 tokens and the model refused it for exceeding its context. The
-    material that carries a fixture therefore carries the ratio too.
+    Two measured figures, not assumptions: how many real tokens one filler unit
+    costs, and how many tokens the chat template adds by itself. With 7 tokens
+    per `tok000123` unit a request declared for 28 672 tokens was really 200 723
+    tokens and was refused for exceeding the context; with the template's own
+    tokens unaccounted, a request declared for 8 192 tokens was refused for
+    exceeding `max_input_tokens`. Both numbers therefore travel with the material.
     """
 
     unit: str
     tokens_per_unit: float
+    template_overhead_tokens: int
 
 
 def filler_text(tokens: int, *, filler: FillerSpec) -> str:
-    """Deterministic filler sized in *real* tokens, from the measured ratio."""
+    """Deterministic filler sized so the *whole* request is the declared budget."""
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
         raise FixtureError("the filler token count must be a non-negative integer")
     ratio = filler.tokens_per_unit
     if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
         raise FixtureError("the filler needs a measured positive tokens-per-unit ratio")
+    overhead = filler.template_overhead_tokens
+    if isinstance(overhead, bool) or not isinstance(overhead, int) or overhead < 0:
+        raise FixtureError("the filler needs the measured template overhead in tokens")
     if not isinstance(filler.unit, str) or not filler.unit or any(char.isspace() for char in filler.unit):
         raise FixtureError("the filler unit must be a single non-blank word")
-    units = math.ceil(tokens / ratio) if tokens else 0
+    if tokens <= overhead:
+        raise FixtureError(f"a declared budget of {tokens} tokens cannot carry a {overhead}-token template")
+    units = math.ceil((tokens - overhead) / ratio) if tokens else 0
     return " ".join(filler.unit for _ in range(units))
 
 

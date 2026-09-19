@@ -21,8 +21,9 @@ from model_scheduler.contracts_v2 import Envelope
 ENVELOPE = Envelope(ctx_size=1024, max_input_tokens=512, max_output_tokens=64, max_parallel=2,
                     max_image_tokens=64, max_image_edge_pixels=64, max_images=1)
 # A measured ratio: one filler unit of "a" really costs this tokenizer one token.
-FILLER = fx.FillerSpec(unit="a", tokens_per_unit=1.0)
+FILLER = fx.FillerSpec(unit="a", tokens_per_unit=1.0, template_overhead_tokens=19)
 FILLERS = {"qwen-small": FILLER}
+FAKE_TEMPLATE_TOKENS = 19  # the measured template cost the fake runtime reproduces
 
 
 def _text_words(request) -> int:
@@ -94,7 +95,9 @@ class FakeDriver:
                 message["content"] if isinstance(message["content"], list) else
                 [{"type": "text", "text": message["content"]}])]
             images = sum(1 for item in content if item.get("type") == "image_url")
-            tokens = _text_words(request)
+            # A real round costs the filler plus its chat template: the fake runtime
+            # mirrors that, so a declared boundary is reached exactly.
+            tokens = _text_words(request) + FAKE_TEMPLATE_TOKENS
             output_tokens = int(request.get("max_tokens", 0))
             if self.split_boundary:
                 tokens = tokens // 2
@@ -287,7 +290,7 @@ def test_capability_fixtures_are_deterministic_and_reach_the_declared_boundary()
     assert [fixture.capability for fixture in fixtures] == ["chat", "vision", "embeddings", "rerank"]
     chat = fixtures[0]
     assert chat.boundary == {"input_tokens": 512, "output_tokens": 64, "parallel": 2}
-    assert len(chat.payload["messages"][0]["content"].split()) == 512  # text budget in one request
+    assert len(chat.payload["messages"][0]["content"].split()) == 493  # 512 minus the 19-token template
     vision = fixtures[1]
     assert vision.boundary["images"] == 1 and vision.boundary["image_edge_pixels"] == 64
     assert sum(1 for item in vision.payload["messages"][0]["content"] if item["type"] == "image_url") == 1
@@ -297,11 +300,11 @@ def test_capability_fixtures_are_deterministic_and_reach_the_declared_boundary()
 
 def test_a_text_boundary_is_built_from_the_measured_token_ratio() -> None:
     """7 tokens per unit is what the target tokenizer really costs: 512/7 units, not 512."""
-    expensive = fx.FillerSpec(unit="tok000123", tokens_per_unit=7.0)
+    expensive = fx.FillerSpec(unit="tok000123", tokens_per_unit=7.0, template_overhead_tokens=19)
 
     chat = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE, filler=expensive)[0]
 
-    assert len(chat.payload["messages"][0]["content"].split()) == 74  # ceil(512 / 7)
+    assert len(chat.payload["messages"][0]["content"].split()) == 71  # ceil((512 - 19) / 7)
     assert chat.boundary["input_tokens"] == ENVELOPE.max_input_tokens  # the declaration never moves
 
 
@@ -310,7 +313,8 @@ def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> 
     from model_scheduler.acceptance.runner import LayerError, load_filler_specs
 
     (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
-        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 1.0}]}), encoding="utf-8")
+        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 1.0,
+                                       "template_overhead_tokens": 19}]}), encoding="utf-8")
 
     class _Candidate:
         fixture_refs = []
@@ -326,7 +330,8 @@ def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> 
         load_filler_specs(tmp_path, _Naming())
 
     (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
-        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 0}]}), encoding="utf-8")
+        {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 0,
+                                           "template_overhead_tokens": 19}]}), encoding="utf-8")
     with pytest.raises(LayerError, match="measured positive number"):  # an assumed ratio is not a measurement
         load_filler_specs(tmp_path, _Candidate())
 
