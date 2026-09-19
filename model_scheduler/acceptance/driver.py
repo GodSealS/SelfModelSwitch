@@ -292,13 +292,22 @@ class ControlApiCaseDriver:
                 "view": view}
 
     def cancel(self, model_id: str, execution_id: str) -> Mapping[str, Any]:
-        document = self._require(self.transport.request("POST", f"/internal/executions/{execution_id}/cancel", {}),
-                                 f"execution cancel {execution_id}")
+        session = self._session_for(model_id)
+        document = self._require(self.transport.request(
+            "POST", f"/internal/executions/{execution_id}/cancel", {"session_token": session.token}),
+            f"execution cancel {execution_id}")
         return {"execution_id": execution_id, "view": document}
 
     def stop(self, model_id: str) -> Mapping[str, Any]:
-        """Close the session; the deployment stops what it started."""
-        session = self._session_for(model_id)
+        """Close the session; the deployment stops what it started.
+
+        Nothing open means nothing to stop: the matrix runs a stop case and then
+        reloads, so a missing session is a no-op, not a failure.
+        """
+        session = self._sessions.get(model_id)
+        if session is None:
+            return {"session_id": None, "state": "closed", "note": "no session was open"}
+        self._beat_if_due(model_id)
         closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close",
                                                        {"session_token": session.token}),
                                f"session close for {model_id!r}")

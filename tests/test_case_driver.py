@@ -154,8 +154,8 @@ def test_the_driver_refuses_execute_before_a_load() -> None:
 
     with pytest.raises(DriverError, match="must load it first"):
         driver.execute("qwen-small", {"messages": []})
-    with pytest.raises(DriverError, match="must load it first"):
-        driver.stop("qwen-small")
+    # a stop with nothing open is a no-op, not a failure (the matrix stops, then reloads)
+    assert driver.stop("qwen-small")["state"] == "closed"
 
 
 def test_an_api_refusal_is_reported_not_guessed() -> None:
@@ -202,6 +202,20 @@ def test_an_image_request_is_sent_as_the_vision_operation() -> None:
     assert creates and creates[0]["operation"] == "vision"
 
 
+def test_cancel_carries_the_session_token_and_a_stop_without_a_session_is_a_no_op() -> None:
+    transport = _Transport(execution_states=["succeeded"])
+    driver = _driver(transport)
+    driver.load("qwen-small", cold=True)
+    started = driver.start("qwen-small", {"messages": [{"role": "user", "content": "hi"}]})
+
+    driver.cancel("qwen-small", started["execution_id"])
+    cancels = [(method, path, body) for method, path, body in transport.requests if path.endswith("/cancel")]
+
+    assert cancels and cancels[0][2] == {"session_token": "tok-1"}  # the API demands exactly this body
+    driver.stop("qwen-small")
+    assert driver.stop("qwen-small") == {"session_id": None, "state": "closed", "note": "no session was open"}
+
+
 def test_a_second_load_closes_the_previous_session_first() -> None:
     """The matrix wants independent cold starts: stop, then start from nothing."""
     transport = _Transport()
@@ -246,7 +260,8 @@ def test_cancel_uses_the_official_cancel_path() -> None:
     cancelled = driver.cancel("qwen-small", started["execution_id"])
     followed = transport.request("GET", f"/internal/executions/{started['execution_id']}")
 
-    assert transport.requests[-2] == ("POST", "/internal/executions/execution-2/cancel", {})
+    assert (transport.requests[-2][0], transport.requests[-2][1]) == ("POST", "/internal/executions/execution-2/cancel")
+    assert transport.requests[-2][2] == {"session_token": "tok-1"}
     assert cancelled["execution_id"] == "execution-2" and followed.document["state"] == "cancelled"
 
 
