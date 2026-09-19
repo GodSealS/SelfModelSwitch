@@ -230,7 +230,7 @@ class LlamaCppAdapter:
             "max_tokens": max_tokens,
             "stream": False,
         }
-        for key in ("temperature", "top_p", "seed"):
+        for key in ("temperature", "top_p", "seed", "ignore_eos"):
             if key in parameters:
                 payload[key] = parameters[key]
         return payload

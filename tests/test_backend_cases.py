@@ -21,7 +21,7 @@ from model_scheduler.contracts_v2 import Envelope
 ENVELOPE = Envelope(ctx_size=1024, max_input_tokens=512, max_output_tokens=64, max_parallel=2,
                     max_image_tokens=64, max_image_edge_pixels=64, max_images=1)
 # A measured ratio: one filler unit of "a" really costs this tokenizer one token.
-FILLER = fx.FillerSpec(unit="a", tokens_per_unit=1.0, template_overhead_tokens=19, image_tokens=64)
+FILLER = fx.FillerSpec(unit="a", tokens_per_unit=1.0, template_overhead_tokens=19)
 FILLERS = {"qwen-small": FILLER}
 FAKE_TEMPLATE_TOKENS = 19  # the measured template cost the fake runtime reproduces
 
@@ -300,8 +300,7 @@ def test_capability_fixtures_are_deterministic_and_reach_the_declared_boundary()
 
 def test_a_text_boundary_is_built_from_the_measured_token_ratio() -> None:
     """7 tokens per unit is what the target tokenizer really costs: 512/7 units, not 512."""
-    expensive = fx.FillerSpec(unit="tok000123", tokens_per_unit=7.0, template_overhead_tokens=19,
-                              image_tokens=64)
+    expensive = fx.FillerSpec(unit="tok000123", tokens_per_unit=7.0, template_overhead_tokens=19)
 
     chat = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE, filler=expensive)[0]
 
@@ -315,7 +314,7 @@ def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> 
 
     (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
         {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 1.0,
-                                       "template_overhead_tokens": 19, "image_tokens": 64}]}), encoding="utf-8")
+                                       "template_overhead_tokens": 19}]}), encoding="utf-8")
 
     class _Candidate:
         fixture_refs = []
@@ -332,7 +331,7 @@ def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> 
 
     (tmp_path / "fillers.json").write_text(json.dumps({"schema_version": 1, "fillers": [
         {"model_id": "qwen-small", "unit": "a", "tokens_per_unit": 0,
-                                           "template_overhead_tokens": 19, "image_tokens": 64}]}), encoding="utf-8")
+                                           "template_overhead_tokens": 19}]}), encoding="utf-8")
     with pytest.raises(LayerError, match="measured positive number"):  # an assumed ratio is not a measurement
         load_filler_specs(tmp_path, _Candidate())
 

@@ -379,10 +379,36 @@ async def test_adapter_satisfies_backend_port_and_consumes_chat_messages() -> No
     assert seen[0]["messages"][0]["content"] == "hello there"
     assert seen[0]["max_tokens"] == 16
     assert adapter.claims_device_quiescence() is False
+    assert "ignore_eos" not in seen[0]  # a control nobody asked for is not invented
     paths = [str(request.url.path) for request in transport.requests]
     assert "/apply-template" in paths
     assert "/tokenize" in paths
     assert "/v1/chat/completions" in paths
+    await client.aclose()
+
+
+async def test_a_boundary_round_keeps_generating_until_its_declared_budget() -> None:
+    """A model that stops early would leave the declared output boundary unproven."""
+    seen: list[dict] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_ok())
+
+    client, _transport = _client({
+        "/apply-template": _apply_template,
+        "/tokenize": _tokenize_by_words,
+        "/v1/chat/completions": chat,
+        "/slots": (200, [{"id": 0, "is_processing": False, "n_ctx": 32768}]),
+    })
+
+    await _adapter(client).execute(
+        ExecutionRequest(execution_id="e-eos", operation="chat",
+                         inline_input={"messages": [{"role": "user", "content": "hello there"}]},
+                         parameters={"max_tokens": 4096, "ignore_eos": True}),
+        _fence(), _deadline())
+
+    assert seen[0]["ignore_eos"] is True and seen[0]["max_tokens"] == 4096
     await client.aclose()
 
 

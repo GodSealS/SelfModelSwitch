@@ -524,6 +524,16 @@ def test_parameters_follow_the_capability_whitelist():
     )
     assert chat.parameters == {"max_tokens": 512, "temperature": 0.7, "top_p": 0.9, "seed": 7}
 
+    # A boundary round keeps generating to its declared budget instead of stopping early.
+    boundary = cp.parse_execution_create_request(_execution_create(parameters={"max_tokens": 4096,
+                                                                               "ignore_eos": True}))
+    assert boundary.parameters == {"max_tokens": 4096, "ignore_eos": True}
+    with pytest.raises(cp.ContractError):  # it is a boolean, not a number
+        cp.parse_execution_create_request(_execution_create(parameters={"ignore_eos": 1}))
+    with pytest.raises(cp.ContractError):  # and embeddings never takes it
+        cp.parse_execution_create_request(_execution_create(operation="embeddings",
+                                                            parameters={"ignore_eos": True}))
+
     with pytest.raises(cp.ContractError):  # not a chat parameter
         cp.parse_execution_create_request(_execution_create(parameters={"repetition_penalty": 1.1}))
     with pytest.raises(cp.ContractError):  # text belongs to vision only

@@ -46,7 +46,7 @@ from .fixtures import FillerSpec
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
 FIXTURE_MATERIAL_NAME = "fillers.json"
 FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
-FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens", "image_tokens", "unit"})
+FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens", "unit"})
 EXIT_INPUT = 2
 EXIT_FAILED = 3
 
@@ -121,12 +121,8 @@ def load_filler_specs(root: Path, candidate: Any) -> dict[str, FillerSpec]:
         if isinstance(overhead, bool) or not isinstance(overhead, int) or overhead < 0:
             raise LayerError(f"{where}: template_overhead_tokens must be the measured non-negative count",
                              exit_code=EXIT_INPUT)
-        image_tokens = entry.get("image_tokens")
-        if isinstance(image_tokens, bool) or not isinstance(image_tokens, int) or image_tokens < 0:
-            raise LayerError(f"{where}: image_tokens must be the measured non-negative cost of one maximum image",
-                             exit_code=EXIT_INPUT)
         specs[model_id] = FillerSpec(unit=str(entry["unit"]), tokens_per_unit=float(ratio),
-                                     template_overhead_tokens=overhead, image_tokens=image_tokens)
+                                     template_overhead_tokens=overhead)
     return specs
 
 

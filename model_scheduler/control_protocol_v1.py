@@ -146,6 +146,9 @@ _CHAT_PARAMETERS: Mapping[str, ParameterRule] = {
     "temperature": ParameterRule("number", "sampling temperature", minimum=0, maximum=2),
     "top_p": ParameterRule("number", "nucleus sampling probability", minimum=0, maximum=1, exclusive_minimum=True),
     "seed": ParameterRule("integer", "deterministic sampling seed", minimum=0, maximum=_MAX_PROTOCOL_INTEGER),
+    # Acceptance needs a round that really consumes its declared output budget: a
+    # model that stops early would leave the boundary unproven rather than unmet.
+    "ignore_eos": ParameterRule("boolean", "keep generating until max_tokens, ignoring the end-of-sequence token"),
 }
 
 PARAMETER_RULES: Mapping[str, Mapping[str, ParameterRule]] = {

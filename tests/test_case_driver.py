@@ -412,6 +412,20 @@ def test_device_activity_is_derived_from_raw_rows_never_from_a_boolean() -> None
     assert executed["samples"] == rows
 
 
+def test_a_fixtures_generation_controls_reach_the_protocol() -> None:
+    """The boundary round must consume its output budget: it asks for that in the protocol's terms."""
+    transport = _ResultBlobTransport({"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+                                     execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    driver.execute("qwen-small", {**_chat_payload(), "max_tokens": 4096, "ignore_eos": True, "n_parallel": 2,
+                                  "unexpected": "dropped"})
+
+    body = [payload for method, path, payload in transport.requests if path == "/internal/executions"][0]
+    assert body["parameters"] == {"ignore_eos": True}  # only what the protocol defines
+
+
 def test_the_round_reports_what_it_really_consumed() -> None:
     """The boundary is judged on this round's own usage, never on the declaration."""
     output = {"message": {"content": "hi"}, "usage": {"prompt_tokens": 1234, "completion_tokens": 56}}

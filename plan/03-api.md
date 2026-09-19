@@ -69,7 +69,8 @@ vision adapter 可扩展既有 chat data URL 输入；audio/embedding 等能力�
   （排队取消不需要伪造容器）。
 - fence：(boot_id, model_id, generation, operation_id, execution_id, attempt)；execution 的 attempt 从 1 起，
   非 execution 的最后两项为 null；执行视图的 fence 必须指向该 execution。
-- 参数闭集：chat=`max_tokens`、`temperature`(0..2)、`top_p`((0,1])、`seed`(0..2^31-1)；vision 另加 `text`；
+- 参数闭集：chat=`max_tokens`、`temperature`(0..2)、`top_p`((0,1])、`seed`(0..2^31-1)、`ignore_eos`(boolean，验收用：
+  请求必须真正消耗声明的输出预算，模型自然提前停止会让边界无法证明)；vision 另加 `text`；
   embeddings=`encoding_format`（首版仅 float）；rerank=`top_n`、`return_documents`。默认值与 envelope 截断由执行层应用。
 - 错误码：24 个固定码，HTTP 状态与 retryable 以模块 `ERROR_STATUS`/`RETRYABLE_ERROR_CODES` 为准；
   错误体中的 retryable 必须与表一致，否则拒绝。

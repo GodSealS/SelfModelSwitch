@@ -180,6 +180,21 @@ class UnixControlTransport:
         return ApiResponse(status, document, body_bytes)
 
 
+GENERATION_PARAMETERS = ("temperature", "top_p", "seed", "ignore_eos")
+
+
+def parameters_of(request: Mapping[str, Any]) -> dict:
+    """The generation controls a fixture asks for, in the protocol's own vocabulary.
+
+    A fixture that must consume its declared output budget asks for `ignore_eos`;
+    the request body carries it, the protocol carries it as a parameter, and
+    anything the protocol does not define is simply not forwarded.
+    """
+    if not isinstance(request, Mapping):
+        return {}
+    return {key: request[key] for key in GENERATION_PARAMETERS if key in request}
+
+
 def operation_of(request: Mapping[str, Any]) -> str:
     """The operation the API accepts, read from the request the fixture defines.
 
@@ -339,7 +354,8 @@ class ControlApiCaseDriver:
         document = self._require(self.transport.request(
             "POST", "/internal/executions",
             {"session_token": session.token, "operation": operation_of(request),
-             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
+             "input": {"inline": dict(request)}, "parameters": parameters_of(request),
+             "idempotency_key": key}),
             f"execution create for {model_id!r}")
         execution_id = document.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:
@@ -376,7 +392,8 @@ class ControlApiCaseDriver:
         created = self._require(self.transport.request(
             "POST", "/internal/executions",
             {"session_token": session.token, "operation": operation_of(request),
-             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
+             "input": {"inline": dict(request)}, "parameters": parameters_of(request),
+             "idempotency_key": key}),
             f"execution create for {model_id!r}")
         execution_id = created.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:

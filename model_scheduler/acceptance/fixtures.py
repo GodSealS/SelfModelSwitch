@@ -69,7 +69,6 @@ class FillerSpec:
     unit: str
     tokens_per_unit: float
     template_overhead_tokens: int
-    image_tokens: int  # what one max-edge image really costs this model, measured
 
 
 def filler_text(tokens: int, *, filler: FillerSpec) -> str:
@@ -147,17 +146,21 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
                                "this model's tokenizer (a declared boundary no one can reach is not a boundary)")
         if capability == "chat":
             payload = {"messages": [{"role": "user", "content": _filler(text_tokens, filler)}],
-                       "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel}
+                       "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel,
+                       # A boundary round must really consume its output budget: left to
+                       # itself the model may answer shorter and leave the boundary unproven.
+                       "ignore_eos": True}
             boundary = {"input_tokens": envelope.max_input_tokens, "output_tokens": envelope.max_output_tokens,
                         "parallel": envelope.max_parallel}
         elif capability == "vision":
             if envelope.max_images <= 0 or envelope.max_image_edge_pixels <= 0:
                 raise FixtureError(f"{model_id}: the vision capability needs a positive image envelope")
-            if filler is None or filler.image_tokens <= 0:
-                raise FixtureError(f"{model_id}: the vision fixture needs the measured token cost of one maximum "
-                                   "image, otherwise the image budget is a guess and the boundary unreachable")
-            # The image and the template are part of the same declared input budget.
-            text_tokens = text_tokens - filler.image_tokens
+            # The adapter charges every image against the *declared* image budget
+            # (envelope.max_image_tokens), so the text portion must leave exactly
+            # that much room; anything else makes the request unservable.
+            if envelope.max_image_tokens <= 0:
+                raise FixtureError(f"{model_id}: the vision envelope needs a positive max_image_tokens budget")
+            text_tokens = text_tokens - envelope.max_images * envelope.max_image_tokens
             content = [{"type": "image_url", "image_url": {"url": _image_data_url(envelope.max_image_edge_pixels,
                                                                                    envelope.max_image_edge_pixels)}}]
             content += [{"type": "image_url", "image_url": {"url": _image_data_url(envelope.max_image_edge_pixels,
@@ -168,7 +171,8 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
                                    "template, so the vision boundary cannot be reached in one request")
             content.append({"type": "text", "text": _filler(text_tokens, filler)})
             payload = {"messages": [{"role": "user", "content": content}],
-                       "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel}
+                       "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel,
+                       "ignore_eos": True}
             boundary = {"input_tokens": envelope.max_input_tokens, "output_tokens": envelope.max_output_tokens,
                         "images": envelope.max_images, "image_edge_pixels": envelope.max_image_edge_pixels,
                         "parallel": envelope.max_parallel}

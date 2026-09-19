@@ -406,6 +406,10 @@
     "Parameters_chat": {
       "additionalProperties": false,
       "properties": {
+        "ignore_eos": {
+          "description": "keep generating until max_tokens, ignoring the end-of-sequence token",
+          "type": "boolean"
+        },
         "max_tokens": {
           "description": "requested output tokens; the effective value is min(4096, model max_output_tokens)",
           "maximum": 2147483647,
@@ -462,6 +466,10 @@
     "Parameters_vision": {
       "additionalProperties": false,
       "properties": {
+        "ignore_eos": {
+          "description": "keep generating until max_tokens, ignoring the end-of-sequence token",
+          "type": "boolean"
+        },
         "max_tokens": {
           "description": "requested output tokens; the effective value is min(4096, model max_output_tokens)",
           "maximum": 2147483647,
@@ -598,6 +606,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "capabilities": {
     "chat": [
+      "ignore_eos",
       "max_tokens",
       "seed",
       "temperature",
@@ -611,6 +620,7 @@
       "top_n"
     ],
     "vision": [
+      "ignore_eos",
       "max_tokens",
       "seed",
       "temperature",
