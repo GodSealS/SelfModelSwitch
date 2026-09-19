@@ -1358,3 +1358,37 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. `cap:chat` 的输出边界确定性：模型自然停止会低于声明输出上界；M00 用 `ignore_eos` 跑满，需要同一确定性进入 fixture/参数通路（并确认参数白名单允许）。
 3. `cap:vision`：确认图像预算扣除后的重跑（本轮运行早于该提交）。
 4. S 层与 O 层编排仍未交付（P23/P24 仅为注入式逻辑）；P30/P31 依赖本链。
+
+## P29 补记（2026-09-19，B 层第三轮：能力轮的真实观测）
+
+| 项 | 值 |
+|---|---|
+| task_id | P29（仍未完成；AC1—AC3 保持未勾） |
+| source_commit | `34a9fda`（本补记前的代码基线），记录提交 `3761c0c`、`78e4d26` |
+| candidate_sha256 | `eb2925de850162b56dd3314832f6ffa8af9fe1f8e17622e470b3c1e5e0c808a9`（run-b15） |
+| target_commit | `3761c0c`（代码与运行一致）；`78e4d26`（仅文档）**待同步**——目标机到 `github.com` 连续两次失败（`RPC failed / HTTP2 framing`、`HTTP2 stream not closed`），镜像与 checkout 停在 `3761c0c` |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/fresh/run-b15/`（cases 现在含 `facts/problems/failure`） |
+
+**新增交付（代码，均已推送并同步到 `3761c0c`）**
+
+- `34a9fda`：`ignore_eos` 进入 chat/vision 参数闭集（schema 重新导出）、adapter 转发、驱动把 fixture 的生成控制作为 protocol 参数传递；vision 文本预算按**声明的** `max_images × max_image_tokens` 扣除（校验器就是按声明计费的）。
+- `3761c0c`：`end_case` 落盘 `status/facts/problems/failure`——失败可从材料解释，不再需要重跑。
+
+**真机事实（run-b15，逐条来自材料）**
+
+| case | status | 材料事实 |
+|---|---|---|
+| `B:qwen-small:infer` | passed | 归因齐备 |
+| `B:qwen-small:envelope` | passed | 单请求达到声明边界 |
+| `B:qwen-small:cap:chat` | failed | `observed={input_tokens: 8192, output_tokens: 4096, parallel: 2}`；`problems=["chat: the response carries no non-empty content"]`。边界已达到；填充词后缺指令，回答为空 |
+| `B:qwen-small:cap:vision` | failed | `AdapterError: input tokens exceed envelope.max_input_tokens`；文本模板 19 token 不足以覆盖 vision 模板（`vision_start/image_pad/vision_end`）的开销 |
+| `load`×3 / `cancel` / `stop` / `reload`×3 | unknown | 非推理 case 缺 provider/实例事实 |
+
+**直测（经官方控制 API，同一请求）**：`ignore_eos=false` → 33 token 自然停止；`ignore_eos=true` → 4096 token 跑满。参数通路有效。
+
+**下一步（按依赖）**
+
+1. 测 vision 模板开销（用 fixture 自身的 1024×1024 图像做一次探测，取其"模板+图像占位"合计），按能力分别扣除文本预算。
+2. 填充后追加一条短指令（其 token 成本同样实测），让边界轮是一次真实请求。
+3. 非推理 case 的归属：provider=部署身份（`deployment_id@boot_id`，由候选传入、boot_id 取自控制 socket），`load` 的实例事实需在"只读实例视图"与"只读容器观察"之间决策；`cancel` 需轮询到终态并证 `cancelled`。
+4. 之后重跑 B；S 层与 O 层编排仍未交付，P30/P31 依赖本链（`78e4d26` 起需重新同步目标）。
