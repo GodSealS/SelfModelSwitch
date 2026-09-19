@@ -142,8 +142,10 @@ def container_fact(*, running: bool, status: str | None = None, exit_code: int =
         rendered = {**rendered, **labels}
     return {
         "Id": container_id,
-        "Image": image_digest,
-        "Config": {"Labels": rendered},
+        # what `docker inspect` really reports: the bare image ID in `Image`, and
+        # the reference the container was started with in `Config.Image`
+        "Image": "sha256:" + "0" * 64,
+        "Config": {"Image": image_digest, "Labels": rendered},
         "State": {
             "Running": running,
             "Status": status or ("running" if running else "exited"),

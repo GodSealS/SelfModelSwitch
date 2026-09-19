@@ -198,12 +198,16 @@ def parse_inspect_payload(raw: str) -> tuple[ContainerFact, ...]:
 def _container_fact(item: object) -> ContainerFact:
     if not isinstance(item, dict):
         raise ObservationError("docker inspect item must be an object")
-    container_id, image = item.get("Id"), item.get("Image")
+    container_id = item.get("Id")
     config, state = item.get("Config"), item.get("State")
+    # The *reference* the container was started with (`Config.Image`), never the bare
+    # image ID in `Image`: the contract and the registration both speak
+    # `name@sha256:<64-hex>`, so an ID could never be compared or reported.
+    image = config.get("Image") if isinstance(config, dict) else None
     if not isinstance(container_id, str) or not container_id:
         raise ObservationError("docker inspect item has no container id")
     if not isinstance(image, str) or not image:
-        raise ObservationError("docker inspect item has no image digest")
+        raise ObservationError("docker inspect item has no image reference")
     if not isinstance(config, dict) or not isinstance(state, dict):
         raise ObservationError("docker inspect item has no config or state")
     labels = config.get("Labels")
