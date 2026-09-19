@@ -141,6 +141,7 @@ class ControlApiCaseDriver:
     _sessions: dict[str, Session] = field(default_factory=dict, init=False)
     _counter: int = field(default=0, init=False)
     _executions: dict[str, str] = field(default_factory=dict, init=False)  # execution_id -> model_id
+    _stop_proven: dict[str, bool] = field(default_factory=dict, init=False)
 
     # -- helpers -----------------------------------------------------------
 
@@ -306,13 +307,21 @@ class ControlApiCaseDriver:
         """
         session = self._sessions.get(model_id)
         if session is None:
-            return {"session_id": None, "state": "closed", "note": "no session was open"}
+            # Nothing is open because the previous stop was proven: keep that proof,
+            # a reload must not be refused just because the stop case already ran.
+            proven = self._stop_proven.get(model_id) is True
+            return {"session_id": None, "state": "closed" if proven else None, "stop_proven": proven,
+                    "note": "no session was open"}
         self._beat_if_due(model_id)
         closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close",
                                                        {"session_token": session.token}),
                                f"session close for {model_id!r}")
         del self._sessions[model_id]
-        return {"session_id": session.session_id, "state": closed.get("state"), "view": closed}
+        # The API's own CLOSED view is the stop proof the case matrix requires.
+        proven = str(closed.get("state")) == "closed"
+        self._stop_proven[model_id] = proven
+        return {"session_id": session.session_id, "state": closed.get("state"), "stop_proven": proven,
+                "view": closed}
 
     def cleanup(self, model_id: str) -> Mapping[str, Any]:
         """Close any session left open; inline inputs mean no blobs to delete."""

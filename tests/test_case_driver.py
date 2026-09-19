@@ -155,7 +155,8 @@ def test_the_driver_refuses_execute_before_a_load() -> None:
     with pytest.raises(DriverError, match="must load it first"):
         driver.execute("qwen-small", {"messages": []})
     # a stop with nothing open is a no-op, not a failure (the matrix stops, then reloads)
-    assert driver.stop("qwen-small")["state"] == "closed"
+    assert driver.stop("qwen-small") == {"session_id": None, "state": None, "stop_proven": False,
+                                         "note": "no session was open"}
 
 
 def test_an_api_refusal_is_reported_not_guessed() -> None:
@@ -212,8 +213,10 @@ def test_cancel_carries_the_session_token_and_a_stop_without_a_session_is_a_no_o
     cancels = [(method, path, body) for method, path, body in transport.requests if path.endswith("/cancel")]
 
     assert cancels and cancels[0][2] == {"session_token": "tok-1"}  # the API demands exactly this body
-    driver.stop("qwen-small")
-    assert driver.stop("qwen-small") == {"session_id": None, "state": "closed", "note": "no session was open"}
+    stopped = driver.stop("qwen-small")
+    assert stopped["stop_proven"] is True and stopped["state"] == "closed"  # the API's CLOSED view is the proof
+    again = driver.stop("qwen-small")  # the matrix stops, then reloads: the proof survives
+    assert again["stop_proven"] is True and again["session_id"] is None
 
 
 def test_a_second_load_closes_the_previous_session_first() -> None:
