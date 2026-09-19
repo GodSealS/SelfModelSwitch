@@ -44,6 +44,73 @@ class ApiResponse:
         return 200 <= self.status < 300
 
 
+def observed_of(request: Mapping[str, Any], output: Mapping[str, Any] | None) -> dict:
+    """What this round really reached, read from the request and the response.
+
+    A declared boundary is only proven when the round's own usage says so: the
+    image count and edge are read back from what was sent, and the token counts
+    come from the model's usage. Anything the round cannot show stays absent,
+    which fails the boundary comparison instead of satisfying it.
+    """
+    observed: dict[str, Any] = {"parallel": request.get("n_parallel") if isinstance(request, Mapping) else None}
+    images, edge = _image_boundary(request)
+    if images:
+        observed["images"] = images
+    if edge is not None:
+        observed["image_edge_pixels"] = edge
+    usage = output.get("usage") if isinstance(output, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return observed
+    for key, field in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
+        value = usage.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        observed[key] = value
+    return observed
+
+
+def _image_boundary(request: Mapping[str, Any]) -> tuple[int, int | None]:
+    """How many images were sent and how large the largest one really is."""
+    images = 0
+    edge: int | None = None
+    if not isinstance(request, Mapping):
+        return 0, None
+    for message in request.get("messages") or []:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping) or part.get("type") != "image_url":
+                continue
+            url = part.get("image_url", {})
+            url = url.get("url") if isinstance(url, Mapping) else None
+            if not isinstance(url, str):
+                continue
+            images += 1
+            size = _png_edge(url)
+            if size is not None:
+                edge = max(edge or 0, size)
+    return images, edge
+
+
+def _png_edge(url: str) -> int | None:
+    """The edge of an inline PNG, read from its header; a claim is not a measurement."""
+    import base64
+    import struct
+
+    marker = "base64,"
+    if not url.startswith("data:image/") or marker not in url:
+        return None
+    try:
+        raw = base64.b64decode(url.split(marker, 1)[1], validate=False)
+    except (ValueError, TypeError):
+        return None
+    if raw[:8] != b"\x89PNG\r\n\x1a\n" or len(raw) < 24:
+        return None
+    width, height = struct.unpack(">II", raw[16:24])
+    return max(width, height)
+
+
 def provider_of(instance: Mapping[str, Any] | None) -> str | None:
     """Who ran this action: the runtime identity the deployment reported.
 
@@ -294,9 +361,10 @@ class ControlApiCaseDriver:
         finally:
             rows = () if sampler is None else tuple(sampler.stop())
         instance = view.get("instance")
+        output = self._published_output(view.get("result"))
         return {"execution_id": execution_id, "state": view.get("state"), "dispatch_state": view.get("dispatch_state"),
                 "compute_quiescent": view.get("compute_quiescent"), "result": view.get("result"),
-                "output": self._published_output(view.get("result")),
+                "output": output, "observed": observed_of(request, output),
                 "provider": provider_of(instance), "instance": instance,
                 "device_activity": derive_attribution(rows) if rows else None, "samples": rows,
                 "fence": view.get("fence"), "error": view.get("error"), "view": view}

@@ -412,6 +412,50 @@ def test_device_activity_is_derived_from_raw_rows_never_from_a_boolean() -> None
     assert executed["samples"] == rows
 
 
+def test_the_round_reports_what_it_really_consumed() -> None:
+    """The boundary is judged on this round's own usage, never on the declaration."""
+    output = {"message": {"content": "hi"}, "usage": {"prompt_tokens": 1234, "completion_tokens": 56}}
+    transport = _ResultBlobTransport(output, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", {**_chat_payload(), "n_parallel": 2})
+
+    assert executed["observed"] == {"input_tokens": 1234, "output_tokens": 56, "parallel": 2}
+
+
+def test_the_observed_boundary_counts_the_images_it_really_sent() -> None:
+    import base64
+
+    from model_scheduler.acceptance.fixtures import render_test_png
+
+    url = "data:image/png;base64," + base64.b64encode(render_test_png(8, 8)).decode("ascii")
+    request = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": url}},
+        {"type": "image_url", "image_url": {"url": url}},
+        {"type": "text", "text": "describe"}]}]}
+    transport = _ResultBlobTransport({"usage": {"prompt_tokens": 900, "completion_tokens": 4}},
+                                     execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", request)
+
+    # the edge is read back from the image that was sent, not copied from the envelope
+    assert executed["observed"]["images"] == 2 and executed["observed"]["image_edge_pixels"] == 8
+    assert executed["observed"]["input_tokens"] == 900
+
+
+def test_a_round_without_usage_reports_no_token_boundary() -> None:
+    transport = _ResultBlobTransport({"message": {"content": "hi"}}, execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None)
+    driver.load("qwen-small", cold=True)
+
+    executed = driver.execute("qwen-small", _chat_payload())
+
+    assert executed["observed"] == {"parallel": None}  # unreached is unreached, never declared reached
+
+
 def test_a_case_without_samples_records_no_device_activity() -> None:
     transport = _ResultBlobTransport({"message": {"content": "hi"}}, execution_states=["succeeded"])
     driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None, sampler_factory=lambda: _Sampler(()))
