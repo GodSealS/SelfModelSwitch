@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 import json
 from pathlib import Path
 import struct
@@ -53,11 +54,31 @@ class Fixture:
                 "boundary": dict(self.boundary), "artifact_name": self.artifact_name}
 
 
-def filler_text(tokens: int, *, seed: int = FILLER_SEED) -> str:
-    """Space-separated deterministic filler, one token per word."""
+@dataclass(frozen=True)
+class FillerSpec:
+    """How many real tokens one filler unit costs, as measured for that model.
+
+    The count is a measurement of the model's own tokenizer, not an assumption:
+    with 7 tokens per `tok000123` unit a request declared for 28 672 tokens was
+    really 200 723 tokens and the model refused it for exceeding its context. The
+    material that carries a fixture therefore carries the ratio too.
+    """
+
+    unit: str
+    tokens_per_unit: float
+
+
+def filler_text(tokens: int, *, filler: FillerSpec) -> str:
+    """Deterministic filler sized in *real* tokens, from the measured ratio."""
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
         raise FixtureError("the filler token count must be a non-negative integer")
-    return " ".join(f"tok{seed + index:06d}" for index in range(tokens))
+    ratio = filler.tokens_per_unit
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
+        raise FixtureError("the filler needs a measured positive tokens-per-unit ratio")
+    if not isinstance(filler.unit, str) or not filler.unit or any(char.isspace() for char in filler.unit):
+        raise FixtureError("the filler unit must be a single non-blank word")
+    units = math.ceil(tokens / ratio) if tokens else 0
+    return " ".join(filler.unit for _ in range(units))
 
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -84,22 +105,39 @@ def _image_data_url(width: int, height: int) -> str:
     return "data:image/png;base64," + base64.b64encode(render_test_png(width, height)).decode("ascii")
 
 
+def _filler(tokens: int, filler: FillerSpec | None) -> str:
+    """The filler of one request; a missing measurement is a refusal, not a default."""
+    if filler is None:
+        raise FixtureError("the text filler needs the measured tokens-per-unit ratio of this model's tokenizer")
+    return filler_text(tokens, filler=filler)
+
+
 def _text_tokens_within(envelope) -> int:
     """The text budget that is left once the image budget is accounted for."""
     return int(envelope.max_input_tokens)
 
 
-def fixtures_for(model_id: str, capabilities: Sequence[str], envelope) -> tuple[Fixture, ...]:
-    """One fixture per declared capability, each reaching its declared boundary."""
+def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
+                 filler: FillerSpec | None = None) -> tuple[Fixture, ...]:
+    """One fixture per declared capability, each reaching its declared boundary.
+
+    `filler` is the measured token ratio of this model's tokenizer. Without it a
+    text boundary cannot be constructed honestly, so the call is refused rather
+    than silently assuming one word costs one token.
+    """
     fixtures: list[Fixture] = []
+    text_tokens = _text_tokens_within(envelope)  # a text budget is only usable with a measurement
     for capability in capabilities:
         if capability in FORBIDDEN_FIXTURE_KINDS:
             raise FixtureError(f"{model_id}: {capability!r} is not an acceptance capability: video/audio quality is "
                                "never claimed by this plan")
         if capability not in CAPABILITY_FIXTURES:
             raise FixtureError(f"{model_id}: no fixture is defined for capability {capability!r}")
+        if capability in ("chat", "vision") and filler is None:
+            raise FixtureError(f"{model_id}: the {capability} fixture needs the measured tokens-per-unit ratio of "
+                               "this model's tokenizer (a declared boundary no one can reach is not a boundary)")
         if capability == "chat":
-            payload = {"messages": [{"role": "user", "content": filler_text(_text_tokens_within(envelope))}],
+            payload = {"messages": [{"role": "user", "content": _filler(text_tokens, filler)}],
                        "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel}
             boundary = {"input_tokens": envelope.max_input_tokens, "output_tokens": envelope.max_output_tokens,
                         "parallel": envelope.max_parallel}
@@ -111,18 +149,18 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope) -> tuple[
             content += [{"type": "image_url", "image_url": {"url": _image_data_url(envelope.max_image_edge_pixels,
                                                                                    envelope.max_image_edge_pixels)}}
                         for _ in range(envelope.max_images - 1)]
-            content.append({"type": "text", "text": filler_text(_text_tokens_within(envelope))})
+            content.append({"type": "text", "text": _filler(text_tokens, filler)})
             payload = {"messages": [{"role": "user", "content": content}],
                        "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel}
             boundary = {"input_tokens": envelope.max_input_tokens, "output_tokens": envelope.max_output_tokens,
                         "images": envelope.max_images, "image_edge_pixels": envelope.max_image_edge_pixels,
                         "parallel": envelope.max_parallel}
         elif capability == "embeddings":
-            payload = {"inputs": [f"doc {index:04d} {filler_text(8)}" for index in range(MAX_EMBEDDING_BATCH)]}
+            payload = {"inputs": [f"doc {index:04d}" for index in range(MAX_EMBEDDING_BATCH)]}
             boundary = {"batch": MAX_EMBEDDING_BATCH}
         else:  # rerank
-            payload = {"query": filler_text(32),
-                       "documents": [f"doc {index:04d} {filler_text(16)}" for index in range(MAX_RERANK_DOCUMENTS)]}
+            payload = {"query": "doc query",
+                       "documents": [f"doc {index:04d}" for index in range(MAX_RERANK_DOCUMENTS)]}
             boundary = {"documents": MAX_RERANK_DOCUMENTS}
         fixtures.append(Fixture(capability=capability, fixture_id=f"{model_id}-{capability}",
                                 payload=payload, boundary=boundary,

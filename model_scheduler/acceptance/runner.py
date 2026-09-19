@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import atexit
+import hashlib
+import math
 import os
 import shutil
 import tempfile
@@ -39,8 +41,12 @@ from ..evidence_contracts import (
 )
 from .collector import FileCollector, collector_sha256
 from .device_activity import ManagedComputeSampler
+from .fixtures import FillerSpec
 
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
+FIXTURE_MATERIAL_NAME = "fixtures.json"
+FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "evaluator", "fixtures", "fillers"})
+FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "unit"})
 EXIT_INPUT = 2
 EXIT_FAILED = 3
 
@@ -77,6 +83,44 @@ def _document_of(report: AcceptanceReportV3) -> dict:
     }
 
 
+def load_filler_specs(root: Path, candidate: Any) -> dict[str, FillerSpec]:
+    """Read the frozen fixture material and check it against the candidate's refs.
+
+    A run may not fall back on the package's own fixtures: the candidate names the
+    material it was frozen with, and the same directory supplies the measured
+    tokens-per-unit ratio without which no text boundary can be built honestly.
+    """
+    directory = Path(root)
+    if not directory.is_dir():
+        raise LayerError(f"the fixture material {directory} is not a directory", exit_code=EXIT_INPUT)
+    for reference in candidate.fixture_refs:
+        path = directory / reference.relative_path
+        if not path.is_file():
+            raise LayerError(f"the fixture {reference.relative_path} the candidate names is missing under {directory}",
+                             exit_code=EXIT_INPUT)
+        if path.stat().st_size != reference.size_bytes or _sha256_file(path) != reference.sha256:
+            raise LayerError(f"the fixture {reference.relative_path} differs from the candidate's reference: "
+                             "a run may not use material the candidate does not name", exit_code=EXIT_INPUT)
+    document = _read_json(directory / FIXTURE_MATERIAL_NAME)
+    if not isinstance(document, dict) or set(document) != FIXTURE_MATERIAL_KEYS:
+        raise LayerError(f"{directory / FIXTURE_MATERIAL_NAME}: keys must be exactly {sorted(FIXTURE_MATERIAL_KEYS)}",
+                         exit_code=EXIT_INPUT)
+    specs: dict[str, FillerSpec] = {}
+    for index, entry in enumerate(document.get("fillers") or []):
+        where = f"fillers[{index}]"
+        if not isinstance(entry, dict) or set(entry) != FILLER_ENTRY_KEYS:
+            raise LayerError(f"{where}: keys must be exactly {sorted(FILLER_ENTRY_KEYS)}", exit_code=EXIT_INPUT)
+        model_id = entry.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            raise LayerError(f"{where}: model_id is required", exit_code=EXIT_INPUT)
+        ratio = entry.get("tokens_per_unit")
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
+            raise LayerError(f"{where}: tokens_per_unit must be a measured positive number, not an assumption",
+                             exit_code=EXIT_INPUT)
+        specs[model_id] = FillerSpec(unit=str(entry["unit"]), tokens_per_unit=float(ratio))
+    return specs
+
+
 def compute_sampler_factory(scratch: Path) -> Callable[[], ManagedComputeSampler]:
     """One sampler per execution, each over a scratch log it removes once read.
 
@@ -97,6 +141,7 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
                 transport: Any = None, executor: Any = None, run_id: str | None = None,
                 sampler_factory: Callable[[], Any] | None = None,
                 collector_factory: Callable[..., FileCollector] = FileCollector,
+                fixtures_root: Path | None = None, filler_of: Mapping[str, Any] | None = None,
                 clock: Callable[[], float] | None = None) -> dict:
     """Execute the B matrix of every registered model and persist its v3 report."""
     from .backend_cases import CaseExecutor
@@ -136,7 +181,12 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
     run = run_id or uuid4().hex
     collector = collector_factory(output, run_id=run, candidate_sha256=digest, device_digest=device,
                                   boot_id=boot_id)
-    machine = executor if executor is not None else CaseExecutor(driver, collector=collector)
+    fillers = dict(filler_of) if filler_of is not None else load_filler_specs(Path(fixtures_root), candidate) \
+        if fixtures_root is not None else None
+    if executor is None and fillers is None:
+        raise LayerError("the fixture material is required: a run may not build cases from the package's own "
+                         "fixtures", exit_code=EXIT_INPUT)
+    machine = executor if executor is not None else CaseExecutor(driver, collector=collector, filler_of=fillers)
 
     attempts: list[Any] = []
     for model in candidate.models:
@@ -193,6 +243,14 @@ def _finals_of(attempts: list[Any]) -> list[Any]:
     for item in attempts:
         last[item.case_id] = item
     return list(last.values())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _read_json(path: Path) -> Mapping[str, Any]:

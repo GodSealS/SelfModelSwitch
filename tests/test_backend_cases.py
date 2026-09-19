@@ -20,6 +20,9 @@ from model_scheduler.contracts_v2 import Envelope
 
 ENVELOPE = Envelope(ctx_size=1024, max_input_tokens=512, max_output_tokens=64, max_parallel=2,
                     max_image_tokens=64, max_image_edge_pixels=64, max_images=1)
+# A measured ratio: one filler unit of "a" really costs this tokenizer one token.
+FILLER = fx.FillerSpec(unit="a", tokens_per_unit=1.0)
+FILLERS = {"qwen-small": FILLER}
 
 
 def _text_words(request) -> int:
@@ -112,7 +115,7 @@ class FakeDriver:
 
 
 def _run(driver: FakeDriver, capabilities=("chat", "vision"), collector=None, **kwargs):
-    executor = bc.CaseExecutor(driver, collector=collector, **kwargs)
+    executor = bc.CaseExecutor(driver, collector=collector, filler_of=FILLERS, **kwargs)
     return executor.run_model(model_id="qwen-small", capabilities=capabilities, envelope=ENVELOPE)
 
 
@@ -135,7 +138,7 @@ def test_the_envelope_round_reaches_every_declared_boundary_in_one_request() -> 
     attempts = _run(driver)
 
     envelope = [attempt for attempt in attempts if attempt.case_id.endswith(":envelope")][0]
-    fixture = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)[0]
+    fixture = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE, filler=FILLER)[0]
     assert envelope.status == "passed"
     assert fx.boundary_shortfalls(fixture, envelope.facts["observed"]) == []
     # one request per inference case: infer + envelope + two capability cases, never split up
@@ -182,7 +185,7 @@ def test_the_raw_rows_a_driver_returns_become_the_case_material(tmp_path) -> Non
     collector = FileCollector(tmp_path, run_id="run-1", candidate_sha256="a" * 64, device_digest="b" * 64,
                               boot_id="boot-1")
 
-    executor = bc.CaseExecutor(driver, collector=collector, cold_starts=3, reload_rounds=3)
+    executor = bc.CaseExecutor(driver, collector=collector, cold_starts=3, reload_rounds=3, filler_of=FILLERS)
     executor.run_model(model_id="qwen-small", capabilities=("chat",), envelope=ENVELOPE)
 
     rows = [json.loads(line) for line in (tmp_path / "samples" / "tegrastats.jsonl").read_text().splitlines()
@@ -279,7 +282,7 @@ def test_the_executor_refuses_fewer_than_the_acceptance_minimum() -> None:
 
 
 def test_capability_fixtures_are_deterministic_and_reach_the_declared_boundary() -> None:
-    fixtures = fx.fixtures_for("qwen-small", ("chat", "vision", "embeddings", "rerank"), ENVELOPE)
+    fixtures = fx.fixtures_for("qwen-small", ("chat", "vision", "embeddings", "rerank"), ENVELOPE, filler=FILLER)
 
     assert [fixture.capability for fixture in fixtures] == ["chat", "vision", "embeddings", "rerank"]
     chat = fixtures[0]
@@ -288,7 +291,25 @@ def test_capability_fixtures_are_deterministic_and_reach_the_declared_boundary()
     vision = fixtures[1]
     assert vision.boundary["images"] == 1 and vision.boundary["image_edge_pixels"] == 64
     assert sum(1 for item in vision.payload["messages"][0]["content"] if item["type"] == "image_url") == 1
-    assert fx.fixture_bytes(chat) == fx.fixture_bytes(fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)[0])
+    assert fx.fixture_bytes(chat) == fx.fixture_bytes(fx.fixtures_for("qwen-small", ("chat",), ENVELOPE,
+                                                                      filler=FILLER)[0])
+
+
+def test_a_text_boundary_is_built_from_the_measured_token_ratio() -> None:
+    """7 tokens per unit is what the target tokenizer really costs: 512/7 units, not 512."""
+    expensive = fx.FillerSpec(unit="tok000123", tokens_per_unit=7.0)
+
+    chat = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE, filler=expensive)[0]
+
+    assert len(chat.payload["messages"][0]["content"].split()) == 74  # ceil(512 / 7)
+    assert chat.boundary["input_tokens"] == ENVELOPE.max_input_tokens  # the declaration never moves
+
+
+def test_a_boundary_without_a_measured_ratio_is_refused() -> None:
+    with pytest.raises(fx.FixtureError, match="measured tokens-per-unit"):
+        fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)
+    with pytest.raises(bc.BackendCaseError, match="measured tokens-per-unit"):
+        bc.CaseExecutor(FakeDriver()).run_model(model_id="qwen-small", capabilities=("chat",), envelope=ENVELOPE)
 
 
 def test_video_and_audio_quality_are_never_fixtures() -> None:
@@ -298,7 +319,7 @@ def test_video_and_audio_quality_are_never_fixtures() -> None:
 
 
 def test_fixture_material_carries_size_and_hash(tmp_path) -> None:
-    fixtures = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)
+    fixtures = fx.fixtures_for("qwen-small", ("chat",), ENVELOPE, filler=FILLER)
 
     entries = fx.write_fixture_material(tmp_path, fixtures)
 
@@ -313,17 +334,22 @@ def test_the_run_command_validates_layers_and_refuses_until_the_orchestration_ex
     from model_scheduler.acceptance import EXIT_FAILED, EXIT_INPUT
     from model_scheduler.acceptance.__main__ import main
 
-    assert main(["run", "--candidate", "c.json", "--layers", "B,Q", "--output", str(tmp_path / "a")]) == EXIT_INPUT
-    assert main(["run", "--candidate", "c.json", "--layers", "B,B", "--output", str(tmp_path / "a")]) == EXIT_INPUT
+    root = str(tmp_path / "fixtures")
+    assert main(["run", "--candidate", "c.json", "--layers", "B,Q", "--output", str(tmp_path / "a"),
+                 "--fixtures-root", root]) == EXIT_INPUT
+    assert main(["run", "--candidate", "c.json", "--layers", "B,B", "--output", str(tmp_path / "a"),
+                 "--fixtures-root", root]) == EXIT_INPUT
 
-    code = main(["run", "--candidate", "c.json", "--layers", "S,B", "--output", str(tmp_path / "b")])
+    code = main(["run", "--candidate", "c.json", "--layers", "S,B", "--output", str(tmp_path / "b"),
+                 "--fixtures-root", root])
 
     assert code == EXIT_FAILED  # an undelivered layer must not be executed, even partly
     assert "no orchestration yet" in capsys.readouterr().err
     assert not (tmp_path / "b" / "report.json").exists()
 
     # B alone is wired now: it refuses *before* touching anything when the site is not up.
-    code = main(["run", "--candidate", "c.json", "--layers", "B", "--output", str(tmp_path / "c")])
+    code = main(["run", "--candidate", "c.json", "--layers", "B", "--output", str(tmp_path / "c"),
+                 "--fixtures-root", root])
     assert code == EXIT_INPUT
     assert "SMS_CONTROL_SOCKET" in capsys.readouterr().err
     assert not (tmp_path / "c" / "report.json").exists()

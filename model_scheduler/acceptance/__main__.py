@@ -129,7 +129,8 @@ def _run(args) -> int:
     from .runner import LayerError, run_b_layer
 
     try:
-        summary = run_b_layer(candidate_path=args.candidate, output=args.output)
+        summary = run_b_layer(candidate_path=args.candidate, output=args.output,
+                              fixtures_root=args.fixtures_root)
     except LayerError as exc:
         print(f"run: {exc}", file=sys.stderr)
         return exc.exit_code
@@ -208,6 +209,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--candidate", type=Path, required=True)
     run_parser.add_argument("--layers", required=True, help="comma-separated subset of S,B,O")
     run_parser.add_argument("--output", type=Path, required=True)
+    run_parser.add_argument("--fixtures-root", type=Path, required=True,
+                            help="the directory of the fixture material the candidate names (with the measured "
+                                 "tokens-per-unit ratio); cases are never built from the package's own fixtures")
 
     candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
     candidate_parser.add_argument("--config", type=Path, required=True)

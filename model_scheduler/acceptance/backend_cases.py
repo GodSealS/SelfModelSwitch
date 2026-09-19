@@ -27,7 +27,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from ..evidence_contracts import BACKEND_CASE_MIN_COLD_STARTS, BACKEND_CASE_MIN_RELOAD_ROUNDS
 from .collector import FileCollector
-from .fixtures import Fixture, FixtureError, boundary_shortfalls, fixtures_for
+from .fixtures import FillerSpec, Fixture, FixtureError, boundary_shortfalls, fixtures_for
 
 CASE_KINDS = ("load", "infer", "envelope", "cancel", "stop", "reload")
 STATUSES = ("passed", "failed", "unknown", "not_run")
@@ -150,7 +150,8 @@ class CaseExecutor:
 
     def __init__(self, driver: CaseDriver, *, clock=None, collector: FileCollector | None = None,
                  cold_starts: int = BACKEND_CASE_MIN_COLD_STARTS,
-                 reload_rounds: int = BACKEND_CASE_MIN_RELOAD_ROUNDS) -> None:
+                 reload_rounds: int = BACKEND_CASE_MIN_RELOAD_ROUNDS,
+                 filler_of: Mapping[str, FillerSpec] | None = None) -> None:
         if cold_starts < BACKEND_CASE_MIN_COLD_STARTS:
             raise BackendCaseError("the acceptance minimum is three independent cold starts")
         if reload_rounds < BACKEND_CASE_MIN_RELOAD_ROUNDS:
@@ -160,13 +161,15 @@ class CaseExecutor:
         self.collector = collector
         self.cold_starts = cold_starts
         self.reload_rounds = reload_rounds
+        self.filler_of = filler_of  # the measured token ratio per model, from the frozen material
 
     # -- the matrix --------------------------------------------------------
 
     def run_model(self, *, model_id: str, capabilities: Sequence[str], envelope) -> tuple[Attempt, ...]:
         """Every case of one model. Failures are recorded; nothing is retried silently."""
         try:
-            fixtures = fixtures_for(model_id, capabilities, envelope)
+            filler = None if self.filler_of is None else self.filler_of.get(model_id)
+            fixtures = fixtures_for(model_id, capabilities, envelope, filler=filler)
         except FixtureError as exc:
             raise BackendCaseError(str(exc)) from exc
         by_capability = {fixture.capability: fixture for fixture in fixtures}
