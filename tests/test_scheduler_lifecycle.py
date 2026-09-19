@@ -1053,3 +1053,44 @@ async def test_storage_recovery_revalidates_and_never_replays_inference() -> Non
     assert registry.runtime["chat"].leases == {}
     lease = await scheduler.acquire("chat", "req-2", asyncio.get_running_loop().time() + 5)
     await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_a_v2_registration_acquires_through_the_ledger() -> None:
+    """The target bring-up bug: a v2 registration carries no scheduling fields.
+
+    `contracts_v2.ModelSpec` has no `priority` (the ledger supplies the default),
+    so the acquire path must read the ledger — reading the raw spec crashed.
+    """
+    from model_scheduler.contracts_v2 import (
+        AssetRef,
+        DeploymentSpec,
+        Envelope,
+        ModelSpec as RegisteredModel,
+        RuntimeSpec,
+    )
+    from model_scheduler.runtime import ledger_specs_from
+
+    runtime = RuntimeSpec(runtime_id="rt", profile_id="llama-cpp-gguf-v1",
+                          image_digest="img@sha256:" + "a" * 64, adapter_sha256="b" * 64,
+                          lock_sha256="c" * 64, startup_args=("--no-webui",))
+    model = RegisteredModel(model_id="chat", runtime_id="rt", capabilities=("chat",),
+                            assets=(AssetRef(role="model", path="m.gguf", sha256="d" * 64, size_bytes=1),),
+                            port=10003, envelope=Envelope(ctx_size=4096, max_input_tokens=2048,
+                                                          max_output_tokens=1024, max_parallel=1,
+                                                          max_image_tokens=0, max_image_edge_pixels=0, max_images=0),
+                            timeout_seconds=60, reserved_bytes=100, measured=False,
+                            measurement_ref=None, physical_resident_peak_bytes=None)
+    specs = ledger_specs_from(registration=DeploymentSpec(runtimes=(runtime,), models=(model,)))
+    registry = Book(specs, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    backend = Backend()
+    scheduler = ModelScheduler(registry, Resources(), backend, queue_capacity=2)
+
+    pending = asyncio.create_task(scheduler.acquire("chat", "v2-request", asyncio.get_running_loop().time() + 1))
+    await backend.started.wait()
+    backend.finish.set()
+    lease = await pending
+
+    assert lease is not None
+    await scheduler.release(lease, Outcome.SUCCESS)

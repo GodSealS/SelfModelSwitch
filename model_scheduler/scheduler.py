@@ -113,7 +113,7 @@ class ModelScheduler:
                 raise Conflict("session_exclusive")
             try:
                 kind = WaitKind.SESSION if session_id is not None else WaitKind.INTERACTIVE
-                self._queue.enqueue(request_id, model_id, self.book.specs[model_id].priority, deadline, self._clock(), kind=kind)
+                self._queue.enqueue(request_id, model_id, self.book.ledger[model_id].priority, deadline, self._clock(), kind=kind)
             except ValueError as exc:
                 raise Conflict("duplicate waiter") from exc
             except OverflowError as exc:
