@@ -169,11 +169,16 @@ class LlamaCppAdapter:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise AdapterError("execution timed out before dispatch", "execution_timeout")
-        request = self._client.build_request(method, url, json=None if json_body is None else dict(json_body))
+        # The execution deadline is the only authority over a request's lifetime:
+        # an injected client's own default (httpx ships 5 s) must never cut a real
+        # inference short, and a timeout that does happen means the deadline
+        # elapsed — never "upstream unavailable".
+        request = self._client.build_request(method, url, json=None if json_body is None else dict(json_body),
+                                             timeout=remaining)
         try:
             async with asyncio.timeout(remaining):
                 response = await self._client.send(request, follow_redirects=False)
-        except asyncio.TimeoutError as exc:
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
             raise AdapterError("upstream timed out", "execution_timeout") from exc
         except httpx.HTTPError as exc:
             raise AdapterError(f"upstream unavailable: {exc}", "backend_failed") from exc

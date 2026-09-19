@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
+import inspect
 import json
 import struct
+import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -199,7 +203,10 @@ class RecordingTransport(httpx.AsyncBaseTransport):
         if handler is None:
             return httpx.Response(404, json={"error": "missing"})
         if callable(handler):
-            return handler(request)
+            produced = handler(request)
+            if inspect.isawaitable(produced):  # a slow upstream is how a real inference behaves
+                produced = await produced
+            return produced
         status, payload = handler
         if isinstance(payload, bytes):
             return httpx.Response(status, content=payload)
@@ -228,6 +235,66 @@ def _apply_template(request: httpx.Request) -> httpx.Response:
                 if isinstance(item, dict) and item.get("type") == "text":
                     parts.append(str(item.get("text") or ""))
     return httpx.Response(200, json={"prompt": " ".join(parts)})
+
+
+class _SlowLlamaServer:
+    """A real loopback llama-server whose chat answer takes `chat_delay` seconds."""
+
+    def __init__(self, *, chat_delay: float) -> None:
+        outer = self
+        self.chat_delay = chat_delay
+        self.paths: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _answer(self, payload: dict | list) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # the client gave up: a real timeout is not the server's failure
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server's own API
+                outer.paths.append(self.path)
+                self.rfile.read(int(self.headers.get("content-length") or 0))
+                if self.path == "/apply-template":
+                    self._answer({"prompt": "hello"})
+                elif self.path == "/tokenize":
+                    self._answer({"tokens": [1, 2, 3]})
+                elif self.path == "/v1/chat/completions":
+                    time.sleep(outer.chat_delay)
+                    self._answer(_chat_ok())
+                else:
+                    self.send_error(404)
+
+            def do_GET(self) -> None:  # noqa: N802
+                outer.paths.append(self.path)
+                if self.path == "/slots":
+                    self._answer([{"id": 0, "is_processing": False}])
+                else:
+                    self.send_error(404)
+
+            def log_message(self, *args) -> None:
+                return  # the test output stays readable
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 def _client(routes: dict[str, object], *, follow_redirects: bool = False) -> tuple[httpx.AsyncClient, RecordingTransport]:
@@ -317,6 +384,53 @@ async def test_adapter_satisfies_backend_port_and_consumes_chat_messages() -> No
     assert "/tokenize" in paths
     assert "/v1/chat/completions" in paths
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_execution_deadline_not_the_clients_default_timeout_governs_dispatch() -> None:
+    """A real inference outlives a short client timeout; only the deadline may cut it.
+
+    The Orin run showed this the hard way: every control-API execution died as
+    `backend_failed` because the injected client kept httpx's default read
+    timeout, so a cold model that needed longer than five seconds to answer was
+    reported as an unavailable upstream. The server is a real loopback socket on
+    purpose: a custom `AsyncBaseTransport` ignores httpx timeouts and would hide
+    exactly the defect this pins.
+    """
+    server = _SlowLlamaServer(chat_delay=0.3)
+    client = httpx.AsyncClient(base_url=server.base_url, follow_redirects=False, timeout=0.1)
+    adapter = _adapter(client, inference_base_url=server.base_url)
+    try:
+        handle = await adapter.execute(
+            ExecutionRequest(execution_id="e-1", operation="chat",
+                             inline_input={"messages": [{"role": "user", "content": "hello"}]}),
+            _fence(),
+            asyncio.get_running_loop().time() + 10,
+        )
+        assert isinstance(handle, ExecutionHandle)
+        assert "/v1/chat/completions" in server.paths
+    finally:
+        await client.aclose()
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_that_outlives_the_deadline_is_a_timeout_not_a_backend_failure() -> None:
+    server = _SlowLlamaServer(chat_delay=5.0)
+    client = httpx.AsyncClient(base_url=server.base_url, follow_redirects=False, timeout=0.1)
+    adapter = _adapter(client, inference_base_url=server.base_url)
+    try:
+        with pytest.raises(Exception) as error:
+            await adapter.execute(
+                ExecutionRequest(execution_id="e-1", operation="chat",
+                                 inline_input={"messages": [{"role": "user", "content": "hello"}]}),
+                _fence(),
+                asyncio.get_running_loop().time() + 0.15,
+            )
+        assert getattr(error.value, "code", None) == "execution_timeout"
+    finally:
+        await client.aclose()
+        server.close()
 
 
 @pytest.mark.asyncio
