@@ -30,26 +30,33 @@ class _Transport:
         self.terminal = terminal
         self.execution_states = execution_states or []
         self.reads = 0
+        self._sessions = 0
+        self._executions = 0
 
     def request(self, method: str, path: str, body=None) -> ApiResponse:
         self.requests.append((method, path, body))
         if self.fail_on is not None and self.fail_on in path:
             return ApiResponse(409, {"error": {"code": "conflict", "message": "already open"}})
-        if path.startswith("/internal/sessions/") and method == "POST":
-            if path.endswith("/close"):
-                return ApiResponse(200, {"session_id": path.split("/")[3], "state": "closed", "phase": None,
-                                         "boot_id": "boot-x", "model_id": "qwen-small", "expires_in_ms": 0,
-                                         "hard_remaining_ms": 0, "owner_token": None, "error": None})
-            return ApiResponse(201, {"session_id": path.split("/")[3], "state": "preparing", "phase": "loading",
-                                     "boot_id": "boot-x", "model_id": body["model_id"], "expires_in_ms": 30000,
-                                     "hard_remaining_ms": 60000, "owner_token": "tok-1", "error": None})
+        if method == "GET" and path == "/internal/peer":
+            return ApiResponse(200, {"owner": "uid:1000", "boot_id": "boot-x", "via": "sms-control"})
+        if path == "/internal/sessions" and method == "POST":
+            self._sessions += 1
+            return ApiResponse(201, {"session_id": f"session-{self._sessions}", "state": "preparing",
+                                     "phase": "loading", "boot_id": "boot-x", "model_id": body["model_id"],
+                                     "expires_in_ms": 30000, "hard_remaining_ms": 60000,
+                                     "owner_token": f"tok-{self._sessions}", "error": None})
+        if path.startswith("/internal/sessions/") and method == "POST" and path.endswith("/close"):
+            return ApiResponse(200, {"session_id": path.split("/")[3], "state": "closed", "phase": None,
+                                     "boot_id": "boot-x", "model_id": "qwen-small", "expires_in_ms": 0,
+                                     "hard_remaining_ms": 0, "owner_token": None, "error": None})
         if path.startswith("/internal/executions/") and method == "POST" and path.endswith("/cancel"):
             self.terminal = "cancelled"
             return ApiResponse(200, {"execution_id": path.split("/")[3], "state": "cancelling",
                                      "dispatch_state": "dispatched", "compute_quiescent": False, "result": None,
                                      "error": None, "instance": None, "fence": None})
-        if path.startswith("/internal/executions/") and method == "POST":
-            return ApiResponse(201, {"execution_id": path.split("/")[3], "state": "running",
+        if path == "/internal/executions" and method == "POST":
+            self._executions += 1
+            return ApiResponse(201, {"execution_id": f"execution-{self._executions + 1}", "state": "running",
                                      "dispatch_state": "dispatched", "compute_quiescent": False, "result": None,
                                      "error": None, "instance": {"container_id": "abc", "started_at": "t0",
                                                                  "deployment_id": "sms-orin-lab",
@@ -60,7 +67,8 @@ class _Transport:
                                                                  "image_digest": "sms-llama-cpp@sha256:" + "a" * 64},
                                      "fence": {"boot_id": "boot-x", "model_id": "qwen-small", "generation": 1,
                                                "operation_id": "op-1",
-                                               "execution_id": path.split("/")[3], "attempt": 1}})
+                                               "execution_id": f"execution-{self._executions + 1}",
+                                               "attempt": 1}})
         if path.startswith("/internal/executions/") and method == "GET":
             self.reads += 1
             state = self.execution_states.pop(0) if self.execution_states else self.terminal
@@ -90,9 +98,9 @@ def test_a_load_opens_a_session_and_execute_polls_to_terminal() -> None:
     loaded = driver.load("qwen-small", cold=True)
     executed = driver.execute("qwen-small", {"messages": [{"role": "user", "content": "hi"}]})
 
-    assert loaded["session_id"] == "session-1" and loaded["cold"] is True
+    assert loaded["session_id"] == "session-1" and loaded["cold"] is True and loaded["boot_id"] == "boot-x"
     assert [(method, path) for method, path, _b in transport.requests] == [
-        ("POST", "/internal/sessions/session-1"), ("POST", "/internal/executions/execution-2"),
+        ("POST", "/internal/sessions"), ("POST", "/internal/executions"),
         ("GET", "/internal/executions/execution-2")]  # create said running, one read said succeeded
     create = transport.requests[0][2]
     assert create == {"model_id": "qwen-small", "idempotency_key": "session-1", "correlation_id": "acceptance"}
@@ -123,7 +131,7 @@ def test_the_driver_refuses_execute_before_a_load() -> None:
 
 
 def test_an_api_refusal_is_reported_not_guessed() -> None:
-    transport = _Transport(fail_on="/internal/sessions/")
+    transport = _Transport(fail_on="/internal/sessions")
     driver = _driver(transport)
 
     with pytest.raises(DriverError, match="409"):
@@ -142,6 +150,14 @@ def test_a_second_load_is_refused_and_stop_closes_the_session() -> None:
     assert stopped["state"] == "closed"
     assert transport.requests[-1][1].endswith("/internal/sessions/session-1/close")
     assert driver.cleanup("qwen-small")["state"] == "closed"  # nothing left open is not an error
+
+
+def test_boot_id_comes_from_the_peer_endpoint() -> None:
+    transport = _Transport()
+    driver = _driver(transport)
+
+    assert driver.boot_id() == "boot-x"
+    assert transport.requests == [("GET", "/internal/peer", None)]
 
 
 def test_cancel_uses_the_official_cancel_path() -> None:
@@ -182,7 +198,7 @@ def test_the_transport_speaks_http_over_a_unix_socket_and_sends_the_version_head
             break
         time.sleep(0.01)
     try:
-        response = UnixControlTransport(path).request("POST", "/internal/sessions/session-1", {"model_id": "qwen-small"})
+        response = UnixControlTransport(path).request("POST", "/internal/sessions", {"model_id": "qwen-small"})
     finally:
         path.unlink(missing_ok=True)
 

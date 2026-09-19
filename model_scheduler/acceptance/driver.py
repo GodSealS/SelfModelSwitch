@@ -134,44 +134,64 @@ class ControlApiCaseDriver:
 
     # -- the official API surface -----------------------------------------
 
+    def boot_id(self) -> str:
+        """The deployment's boot identity, from the peer endpoint (C08 path)."""
+        document = self._require(self.transport.request("GET", "/internal/peer"), "peer identity read")
+        value = document.get("boot_id")
+        if not isinstance(value, str) or not value:
+            raise DriverError("the control socket did not report a boot_id")
+        return value
+
     def load(self, model_id: str, *, cold: bool) -> Mapping[str, Any]:
-        """Open a session: the deployment loads the model, the driver only asks."""
+        """Open a session: the deployment loads the model, the driver only asks.
+
+        The API owns the identifiers: `POST /internal/sessions` returns
+        `session_id`, `boot_id` and `owner_token`; the driver never invents them.
+        """
         if model_id in self._sessions:
             raise DriverError(f"{model_id!r} already has an open session: a load must not stack")
-        session_id = self._next_id("session")
+        key = self._next_id("session")
         document = self._require(self.transport.request(
-            "POST", f"/internal/sessions/{session_id}",
-            {"model_id": model_id, "idempotency_key": session_id, "correlation_id": self.owner}),
+            "POST", "/internal/sessions",
+            {"model_id": model_id, "idempotency_key": key, "correlation_id": self.owner}),
             f"session create for {model_id!r}")
-        token = document.get("owner_token")
+        session_id, token = document.get("session_id"), document.get("owner_token")
+        if not isinstance(session_id, str) or not session_id:
+            raise DriverError(f"session create for {model_id!r} returned no session_id")
         if not isinstance(token, str) or not token:
             raise DriverError(f"session create for {model_id!r} returned no owner_token")
         session = Session(session_id, token, model_id, document)
         self._sessions[model_id] = session
         return {"session_id": session_id, "cold": cold, "state": document.get("state"),
-                "phase": document.get("phase"), "view": document}
+                "phase": document.get("phase"), "boot_id": document.get("boot_id"), "view": document}
 
     def start(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution without waiting for it (the cancel case needs one)."""
         session = self._session_for(model_id)
-        execution_id = self._next_id("execution")
+        key = self._next_id("execution")
         document = self._require(self.transport.request(
-            "POST", f"/internal/executions/{execution_id}",
+            "POST", "/internal/executions",
             {"session_token": session.token, "operation": "inference",
-             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": execution_id}),
+             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
             f"execution create for {model_id!r}")
+        execution_id = document.get("execution_id")
+        if not isinstance(execution_id, str) or not execution_id:
+            raise DriverError(f"execution create for {model_id!r} returned no execution_id")
         self._executions[execution_id] = model_id
         return {"execution_id": execution_id, "view": document}
 
     def execute(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution and poll it to a terminal state; nothing is retried."""
         session = self._session_for(model_id)
-        execution_id = self._next_id("execution")
+        key = self._next_id("execution")
         created = self._require(self.transport.request(
-            "POST", f"/internal/executions/{execution_id}",
+            "POST", "/internal/executions",
             {"session_token": session.token, "operation": "inference",
-             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": execution_id}),
+             "input": {"inline": dict(request)}, "parameters": {}, "idempotency_key": key}),
             f"execution create for {model_id!r}")
+        execution_id = created.get("execution_id")
+        if not isinstance(execution_id, str) or not execution_id:
+            raise DriverError(f"execution create for {model_id!r} returned no execution_id")
         self._executions[execution_id] = model_id
         view = created
         waited = 0.0
