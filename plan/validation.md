@@ -1328,3 +1328,33 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 ## P29 补记（2026-09-19）
 
 - **真机 bring-up（2026-09-19，lab）**：llama-swap（cmd 由官方 `render_container_launch` 生成、显式 `proxy` 指向登记端口）+ `run.py`（v2，私有 0700 控制 socket、仅 UID 白名单）已起来；**首次经官方控制 API 完成真实受管执行**：`load active` → `chat succeeded`（`compute_quiescent=True`，输出 Blob）→ `vision succeeded` → `stop closed`，无残留容器。真机共暴露四个产品缺陷并全部修复（capabilities 枚举读取、`acquire` 的 priority、观察者镜像引用、`unload` 的 pinned），驱动的五处按真实 API 修正（operation、幂等键、close token、等 ACTIVE、心跳）。
+
+## P29 补记（2026-09-19，B 层真机第二轮）
+
+| 项 | 值 |
+|---|---|
+| task_id | P29（仍未完成；AC1—AC3 保持未勾） |
+| status | in_progress：真实 B 层首次产出**真实通过**的 case，剩余项原因已逐条定位 |
+| source_commit | 起点 `ba655be`，本轮 7 个提交至 `6411d29`（全部推送并同步目标） |
+| candidate_sha256 | `2058627b848d6f1c8f4241f5bfddee68c6a24f0dc5e959d0ca83eab13c56cb08`（run-b13 绑定） |
+| target_commit | `6411d29`（`/home/jtzn/SelfModelSwitch`，干净 checkout，fast-forward） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/fresh/{run-b13,candidate-b13.json,fillers.json 来源 p22}` |
+
+**命令与结果（目标机真实执行）**
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `acceptance source --root .`（`6411d29`） | 0 | `source-b13.tar.gz` |
+| `acceptance candidate --config scheduler-v2-candidate.yaml …` | 0 | 候选 `2058627b…`，`config_sha256=4f5d76c4…` |
+| `acceptance run --candidate … --layers B --fixtures-root /home/jtzn/self-model-switch-evidence/p22` | 3 | 8 case：2 passed、10 unknown/failed；无部分通过声明 |
+| 直连模型（`/v1/chat/completions`） | 200 | 8192 单元 + 4096 输出 = 165.3 s、`usage` 12307；8192+16 = 19.3 s |
+| `/slots`、`/tokenize` | 200 | 每槽 `n_ctx=16384`；`tok…`=7.000、`a`=1.000 token/单元；模板 19 token |
+
+**结论**：控制面 → 调度 → 受管生命周期 → llama-swap → 受控容器 → 模型 → 输出 Blob → 归因（provider/设备原始采样/真实输出）在 `infer` 与 `envelope` 上完整闭合，且 `envelope` 是在**单个请求**内达到声明边界。`verify` 尚未运行（无完整 S/B/O 全集）。
+
+**剩余阻塞（逐条可执行）**
+
+1. 非推理 case 的归属事实：`load`/`stop`/`cancel`/`reload` 需要实例身份，而 session 视图不携带；需在只读实例视图与只读容器观察之间做一次决策。
+2. `cap:chat` 的输出边界确定性：模型自然停止会低于声明输出上界；M00 用 `ignore_eos` 跑满，需要同一确定性进入 fixture/参数通路（并确认参数白名单允许）。
+3. `cap:vision`：确认图像预算扣除后的重跑（本轮运行早于该提交）。
+4. S 层与 O 层编排仍未交付（P23/P24 仅为注入式逻辑）；P30/P31 依赖本链。

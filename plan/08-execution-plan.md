@@ -1400,6 +1400,26 @@ CLI：`source`、`candidate` 接线（0/2/3 与"拒绝覆盖非空输出"沿用 
 
 **进展（2026-09-19）**：①已完成（镜像按 digest 写入登记：`sms-llama-cpp@sha256:8e572bb9…`，容器内 llama-server `4bc272f`）；②已完成（fresh 校准 passed，`physical_resident_peak_bytes=29,675,012,096 B`）；③④未做。
 
+**④ B 层真机推进（2026-09-19，第二轮实施；目标 `ce75997`→`6411d29`，每步都重建候选）**
+
+lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错误）：
+
+| 项 | 事实 | 处理 |
+|---|---|---|
+| `model_budget_bytes` | 13.4 GiB < `ceil(29,675,012,096×1.15)=34,126,263,911 B`，C02 静态物理门槛在 load 完成后正确拒绝并卸载、会话 `prepare_unconfirmed`→BLOCKED | 站点预算按已测物理上界改为 `36,000,000,000 B`（副本 `scheduler-v2-candidate.yaml.bak-budget`） |
+| 容器标签 | `render_lab` 的 `config-sha256` 绑定配置字节；改配置后必须重渲染（`deploy render --mode lab`），llama-swap 的 `cmd` 用同一 manifest 渲染并固定 `proxy` 到登记端口 | 每轮重渲染 `lab-b8/b10` 等布置并重启 llama-swap |
+| 登记 envelope | 容器收到 `--ctx-size 32768`，实际每槽 `n_ctx=16384`（`--parallel 2` 下统一 KV 的口径，`/slots` 实测）；`max_input_tokens` 28672 不可达 | `ctx_size` 保持 32768（服务端口径），`max_input_tokens` 8192、`max_output_tokens` 4096（8192+4096≤16384，留模板/图像余量） |
+
+实测 token 口径（目标模型自己的 tokenizer，`/tokenize` 与 `usage`）：`tok000123` 单元 **7.000 token**、`a` 单元 **1.000 token**（100/1000 单元均稳定）；聊天模板固定 **19 token**；1024×1024 图像 **1227 token**（M00 记录，校准轮 1247）。这些数字写入 `p22/fillers.json`，由 `run --fixtures-root` 读取。
+
+代码交付（本轮 5 个切片，均已推送并同步目标）：`44176e4`（真实驱动归因：输出 Blob、provider、执行窗口设备采样）、`86ec8eb`（按实测 token 比例构造文本边界，运行期只认候选点名的 fixture 材料）、`ce75997`（token 比例独立成 `fillers.json`，不收窄候选 schema）、`b1dd17a`（`observed` 取本轮真实 usage 与图像头）、`6cbacfe`（未证终结保留真实异常类型/消息）、`497070b`（声明预算含模板开销）、`6411d29`（vision 图像从同一输入预算中扣除）。
+
+真机结果（`…/fresh/run-b13`，候选 `2058627b…`，材料：3560 行 tegrastats 原始采样 + cases/failures/manifest/report）：**8 个 case 中 2 个真实通过**——`B:qwen-small:infer`、`B:qwen-small:envelope`（后者在**同一请求**内达到声明边界，`observed` 来自真实 `usage`）。未通过项及其准确原因：
+
+- `cap:chat`：无异常，边界短欠（模型在 4096 上限前自然停止 → `output_tokens` 观察值 < 声明值）。M00 的探测用 `ignore_eos: true` 保证跑满；fixture/参数通路需要同样的确定性。
+- `cap:vision`：`AdapterError: input tokens exceed envelope.max_input_tokens`——图像 token 实测 1227 已从预算扣除，仍需按新提交重跑确认（本轮运行用的是扣除前的候选）。
+- `load`×3、`cancel`、`stop`、`reload`×3：`unknown`——真实驱动对非推理 case 拿不到 provider/实例事实（控制 API 的 session 视图不携带实例身份；stop/cancel 也没有 provider 来源）。这是需要决策的一步：或给只读的实例视图（协议新增），或按 P15/P16 既有做法**只读观察**受管容器标签。
+
 **③ 接线设计（2026-09-19 侦察结论，供下一次实施；本轮不写半成品代码）**
 - **协议面已定位**：`model_scheduler/control_api.py` 暴露 `POST/GET /internal/sessions/{id}`（create/read）、`/heartbeat`、`/close`；`POST/GET /internal/executions/{id}`、`/cancel`；`POST/GET/DELETE /internal/blobs/{id}`。传输是 **Unix socket 上的 HTTP**（由 `control_server.build_control_app(boot_id, api)` 组装；peer 身份取自 socket，不信任 header）。
 - **`CaseDriver` 映射**（协议定义在 `acceptance/backend_cases.py`，`CaseExecutor` 逻辑已完整）：`load(cold=True)`→session create（冷启动语义必须在会话创建时体现，不能用"先 stop 再 start"替代）；`execute`→execution create（请求内联或 blob 引用）；`cancel`→execution cancel；`stop`→session close + 实例停止证明；`cleanup`→blob delete。归属事实（provider、设备活动、实际输出）取执行响应与 P17/P18 既有字段；executor crash 也须留下 attempt 与清理记录。
