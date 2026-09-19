@@ -291,7 +291,7 @@ class CaseExecutor:
             if failure is not None:
                 self.collector.record_failure(stage=case_id, error=failure,
                                               detail={"attempt": attempt, "cleanup": cleanup})
-            self.collector.end_case(status=status)
+            self.collector.end_case(status=status, facts=facts, failure=failure, problems=tuple(problems))
         return attempt_record
 
 

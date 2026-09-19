@@ -204,6 +204,27 @@ def test_the_raw_rows_a_driver_returns_become_the_case_material(tmp_path) -> Non
     assert attribution["raw_samples"] == {"proc_maps": 3, "tegrastats": 6}
 
 
+def test_a_case_records_what_it_saw_and_why_it_did_not_pass(tmp_path) -> None:
+    """Material must explain a failure without re-running it."""
+    from model_scheduler.acceptance.collector import FileCollector
+
+    driver = FakeDriver()
+    driver.split_boundary = True  # the round falls short of its declared boundary
+    collector = FileCollector(tmp_path, run_id="run-1", candidate_sha256="a" * 64, device_digest="b" * 64,
+                              boot_id="boot-1")
+    executor = bc.CaseExecutor(driver, collector=collector, cold_starts=3, reload_rounds=3, filler_of=FILLERS)
+
+    executor.run_model(model_id="qwen-small", capabilities=("chat",), envelope=ENVELOPE)
+
+    rows = [json.loads(line) for line in (tmp_path / "cases.jsonl").read_text().splitlines() if line.strip()]
+    envelope = [row for row in rows if row["case_id"] == "B:qwen-small:envelope"][0]
+    assert envelope["status"] == "failed"
+    assert any("did not reach the declared boundary" in problem for problem in envelope["problems"])
+    assert envelope["facts"]["observed"]["output_tokens"] == ENVELOPE.max_output_tokens  # what it really saw
+    passed = [row for row in rows if row["case_id"] == "B:qwen-small:infer"][0]
+    assert passed["status"] == "passed" and passed["failure"] is None and passed["problems"] == []
+
+
 def test_a_crash_leaves_a_failed_attempt_and_a_cleanup_record(tmp_path) -> None:
     from model_scheduler.acceptance.collector import FileCollector
 

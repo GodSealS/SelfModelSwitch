@@ -25,7 +25,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..control_protocol_v1 import InstanceIdentity
 from ..ports_v3 import Clock, EventRecord
@@ -86,6 +86,16 @@ def derive_attribution(rows: Iterable[Mapping[str, Any]]) -> dict:
             "raw_samples": dict(sorted(counts.items()))}
 
 
+def _jsonable(value: Any) -> Any:
+    """Facts are persisted as JSON; anything a JSON document cannot hold is refused."""
+    import json as _json
+
+    try:
+        return _json.loads(_json.dumps(value, default=str))
+    except (TypeError, ValueError) as exc:
+        raise CollectorError(f"case facts must be JSON-shaped: {exc}") from exc
+
+
 def _instance_facts(instance: InstanceIdentity | Mapping[str, Any] | None) -> dict | None:
     if instance is None:
         return None
@@ -132,10 +142,18 @@ class FileCollector:
             raise CollectorError("attempt must be a positive integer")
         self._context = {"case_id": case_id, "attempt": attempt, "instance": _instance_facts(instance)}
 
-    def end_case(self, *, status: str) -> None:
+    def end_case(self, *, status: str, facts: Mapping[str, Any] | None = None,
+                 failure: str | None = None, problems: Sequence[str] = ()) -> None:
+        """Close one case, keeping what it observed and why it did not pass.
+
+        The facts are the case's own account of what it saw (the round's usage, the
+        instance, the samples it produced); without them a failed case can only be
+        re-run, never explained from the material.
+        """
         if self._context is None:
             raise CollectorError("no case context to end")
-        row = {**self._run_stamp(), **self._context, "status": status}
+        row = {**self._run_stamp(), **self._context, "status": status,
+               "failure": failure, "problems": list(problems), "facts": _jsonable(facts)}
         self._append("cases.jsonl", row)
         self._context = None
 
