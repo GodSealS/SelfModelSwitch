@@ -119,10 +119,22 @@ def _run(args) -> int:
         raise InputError(f"--layers must be a comma-separated subset of {sorted(ACCEPTANCE_LAYERS)}, got {args.layers!r}")
     if len(set(layers)) != len(layers):
         raise InputError(f"--layers repeats a layer: {args.layers!r}")
-    require_fresh_output(args.output / "run.json")
-    print(f"run: layer orchestration for {sorted(layers)} is not wired yet: the B/O executors are delivered as "
-          "logic with injected drivers (P23/P24) and the real run belongs to P29", file=sys.stderr)
-    return EXIT_FAILED
+    require_fresh_output(args.output / "report.json")
+    unsupported = sorted(layer for layer in layers if layer != "B")
+    if unsupported:
+        # No partial run is written: an unexecuted layer must not be claimed.
+        print(f"run: layer(s) {unsupported} have no orchestration yet (the S software cases and the O "
+              "operational cases are not delivered): refusing before anything is executed", file=sys.stderr)
+        return EXIT_FAILED
+    from .runner import LayerError, run_b_layer
+
+    try:
+        summary = run_b_layer(candidate_path=args.candidate, output=args.output)
+    except LayerError as exc:
+        print(f"run: {exc}", file=sys.stderr)
+        return exc.exit_code
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return EXIT_OK if summary.get("verdict") == "passed" else EXIT_FAILED
 
 
 def _merge(args) -> int:

@@ -282,9 +282,15 @@ def test_the_run_command_validates_layers_and_refuses_until_the_orchestration_ex
 
     code = main(["run", "--candidate", "c.json", "--layers", "S,B", "--output", str(tmp_path / "b")])
 
-    assert code == EXIT_FAILED  # no partial run is written and no layer is claimed as executed
-    assert "not wired yet" in capsys.readouterr().err
-    assert not (tmp_path / "b" / "run.json").exists()
+    assert code == EXIT_FAILED  # an undelivered layer must not be executed, even partly
+    assert "no orchestration yet" in capsys.readouterr().err
+    assert not (tmp_path / "b" / "report.json").exists()
+
+    # B alone is wired now: it refuses *before* touching anything when the site is not up.
+    code = main(["run", "--candidate", "c.json", "--layers", "B", "--output", str(tmp_path / "c")])
+    assert code == EXIT_INPUT
+    assert "SMS_CONTROL_SOCKET" in capsys.readouterr().err
+    assert not (tmp_path / "c" / "report.json").exists()
 
 
 def test_a_model_without_a_usable_capability_is_refused() -> None:
