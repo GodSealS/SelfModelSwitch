@@ -134,6 +134,7 @@ class ControlApiCaseDriver:
     owner: str = "acceptance"
     sleep: Callable[[float], None] = field(default=lambda seconds: __import__("time").sleep(seconds))
     deadline_seconds: float = 1800.0
+    ready_timeout_seconds: float = 1800.0
     _sessions: dict[str, Session] = field(default_factory=dict, init=False)
     _counter: int = field(default=0, init=False)
     _executions: dict[str, str] = field(default_factory=dict, init=False)  # execution_id -> model_id
@@ -191,8 +192,30 @@ class ControlApiCaseDriver:
             raise DriverError(f"session create for {model_id!r} returned no owner_token")
         session = Session(session_id, token, model_id, document)
         self._sessions[model_id] = session
-        return {"session_id": session_id, "cold": cold, "state": document.get("state"),
-                "phase": document.get("phase"), "boot_id": document.get("boot_id"), "view": document}
+        # A `load` means the model is loaded *and usable*: wait until the session is
+        # really ACTIVE. Submitting earlier is refused by the API ("only an ACTIVE
+        # session may submit"), and a load that returns early would be a false pass.
+        view = self._await_active(session)
+        return {"session_id": session_id, "cold": cold, "state": view.get("state"),
+                "phase": view.get("phase"), "boot_id": view.get("boot_id"), "view": view}
+
+    def _await_active(self, session: Session) -> Mapping[str, Any]:
+        deadline_seconds = self.ready_timeout_seconds
+        waited = 0.0
+        view: Mapping[str, Any] = session.view
+        while True:
+            state, phase = str(view.get("state")), view.get("phase")
+            if state == "active" and phase in (None, "active"):
+                return view
+            if state in ("closed", "blocked"):
+                raise DriverError(f"session {session.session_id} ended as {state!r} before it became active")
+            if waited >= deadline_seconds:
+                raise DriverError(f"session {session.session_id} did not become active in {deadline_seconds}s "
+                                  f"(state {state!r}, phase {phase!r})")
+            self.sleep(POLL_INTERVAL_SECONDS)
+            waited += POLL_INTERVAL_SECONDS
+            view = self._require(self.transport.request("GET", f"/internal/sessions/{session.session_id}"),
+                                 f"session read {session.session_id}")
 
     def start(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution without waiting for it (the cancel case needs one)."""

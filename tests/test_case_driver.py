@@ -32,6 +32,7 @@ class _Transport:
         self.reads = 0
         self._sessions = 0
         self._executions = 0
+        self.session_settled = "active"
 
     def request(self, method: str, path: str, body=None) -> ApiResponse:
         self.requests.append((method, path, body))
@@ -42,9 +43,14 @@ class _Transport:
         if path == "/internal/sessions" and method == "POST":
             self._sessions += 1
             return ApiResponse(201, {"session_id": f"session-{self._sessions}", "state": "preparing",
-                                     "phase": "loading", "boot_id": "boot-x", "model_id": body["model_id"],
+                                     "phase": "queued", "boot_id": "boot-x", "model_id": body["model_id"],
                                      "expires_in_ms": 30000, "hard_remaining_ms": 60000,
                                      "owner_token": f"tok-{self._sessions}", "error": None})
+        if path.startswith("/internal/sessions/") and method == "GET":
+            return ApiResponse(200, {"session_id": path.split("/")[3], "state": self.session_settled,
+                                     "phase": None, "boot_id": "boot-x", "model_id": "qwen-small",
+                                     "expires_in_ms": 30000, "hard_remaining_ms": 60000,
+                                     "owner_token": None, "error": None})
         if path.startswith("/internal/sessions/") and method == "POST" and path.endswith("/close"):
             return ApiResponse(200, {"session_id": path.split("/")[3], "state": "closed", "phase": None,
                                      "boot_id": "boot-x", "model_id": "qwen-small", "expires_in_ms": 0,
@@ -98,16 +104,17 @@ def test_a_load_opens_a_session_and_execute_polls_to_terminal() -> None:
     loaded = driver.load("qwen-small", cold=True)
     executed = driver.execute("qwen-small", {"messages": [{"role": "user", "content": "hi"}]})
 
-    assert loaded["session_id"] == "session-1" and loaded["cold"] is True and loaded["boot_id"] == "boot-x"
+    assert loaded["session_id"] == "session-1" and loaded["cold"] is True and loaded["state"] == "active"
     assert [(method, path) for method, path, _b in transport.requests] == [
-        ("POST", "/internal/sessions"), ("POST", "/internal/executions"),
-        ("GET", "/internal/executions/execution-2")]  # create said running, one read said succeeded
+        ("POST", "/internal/sessions"), ("GET", "/internal/sessions/session-1"),
+        ("POST", "/internal/executions"), ("GET", "/internal/executions/execution-2")]
     create = transport.requests[0][2]
     assert create["model_id"] == "qwen-small" and create["correlation_id"] == "acceptance"
     assert create["idempotency_key"].startswith("session-") and len(create["idempotency_key"]) > len("session-")
-    execution = transport.requests[1][2]
+    execution = next(body for method, path, body in transport.requests
+                     if (method, path) == ("POST", "/internal/executions"))
     assert execution["session_token"] == "tok-1" and execution["operation"] == "chat"
-    assert create["idempotency_key"] != transport.requests[1][2]["idempotency_key"]  # keys never collide
+    assert create["idempotency_key"] != execution["idempotency_key"]  # keys never collide
     assert execution["input"] == {"inline": {"messages": [{"role": "user", "content": "hi"}]}}
     assert executed["state"] == "succeeded" and executed["compute_quiescent"] is True
     assert executed["instance"]["container_id"] == "abc" and executed["fence"]["attempt"] == 1  # attribution
@@ -121,6 +128,21 @@ def test_the_driver_refuses_a_terminal_state_it_never_reached() -> None:
 
     with pytest.raises(DriverError, match="did not reach a terminal state"):
         driver.execute("qwen-small", {"messages": []})
+
+
+def test_a_load_waits_until_the_session_is_active_and_refuses_a_stuck_one() -> None:
+    transport = _Transport()
+    driver = _driver(transport)
+    transport.session_settled = "blocked"  # the session dies during preparation
+
+    with pytest.raises(DriverError, match="before it became active"):
+        driver.load("qwen-small", cold=True)
+
+    stuck = _Transport()
+    stuck_driver = _driver(stuck)
+    stuck_driver.ready_timeout_seconds = 0.0
+    with pytest.raises(DriverError, match="did not become active"):
+        stuck_driver.load("qwen-small", cold=True)
 
 
 def test_the_driver_refuses_execute_before_a_load() -> None:
@@ -175,7 +197,8 @@ def test_an_image_request_is_sent_as_the_vision_operation() -> None:
     driver.execute("qwen-small", {"messages": [{"role": "user", "content": [
         {"type": "text", "text": "x"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]}]})
 
-    assert transport.requests[1][2]["operation"] == "vision"
+    creates = [body for method, path, body in transport.requests if path == "/internal/executions"]
+    assert creates and creates[0]["operation"] == "vision"
 
 
 def test_boot_id_comes_from_the_peer_endpoint() -> None:
