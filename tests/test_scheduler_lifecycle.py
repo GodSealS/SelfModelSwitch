@@ -1094,3 +1094,10 @@ async def test_a_v2_registration_acquires_through_the_ledger() -> None:
 
     assert lease is not None
     await scheduler.release(lease, Outcome.SUCCESS)
+    # `unload` reads `pinned` too: a v2 spec has none, so the ledger must supply it.
+    await scheduler.unload("chat", asyncio.get_running_loop().time() + 2)
+    for _ in range(20):
+        if scheduler.book.runtime["chat"].state.value == "unloaded":
+            break
+        await asyncio.sleep(0.02)
+    assert scheduler.book.runtime["chat"].state.value == "unloaded"

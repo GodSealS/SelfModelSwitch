@@ -536,8 +536,10 @@ class ModelScheduler:
     async def unload(self, model_id: str, deadline: float) -> None:
         async with self._condition:
             if model_id not in self.book.specs: raise KeyError(model_id)
-            spec, runtime = self.book.specs[model_id], self.book.runtime[model_id]
-            if spec.pinned: raise Conflict("model_pinned")
+            # The ledger is the scheduling view: a v2 registration carries no
+            # `pinned` of its own (the same reason `priority` is read from the ledger).
+            runtime = self.book.runtime[model_id]
+            if self.book.ledger[model_id].pinned: raise Conflict("model_pinned")
             if runtime.state.value == "unloaded": return
             if self._eviction is not None or runtime.leases or runtime.operation_id or runtime.state.value != "ready": raise Conflict("model_busy")
             operation = self.book.begin_eviction([model_id], automatic=False)[0]
