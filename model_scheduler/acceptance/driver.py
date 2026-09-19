@@ -182,7 +182,11 @@ class ControlApiCaseDriver:
         `session_id`, `boot_id` and `owner_token`; the driver never invents them.
         """
         if model_id in self._sessions:
-            raise DriverError(f"{model_id!r} already has an open session: a load must not stack")
+            # The matrix needs independent cold starts, one after another: the open
+            # session is closed (its model is unloaded) so the next start really
+            # begins from nothing. Two *simultaneous* sessions of one model is what
+            # must never happen.
+            self.stop(model_id)
         key = self._next_id("session")
         document = self._require(self.transport.request(
             "POST", "/internal/sessions",

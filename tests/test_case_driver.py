@@ -166,13 +166,10 @@ def test_an_api_refusal_is_reported_not_guessed() -> None:
         driver.load("qwen-small", cold=True)
 
 
-def test_a_second_load_is_refused_and_stop_closes_the_session() -> None:
+def test_stop_closes_the_session_and_cleanup_afterwards_is_a_no_op() -> None:
     transport = _Transport()
     driver = _driver(transport)
     driver.load("qwen-small", cold=True)
-
-    with pytest.raises(DriverError, match="must not stack"):
-        driver.load("qwen-small", cold=True)
 
     stopped = driver.stop("qwen-small")
     assert stopped["state"] == "closed"
@@ -203,6 +200,19 @@ def test_an_image_request_is_sent_as_the_vision_operation() -> None:
 
     creates = [body for method, path, body in transport.requests if path == "/internal/executions"]
     assert creates and creates[0]["operation"] == "vision"
+
+
+def test_a_second_load_closes_the_previous_session_first() -> None:
+    """The matrix wants independent cold starts: stop, then start from nothing."""
+    transport = _Transport()
+    driver = _driver(transport)
+    driver.load("qwen-small", cold=True)
+
+    driver.load("qwen-small", cold=True)
+
+    closes = [path for method, path, _b in transport.requests if path.endswith("/close")]
+    creates = [path for method, path, _b in transport.requests if path == "/internal/sessions"]
+    assert closes and len(creates) == 2  # nothing stacks: two sessions, never two at once
 
 
 def test_a_waiting_load_heartbeats_the_session() -> None:
