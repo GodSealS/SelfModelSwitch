@@ -219,3 +219,28 @@ def test_the_not_wired_port_reports_itself_unavailable() -> None:
 
     assert port.anything(at_all=True) == {"available": False, "action": "anything",
                                           "reason": "the private mount namespace is not wired"}
+
+
+def test_the_site_reader_agrees_with_the_candidate_config_digest(tmp_path) -> None:
+    """The live digest comes from the deployment's own loader, never a second one.
+
+    The first target run refused a correct deployment because the site reader
+    asked `AppConfigV2` for a `config_digest` it does not have and reported
+    `None`; this pins the two values together.
+    """
+    module = _load_module("tc_for_digest", Path(__file__).resolve().parent / "test_candidate.py")
+    site = module._site(tmp_path)
+    built = module._build(site)
+
+    assert op._config_digest(Path(site["config"])) == built["config_sha256"]
+
+
+def test_image_is_present_matches_the_local_image_id(monkeypatch) -> None:
+    identifier = "8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8"
+    digest = "sms-llama-cpp@sha256:" + identifier
+
+    monkeypatch.setattr(op, "_run", lambda argv, **kwargs: (0, f"sha256:{identifier}\nsha256:{'0' * 64}\n"))
+    assert op.image_is_present(digest) is True
+
+    monkeypatch.setattr(op, "_run", lambda argv, **kwargs: (0, f"sha256:{'0' * 64}\n"))
+    assert op.image_is_present(digest) is False

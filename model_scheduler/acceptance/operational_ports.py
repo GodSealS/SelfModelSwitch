@@ -298,13 +298,22 @@ def read_site_facts(*, candidate: Any, config_path: Path, model_directory: Path,
     images = {}
     for runtime in candidate.runtimes:
         images[runtime.image_digest] = image_is_present(runtime.image_digest)
-    from ..config import load_config
-
-    config = load_config(Path(config_path))
-    digest = config.config_digest() if hasattr(config, "config_digest") else None
     return {**device, "filesystem": _filesystem_of(model_directory),
             "images": images, "model_files": files,
-            "config_sha256": digest, "source_archive_sha256": source_archive_sha256}
+            "config_sha256": _config_digest(Path(config_path)),
+            "source_archive_sha256": source_archive_sha256}
+
+
+def _config_digest(config_path: Path) -> str:
+    """The deployment's own loader and digest, so the value matches the candidate's.
+
+    `build_candidate` digests `config_module._yaml(path)` with
+    `config_module.config_digest`; reading the file any other way would produce a
+    second, differently-normalised value and refuse a correct deployment.
+    """
+    import model_scheduler.config as config_module
+
+    return config_module.config_digest(config_module._yaml(Path(config_path)))
 
 
 def read_device_facts(*, config_path: Path, model_directory: Path, scratch_path: Path | None = None) -> dict:
@@ -333,14 +342,20 @@ def _filesystem_of(path: Path) -> str:
 
 
 def image_is_present(image_digest: str) -> bool:
-    """Whether the pinned digest really exists locally (`docker image inspect`)."""
-    reference = image_digest.split("@", 1)[0] if "@" in image_digest else image_digest
-    code, stdout = _run(["docker", "image", "inspect", "--format", "{{.Id}}", reference])
-    if code != 0 or not stdout.strip():
-        return False
+    """Whether the pinned digest really exists locally.
+
+    The lookup is by image id, not by the registered reference: a site image that
+    was built locally carries no repository digest, so `name@sha256:…` cannot be
+    inspected even though the bytes are right there.
+    """
     recorded = image_digest.split("sha256:", 1)[1] if "sha256:" in image_digest else ""
-    identifier = stdout.strip().splitlines()[0].strip()
-    return identifier.startswith(f"sha256:{recorded}")
+    if not recorded:
+        return False
+    code, stdout = _run(["docker", "images", "--no-trunc", "--quiet"])
+    if code != 0:
+        return False
+    wanted = f"sha256:{recorded}"
+    return any(line.strip() == wanted for line in stdout.splitlines() if line.strip())
 
 
 def _utc_now() -> str:
