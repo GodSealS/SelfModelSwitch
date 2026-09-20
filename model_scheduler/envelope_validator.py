@@ -172,12 +172,16 @@ def effective_max_tokens(parameters: Mapping | None, envelope) -> int:
 
 
 def check_chat_budget(input_tokens: int, max_tokens: int, envelope) -> None:
+    """Every refusal carries the figures: a bare 'exceeded' cannot be diagnosed offline."""
     if input_tokens > envelope.max_input_tokens:
-        raise EnvelopeError("input tokens exceed envelope.max_input_tokens", "envelope_exceeded")
+        raise EnvelopeError(f"input tokens exceed envelope.max_input_tokens "
+                            f"({input_tokens} > {envelope.max_input_tokens})", "envelope_exceeded")
     if max_tokens > envelope.max_output_tokens:
-        raise EnvelopeError("max_tokens exceeds envelope.max_output_tokens", "envelope_exceeded")
+        raise EnvelopeError(f"max_tokens exceeds envelope.max_output_tokens "
+                            f"({max_tokens} > {envelope.max_output_tokens})", "envelope_exceeded")
     if input_tokens + max_tokens > envelope.ctx_size:
-        raise EnvelopeError("input plus output exceeds ctx_size", "envelope_exceeded")
+        raise EnvelopeError(f"input plus output exceeds ctx_size "
+                            f"({input_tokens} + {max_tokens} > {envelope.ctx_size})", "envelope_exceeded")
 
 
 async def check_chat_input(payload: Mapping, *, capabilities: Iterable[str], envelope,
