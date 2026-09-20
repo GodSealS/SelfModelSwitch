@@ -1431,7 +1431,12 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 1. 新模块 `model_scheduler/acceptance/software_cases.py`：`run_software_case(case_id, *, candidate, config_path=None, output=Path) -> dict`，
    每个 observation 由**真实调用**得出，禁止直接写 `True`。落盘 `case.json`（含 `observations` 与逐项 `evidence`）与 S03 的原始数字。
 2. `observations` 的来源（全部离线、不需要模型）：
-   - `S01`：`runtime_registered`＝用 `contracts_v2.parse_deployment` 解析候选登记且 `require_startable_profile` 通过；
+   - `S01`：**需要一个新的显式输入 `--inventory <path>`**——`migration_v2` 的 inventory 强制要求每个 runtime 提供
+     `profile_id/image_digest/adapter_sha256/lock_sha256/startup_args`，其中 `adapter_sha256`/`lock_sha256` 是构建产物事实，
+     候选与配置都不携带（现场只能从真实构件取哈希：adapter 模块文件与依赖 lock 文件）。因此 S01 的
+     `legacy_config_migrated` 只能在一份**有来源的 inventory 材料**下成立；缺该输入时该 observation 必须为 false，
+     绝不能用空哈希或猜测值填 `true`。其余三项不需要 inventory。
+     `runtime_registered`＝用 `contracts_v2.parse_deployment` 解析候选登记且 `require_startable_profile` 通过；
      `strict_schema_enforced`＝对登记/协议 DTO 施以正反例（未知字段、NaN、尾换行 ID、重复 path）并确认全部被拒；
      `legacy_config_migrated`＝`migration_v2.migrate_v2` 对 v1 fixture + 完整 inventory 产出 v2 并通过 `run.py --check-config`；
      `no_business_coupling`＝扫描 `model_scheduler/` 的 import，确认无视频/FFmpeg/人脸/声纹等业务模块。
