@@ -6,6 +6,7 @@ import shlex
 import argparse
 from datetime import datetime
 import hashlib
+import ipaddress
 import json
 import math
 from pathlib import Path
@@ -564,6 +565,9 @@ class ServiceInputs:
     config_path: str
     swap_config_path: str
     listen: str = "127.0.0.1:8080"
+    allow_cidr: str = "127.0.0.1/32"
+    allow_public: bool = False
+    scheduler_port: int = 8090
     socket_mode: str = _SOCKET_MODE
     video_unit: bool = False
 
@@ -589,6 +593,17 @@ class ServiceInputs:
         for name in FORBIDDEN_UNIT_NAMES:
             if name in Path(self.swap_config_path).name.lower() or name in Path(self.config_path).name.lower():
                 raise DeployError(f"the configuration names a {name!r} unit: this deployment renders none")
+        try:
+            network = ipaddress.ip_network(self.allow_cidr, strict=False)
+        except ValueError as exc:
+            raise DeployError(f"allow_cidr must be a network the deployment names: {exc}") from exc
+        if network.num_addresses == 0:
+            raise DeployError("allow_cidr must name at least one address")
+        if self.allow_cidr == "0.0.0.0/0" and not self.allow_public:
+            raise DeployError("allow_cidr 0.0.0.0/0 needs allow_public=True: the internet is not a deployment input")
+        if isinstance(self.scheduler_port, bool) or not isinstance(self.scheduler_port, int) \
+                or not 1 <= self.scheduler_port <= 65535:
+            raise DeployError("scheduler_port must be a port number")
 
 
 def render_service_units(*, inputs: ServiceInputs, output: str | Path,
@@ -636,6 +651,10 @@ def render_service_units(*, inputs: ServiceInputs, output: str | Path,
             f"Environment=SMS_BLOB_ROOT={inputs.blob_root}",
             f"Environment=SMS_BLOB_DISK_UUID={inputs.blob_disk_uuid}",
             f"Environment=SMS_BLOB_QUOTA_BYTES={inputs.blob_quota_bytes}",
+            # The compat surface is reachable only from the network the deployment
+            # names; the rule is added idempotently and never touches the control socket.
+            f"Environment=SMS_ALLOW_CIDR={inputs.allow_cidr}",
+            f"Environment=SMS_SCHEDULER_PORT={inputs.scheduler_port}",
         ]
         marker = "\n[Install]"
         text = text.replace(marker, "\n" + "\n".join(extras) + marker) if marker in text else text + "\n" + "\n".join(extras) + "\n"
@@ -661,7 +680,8 @@ def render_service_units(*, inputs: ServiceInputs, output: str | Path,
              "model_mount": inputs.model_mount, "model_directory": inputs.model_directory,
              "mount_unit": inputs.mount_unit, "blob_root": inputs.blob_root,
              "blob_disk_uuid": inputs.blob_disk_uuid, "blob_quota_bytes": inputs.blob_quota_bytes,
-             "release_root": inputs.release_root, "video_units": 0}
+             "release_root": inputs.release_root, "allow_cidr": inputs.allow_cidr,
+             "allow_public": inputs.allow_public, "scheduler_port": inputs.scheduler_port, "video_units": 0}
     (target / "service-facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"ok": True, "output": str(target), "units": [name for name in sorted(rendered)],
             "socket_mode": inputs.socket_mode, "video_units": 0}

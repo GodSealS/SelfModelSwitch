@@ -55,8 +55,22 @@ render_service_units(output=Path("build/units"), inputs=ServiceInputs(
     blob_disk_uuid="<uuid>", blob_quota_bytes=17179869184,
     release_root="/opt/self-model-switch/releases",
     config_path="/etc/self-model-switch/config.yaml",
-    swap_config_path="/etc/self-model-switch/llama-swap.yaml"))
+    swap_config_path="/etc/self-model-switch/llama-swap.yaml",
+    allow_cidr="192.168.55.0/24",   # the compat port opens to this network only
+    scheduler_port=8090))           # the port `server.port` in the v2 config uses
 ```
+
+**Reaching the service from another machine (P27).** The rendered
+`model-scheduler.service` carries `SMS_ALLOW_CIDR`/`SMS_SCHEDULER_PORT` and runs
+`deploy/open-firewall.sh` as root before the scheduler starts. The rule is
+idempotent (a restart never stacks duplicates) and it only opens the
+compatibility port; the control plane stays on its Unix socket and is never
+reachable over TCP. Review the rule before installing:
+`iptables -S INPUT | grep -- '--dport 8090'`. Opening `0.0.0.0/0` needs
+`allow_public=True` on purpose, and the compatibility surface has no
+authentication of its own: put a reverse proxy (Basic Auth/mTLS) in front of it
+before it leaves a trusted network. To undo the rule by hand:
+`deploy/open-firewall.sh --cidr <cidr> --port <port> --remove`.
 
 Switch order (enforced by `switch_release`): close admission → drain (queue,
 leases, sessions all zero) → **prove the old instances stopped** → preflight the
