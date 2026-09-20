@@ -1420,6 +1420,35 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 - `cap:vision`：仍 `AdapterError: input tokens exceed envelope.max_input_tokens`。文本预算按 `max_images × max_image_tokens`（1×1280）扣除、模板按**文本模板实测的 19** 扣除后仍超限——**vision 模板（含 `vision_start/image_pad/vision_end` 标记）的开销大于文本模板**。修法：按能力分别测量模板开销（用 fixture 自己的 1024×1024 图像做一次探测，得到"模板+图像占位"的合计），并按该值扣除文本预算。
 - `load`×3、`cancel`、`stop`、`reload`×3：`unknown`——真实驱动对非推理 case 拿不到 provider/实例事实（控制 API 的 session 视图不携带实例身份；stop/cancel 也没有 provider 来源）。这是需要决策的一步：或给只读的实例视图（协议新增），或按 P15/P16 既有做法**只读观察**受管容器标签。
 
+**⑤ S 层实施说明书（2026-09-20 勘察结论，照此实现即可，无需再侦察）**
+
+材料契约（`acceptance/evaluator.py` 已固定，勿改判定）：每个 S case 一个目录，内含 `case.json`，
+`observations` 的每个键必须**恰好为 `true`** 才算"有证据"；`S_CASE_OBSERVATIONS` 给出每 case 的键集合，
+缺键/非 true 一律失败；`S03` 另有从原始数字的复算（预算等式、差 1 byte 拒绝、采样新鲜度、不重复计账）。
+
+实施形状（建议）：
+
+1. 新模块 `model_scheduler/acceptance/software_cases.py`：`run_software_case(case_id, *, candidate, config_path=None, output=Path) -> dict`，
+   每个 observation 由**真实调用**得出，禁止直接写 `True`。落盘 `case.json`（含 `observations` 与逐项 `evidence`）与 S03 的原始数字。
+2. `observations` 的来源（全部离线、不需要模型）：
+   - `S01`：`runtime_registered`＝用 `contracts_v2.parse_deployment` 解析候选登记且 `require_startable_profile` 通过；
+     `strict_schema_enforced`＝对登记/协议 DTO 施以正反例（未知字段、NaN、尾换行 ID、重复 path）并确认全部被拒；
+     `legacy_config_migrated`＝`migration_v2.migrate_v2` 对 v1 fixture + 完整 inventory 产出 v2 并通过 `run.py --check-config`；
+     `no_business_coupling`＝扫描 `model_scheduler/` 的 import，确认无视频/FFmpeg/人脸/声纹等业务模块。
+   - `S02`：`load_failure_recorded`/`late_load_rejected`/`old_boot_rejected`/`stop_returned_instance_alive_recorded`/`unknown_keeps_budget`
+     ＝用 `ports_v3` 的 fake 端口驱动 `ModelScheduler`/`Book`（P07/P10 的既有测试路径），每个观察对应一个断言结果。
+   - `S03`：`boundary_equality_holds` 等＝`Book.can_load`/`physical_admissible` 在 C02 边界与差 1 byte 上的实际返回值，
+     连同原始整数（peak、budget、free floor、MemAvailable）写入 `case.json`，供 evaluator 复算。
+   - `S04`：`interactive_priority_holds`/`drain_keeps_lease`/`ttl_enforced`/`hard_deadline_enforced`/`cancel_observed`/`idempotency_enforced`
+     ＝`SessionManager` + `RequestQueue` + `IdempotencyStore` 的行为断言（P09/P10 既有测试的同一场景）。
+   - `S05`：`compat_api_accepts`/`blob_owner_enforced`/`blob_hash_enforced`/`quota_enforced`/`expiry_enforced`/`restart_discovery_works`/`late_output_rejected`
+     ＝`BlobStore` 与兼容面（P11/P12/P19/P20）的行为断言；`restart_discovery_works` 用临时根目录做一次真实的 recover。
+   - `S06`：六个 `tampered_*`/`forged_*` 观察＝`evidence_contracts.parse_*` 与 `preflight_v3` 对已篡改副本的拒绝（P03/P26 既有测试路径）。
+3. `__main__._run`：`--layers S` 走 `run_s_layer`（逐 case 产出材料 + 报告），**未交付的 case 仍显式拒绝**（不得用 `passed=true` 占位）；
+   与 B 相同：输出目录非空即拒、异常退出不留部分 run。
+4. 报告：S 层同样绑定 `candidate_sha256`/`device_digest`/`run_id`，`merge` 只合并同候选/设备的完整 run。
+5. 测试：每 observation 一个正例 + 一个反例（观察在真实检查失败时必须为 false 而不是被写成 true）。
+
 **③ 接线设计（2026-09-19 侦察结论，供下一次实施；本轮不写半成品代码）**
 - **协议面已定位**：`model_scheduler/control_api.py` 暴露 `POST/GET /internal/sessions/{id}`（create/read）、`/heartbeat`、`/close`；`POST/GET /internal/executions/{id}`、`/cancel`；`POST/GET/DELETE /internal/blobs/{id}`。传输是 **Unix socket 上的 HTTP**（由 `control_server.build_control_app(boot_id, api)` 组装；peer 身份取自 socket，不信任 header）。
 - **`CaseDriver` 映射**（协议定义在 `acceptance/backend_cases.py`，`CaseExecutor` 逻辑已完整）：`load(cold=True)`→session create（冷启动语义必须在会话创建时体现，不能用"先 stop 再 start"替代）；`execute`→execution create（请求内联或 blob 引用）；`cancel`→execution cancel；`stop`→session close + 实例停止证明；`cleanup`→blob delete。归属事实（provider、设备活动、实际输出）取执行响应与 P17/P18 既有字段；executor crash 也须留下 attempt 与清理记录。
