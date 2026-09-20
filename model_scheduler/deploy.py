@@ -593,14 +593,19 @@ class ServiceInputs:
         for name in FORBIDDEN_UNIT_NAMES:
             if name in Path(self.swap_config_path).name.lower() or name in Path(self.config_path).name.lower():
                 raise DeployError(f"the configuration names a {name!r} unit: this deployment renders none")
-        try:
-            network = ipaddress.ip_network(self.allow_cidr, strict=False)
-        except ValueError as exc:
-            raise DeployError(f"allow_cidr must be a network the deployment names: {exc}") from exc
-        if network.num_addresses == 0:
-            raise DeployError("allow_cidr must name at least one address")
-        if self.allow_cidr == "0.0.0.0/0" and not self.allow_public:
-            raise DeployError("allow_cidr 0.0.0.0/0 needs allow_public=True: the internet is not a deployment input")
+        networks = [item.strip() for item in self.allow_cidr.split(",") if item.strip()]
+        if not networks:
+            raise DeployError("allow_cidr must name the network the compat port opens to")
+        for item in networks:
+            try:
+                network = ipaddress.ip_network(item, strict=False)
+            except ValueError as exc:
+                raise DeployError(f"allow_cidr must be a network the deployment names: {exc}") from exc
+            if network.num_addresses == 0:
+                raise DeployError("allow_cidr must name at least one address")
+            if item == "0.0.0.0/0" and not self.allow_public:
+                raise DeployError("allow_cidr 0.0.0.0/0 needs allow_public=True: the internet is not a "
+                                  "deployment input")
         if isinstance(self.scheduler_port, bool) or not isinstance(self.scheduler_port, int) \
                 or not 1 <= self.scheduler_port <= 65535:
             raise DeployError("scheduler_port must be a port number")

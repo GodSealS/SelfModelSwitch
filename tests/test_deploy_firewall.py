@@ -61,6 +61,19 @@ def test_the_rule_is_added_once_and_only_once(tmp_path: Path) -> None:
     assert added[0] == f"-A INPUT -p tcp -s {CIDR} --dport {PORT} -j ACCEPT"
 
 
+def test_two_named_networks_get_one_rule_each(tmp_path: Path) -> None:
+    shim, log = _fake_iptables(tmp_path)
+
+    result = _run(["--cidr", "192.168.55.0/24,192.168.1.0/24", "--port", PORT], shim=shim)
+    again = _run(["--cidr", "192.168.55.0/24,192.168.1.0/24", "--port", PORT], shim=shim)
+
+    assert result.returncode == 0, result.stderr
+    assert "already present" in again.stdout and again.stdout.count("already present") == 2
+    added = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("-A")]
+    assert added == [f"-A INPUT -p tcp -s 192.168.55.0/24 --dport {PORT} -j ACCEPT",
+                     f"-A INPUT -p tcp -s 192.168.1.0/24 --dport {PORT} -j ACCEPT"]
+
+
 def test_remove_and_check_report_the_truth(tmp_path: Path) -> None:
     shim, _log = _fake_iptables(tmp_path)
 

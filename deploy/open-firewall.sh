@@ -45,13 +45,6 @@ if [ -z "$CIDR" ] || [ -z "$PORT" ]; then
     exit 2
 fi
 
-case "$CIDR" in
-    *[!0-9./]*)
-        echo "open-firewall.sh: '$CIDR' is not a CIDR" >&2; exit 2 ;;
-esac
-if ! echo "$CIDR" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'; then
-    echo "open-firewall.sh: '$CIDR' is not a CIDR" >&2; exit 2
-fi
 case "$PORT" in
     *[!0-9]*)
         echo "open-firewall.sh: '$PORT' is not a port number" >&2; exit 2 ;;
@@ -59,42 +52,59 @@ esac
 if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
     echo "open-firewall.sh: '$PORT' is out of range" >&2; exit 2
 fi
-if [ "$CIDR" = "0.0.0.0/0" ] && [ "$ALLOW_ANY" -eq 0 ]; then
-    echo "open-firewall.sh: 0.0.0.0/0 needs --allow-any: the whole internet is not a deployment input" >&2
-    exit 2
-fi
-
-RULE="-p tcp -s $CIDR --dport $PORT -j ACCEPT"
 
 if ! command -v "$IPTABLES" >/dev/null 2>&1; then
     echo "open-firewall.sh: '$IPTABLES' is not available" >&2
     exit 3
 fi
 
-if "$IPTABLES" -C INPUT $RULE >/dev/null 2>&1; then
-    PRESENT=1
-else
-    PRESENT=0
-fi
+# `--cidr` takes one network or a comma-separated list, so a deployment that is
+# reached over two internal links names both without opening anything else.
+NETWORKS=$(echo "$CIDR" | tr ',' ' ')
+for NETWORK in $NETWORKS; do
+    case "$NETWORK" in
+        *[!0-9./]*)
+            echo "open-firewall.sh: '$NETWORK' is not a CIDR" >&2; exit 2 ;;
+    esac
+    if ! echo "$NETWORK" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'; then
+        echo "open-firewall.sh: '$NETWORK' is not a CIDR" >&2; exit 2
+    fi
+    if [ "$NETWORK" = "0.0.0.0/0" ] && [ "$ALLOW_ANY" -eq 0 ]; then
+        echo "open-firewall.sh: 0.0.0.0/0 needs --allow-any: the whole internet is not a deployment input" >&2
+        exit 2
+    fi
+done
+
+ABSENT=0
+for NETWORK in $NETWORKS; do
+    RULE="-p tcp -s $NETWORK --dport $PORT -j ACCEPT"
+    if "$IPTABLES" -C INPUT $RULE >/dev/null 2>&1; then
+        PRESENT=1
+    else
+        PRESENT=0
+        ABSENT=$((ABSENT + 1))
+    fi
+    if [ "$CHECK" -eq 1 ]; then
+        [ "$PRESENT" -eq 1 ] && echo "present: $NETWORK -> $PORT" || echo "absent: $NETWORK -> $PORT"
+        continue
+    fi
+    if [ "$REMOVE" -eq 1 ]; then
+        if [ "$PRESENT" -eq 1 ]; then
+            "$IPTABLES" -D INPUT $RULE
+            echo "removed $NETWORK -> $PORT"
+        else
+            echo "absent, nothing to remove: $NETWORK -> $PORT"
+        fi
+        continue
+    fi
+    if [ "$PRESENT" -eq 1 ]; then
+        echo "already present: $NETWORK -> $PORT"
+    else
+        "$IPTABLES" -A INPUT $RULE
+        echo "added $NETWORK -> $PORT"
+    fi
+done
 
 if [ "$CHECK" -eq 1 ]; then
-    [ "$PRESENT" -eq 1 ] && echo "present" || echo "absent"
-    exit $((1 - PRESENT))
-fi
-
-if [ "$REMOVE" -eq 1 ]; then
-    if [ "$PRESENT" -eq 1 ]; then
-        "$IPTABLES" -D INPUT $RULE
-        echo "removed $CIDR -> $PORT"
-    else
-        echo "absent, nothing to remove"
-    fi
-    exit 0
-fi
-
-if [ "$PRESENT" -eq 1 ]; then
-    echo "already present: $CIDR -> $PORT"
-else
-    "$IPTABLES" -A INPUT $RULE
-    echo "added $CIDR -> $PORT"
+    if [ "$ABSENT" -eq 0 ]; then exit 0; else exit 1; fi
 fi
