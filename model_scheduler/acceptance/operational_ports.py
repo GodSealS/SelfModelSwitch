@@ -17,9 +17,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -217,6 +219,114 @@ def _unsafe_evictions(models: Any) -> int | None:
     return sum(1 for model in models.values() if isinstance(model, Mapping)
                and isinstance(model.get("last_error"), str)
                and any(marker in model["last_error"] for marker in markers))
+
+
+# ---------------------------------------------------------------------------
+# O02: the storage faults stay inside a private mount namespace
+
+
+class SubprocessProbe:
+    """`unshare --user --map-root-user --mount` running `o02_probe` over pipes."""
+
+    def __init__(self, *, config_path: Path, filesystem: str) -> None:
+        self._process = subprocess.Popen(  # noqa: S603 - a fixed argv, no shell
+            ["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private",
+             sys.executable, "-m", "model_scheduler.acceptance.o02_probe",
+             "--config", str(config_path), "--filesystem", filesystem, "--parent-pid", str(os.getpid())],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def send(self, command: Mapping[str, Any]) -> Mapping[str, Any]:
+        stdin, stdout = self._process.stdin, self._process.stdout
+        if self._process.poll() is not None:
+            raise PortError(f"the namespace probe exited with {self._process.returncode}: {self._stderr()}")
+        if stdin is None or stdout is None:
+            raise PortError("the namespace probe pipes are not open")
+        stdin.write(json.dumps(dict(command)) + "\n")
+        stdin.flush()
+        line = stdout.readline()
+        if not line.strip():
+            raise PortError(f"the namespace probe answered nothing: {self._stderr()}")
+        document = json.loads(line)
+        if not isinstance(document, dict):
+            raise PortError("the namespace probe answered a non-object")
+        return document
+
+    def close(self) -> None:
+        try:
+            if self._process.poll() is None:
+                self.send({"action": "teardown"})
+                self.send({"action": "quit"})
+        except (PortError, ValueError):
+            pass
+        finally:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+
+    def _stderr(self) -> str:
+        stream = self._process.stderr
+        text = stream.read() if stream is not None else ""
+        return (text or "").strip()[:200]
+
+
+@dataclass
+class NamespaceDiskFaultPort:
+    """O02's storage faults, executed inside a private mount namespace.
+
+    The namespace comes from the launcher (`unshare --user --map-root-user
+    --mount`), so the model disk is *shadowed* rather than unmounted and every
+    scratch write stays on a dedicated tmpfs. When the namespace cannot be
+    created at all, the first step reports itself unavailable and the case
+    becomes `not_run` — never a pass.
+    """
+
+    config_path: Path
+    filesystem: str
+    probe_factory: Callable[[], Any] | None = None
+    _probe: Any = field(default=None, init=False, repr=False)
+
+    def _handle(self) -> Any:
+        if self._probe is None:
+            if self.probe_factory is not None:
+                self._probe = self.probe_factory()
+            else:
+                self._probe = SubprocessProbe(config_path=Path(self.config_path),
+                                              filesystem=self.filesystem)
+        return self._probe
+
+    def isolate_mount_namespace(self, deployment_id: str) -> Mapping[str, Any]:
+        answer = self._answer("isolate", deployment_id=deployment_id)
+        if "error" in answer:
+            return {"available": False, "reason": answer["error"], "action": "isolate_mount_namespace"}
+        return answer
+
+    def fail_model_disk(self) -> Mapping[str, Any]:
+        return self._step("fail_model_disk")
+
+    def fill_scratch(self, quota_bytes: int) -> Mapping[str, Any]:
+        return self._step("fill_scratch", quota_bytes=int(quota_bytes))
+
+    def recover_model_disk(self) -> Mapping[str, Any]:
+        return self._step("recover")
+
+    def close(self) -> None:
+        if self._probe is not None:
+            self._probe.close()
+            self._probe = None
+
+    def _step(self, action: str, **payload: Any) -> Mapping[str, Any]:
+        answer = self._answer(action, **payload)
+        if "error" in answer:
+            raise PortError(str(answer["error"]))
+        return answer
+
+    def _answer(self, action: str, **payload: Any) -> Mapping[str, Any]:
+        answer = self._handle().send({"action": action, **payload})
+        if not isinstance(answer, Mapping):
+            raise PortError(f"the namespace probe answered a non-object for {action!r}: {answer!r}")
+        return dict(answer)
 
 
 # ---------------------------------------------------------------------------

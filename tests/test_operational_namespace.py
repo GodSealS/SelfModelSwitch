@@ -1,0 +1,179 @@
+"""P30 O02: the storage faults really stay inside a private mount namespace.
+
+The port talks to `o02_probe` over a line protocol, so these tests pin two
+things down: the port turns what the probe answers into a case verdict (a probe
+that cannot isolate is `not_run`, a refused step is a failure, never a pass),
+and the probe itself reports every refusal as a JSON line instead of dying.
+"""
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
+from model_scheduler.acceptance import o02_probe
+from model_scheduler.acceptance import operational_cases as oc
+from model_scheduler.acceptance.operational_ports import NamespaceDiskFaultPort, PortError
+
+HEALTHY = {
+    "isolate": {"available": True, "private_mount_namespace": True, "unmounted_shared_disk": False,
+                "workspace": "/tmp/sms-o02-x", "workspace_filesystem": "tmpfs"},
+    "fail_model_disk": {"model_disk_unavailable": True, "reason": "the assets stopped verifying",
+                        "root_disk_writes": 0},
+    "fill_scratch": {"dedicated_quota_fs": True, "scratch_full": True, "root_disk_writes": 0},
+    "recover": {"recovered": True, "rehashed": True, "root_disk_writes": 0},
+}
+
+
+class FakeProbe:
+    """Stands in for the namespace process: one answer per action, all recorded."""
+
+    def __init__(self, answers: dict[str, dict] | None = None) -> None:
+        self.answers = {**HEALTHY, **(answers or {})}
+        self.sent: list[dict] = []
+        self.closed = False
+
+    def send(self, command: dict) -> dict:
+        self.sent.append(dict(command))
+        action = str(command.get("action") or "")
+        answer = self.answers.get(action)
+        if answer is None:
+            return {"error": f"the namespace refused {action!r}"}
+        return dict(answer)
+
+    def close(self) -> None:
+        self.closed = True
+        self.sent.append({"action": "teardown"})
+        self.sent.append({"action": "quit"})
+
+
+def _port(answers: dict[str, dict] | None = None) -> tuple[NamespaceDiskFaultPort, FakeProbe]:
+    probe = FakeProbe(answers)
+    return NamespaceDiskFaultPort(config_path="scheduler.yaml", filesystem="ext4",
+                                  probe_factory=lambda: probe), probe
+
+
+def test_o02_passes_through_a_healthy_namespace_probe() -> None:
+    port, probe = _port()
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=64 * 1024**2)
+
+    assert result.status == "passed"
+    assert [command["action"] for command in probe.sent] == [
+        "isolate", "fail_model_disk", "fill_scratch", "recover"]
+    assert probe.sent[2]["quota_bytes"] == 64 * 1024**2
+    assert oc.recompute_objections("O02", result.facts) == []
+
+
+def test_a_namespace_that_cannot_isolate_is_not_run() -> None:
+    port, _ = _port({"isolate": {"error": "unshare: operation not permitted"}})
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    assert result.status == "not_run"
+    assert "unshare" in result.facts["isolation"]["reason"]
+    assert result.facts["isolation"]["available"] is False
+
+
+def test_a_refused_step_is_a_failure_and_never_a_pass() -> None:
+    port, _ = _port({"fail_model_disk": {"error": "mount --bind is not permitted in this namespace"}})
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    assert result.status == "failed"
+    assert any("fail_model_disk" in failure for failure in result.failures)
+    assert result.facts["model_disk"] == {}
+
+
+def test_a_probe_that_reports_a_machine_wide_unmount_fails() -> None:
+    port, _ = _port({"isolate": {"available": True, "private_mount_namespace": True,
+                                 "unmounted_shared_disk": True}})
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    assert result.status == "failed"
+    assert any("machine-wide disk" in problem for problem in result.problems)
+    assert any("machine-wide disk" in problem for problem in oc.recompute_objections("O02", result.facts))
+
+
+def test_a_probe_that_writes_outside_the_quota_fails() -> None:
+    port, _ = _port({"fill_scratch": {"dedicated_quota_fs": True, "scratch_full": True,
+                                      "root_disk_writes": 2}})
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    assert result.status == "failed"
+    assert any("root_disk_writes" in problem for problem in result.problems)
+
+
+def test_the_port_closes_the_namespace_exactly_once() -> None:
+    port, probe = _port()
+    oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    port.close()
+    assert probe.closed is True
+    assert [command["action"] for command in probe.sent[-2:]] == ["teardown", "quit"]
+
+    port.close()  # a second close must not open another namespace
+    assert probe.sent.count({"action": "teardown"}) == 1
+
+
+def test_a_port_that_never_ran_opens_no_namespace() -> None:
+    calls: list[int] = []
+
+    def factory() -> FakeProbe:
+        calls.append(1)
+        return FakeProbe()
+
+    NamespaceDiskFaultPort(config_path="scheduler.yaml", filesystem="ext4", probe_factory=factory).close()
+
+    assert calls == []
+
+
+def test_a_non_object_answer_is_refused() -> None:
+    class NotAnObject:
+        def send(self, command: dict):
+            return ["a list is not a probe answer"]
+
+        def close(self) -> None:
+            return None
+
+    port = NamespaceDiskFaultPort(config_path="scheduler.yaml", filesystem="ext4",
+                                  probe_factory=NotAnObject)
+
+    with pytest.raises(PortError):
+        port.fail_model_disk()
+
+
+def test_the_probe_reports_every_refusal_as_a_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    class LoopProbe:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        def isolate(self) -> dict:
+            return {"private_mount_namespace": True}
+
+        def fill_scratch(self, quota_bytes: int) -> dict:
+            return {"bytes_written": quota_bytes}
+
+        def fail_model_disk(self) -> dict:
+            raise RuntimeError("mount --bind is not permitted")
+
+    monkeypatch.setattr(o02_probe, "Probe", LoopProbe)
+    stdin = io.StringIO("\n".join([
+        "not json at all",
+        json.dumps({"action": "nonsense"}),
+        json.dumps({"action": "isolate"}),
+        json.dumps({"action": "fail_model_disk"}),
+        json.dumps({"action": "fill_scratch", "quota_bytes": 4096}),
+        json.dumps({"action": "quit"}),
+    ]) + "\n")
+    stdout = io.StringIO()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    assert o02_probe.main(["--config", "scheduler.yaml", "--filesystem", "ext4"]) == 0
+
+    lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert lines[0]["error"] == "the command is not JSON"
+    assert "nonsense" in lines[1]["error"]
+    assert lines[2]["private_mount_namespace"] is True
+    assert "mount --bind is not permitted" in lines[3]["error"]
+    assert lines[4]["bytes_written"] == 4096
+    assert lines[5]["bye"] is True

@@ -394,11 +394,17 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
     results.append(result)
 
     # -- O02 — O06: the fault, recovery, preflight and release ports -------
-    disk = wired.get("disk") or NotWiredPort(
-        "the deployment-private storage fault port is not wired (O02 needs a private mount namespace "
-        "so the model disk can fail without touching the machine)")
-    results.append(_record_o(store, oc.run_o02(disk, deployment_id=candidate.deployment_id,
-                                               quota_bytes=SCRATCH_FAULT_BYTES)))
+    disk = wired.get("disk") or _namespace_disk_port(config_path)
+    if disk is None:
+        disk = NotWiredPort(
+            "the deployment-private storage fault port is not wired (O02 needs a private mount namespace "
+            "so the model disk can fail without touching the machine)")
+    try:
+        results.append(_record_o(store, oc.run_o02(disk, deployment_id=candidate.deployment_id,
+                                                   quota_bytes=SCRATCH_FAULT_BYTES)))
+    finally:
+        if hasattr(disk, "close"):
+            disk.close()
     fault = wired.get("fault") or NotWiredPort(
         "the Docker fault port is not wired (O03 needs Docker to become unreachable for this deployment only)")
     results.append(_record_o(store, oc.run_o03(fault, model_id=candidate.models[0].model_id)))
@@ -440,6 +446,22 @@ def _operational_policy(candidate: Any) -> Mapping[str, Any] | None:
         return asdict(operational)
     except TypeError:
         return dict(operational) if isinstance(operational, Mapping) else None
+
+
+def _namespace_disk_port(config_path: Path | None) -> Any:
+    """O02's port over a mount namespace this run creates for itself.
+
+    `None` means there is no configuration and therefore no model disk to shadow;
+    the caller then reports the case as `not_run`.
+    """
+    if config_path is None:
+        return None
+    from ..config import load_config
+    from .operational_ports import NamespaceDiskFaultPort, _filesystem_of
+
+    config = load_config(Path(config_path))
+    directory = Path(config.storage.model_directory)
+    return NamespaceDiskFaultPort(config_path=Path(config_path), filesystem=_filesystem_of(directory))
 
 
 def _preflight_from_site(*, candidate: Any, candidate_path: Path, config_path: Path | None) -> Any:
