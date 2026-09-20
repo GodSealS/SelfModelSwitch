@@ -1706,3 +1706,10 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - **`/health` 的 preload 检查恒假**：即使 `preload_models: ["qwen-small"]` 且模型已在服务（请求 200），`/health` 仍是 503、`checks.preload=false`。说明 v2 的 `preload_pending`/`preload_error` 不会被清（任务失败或被卡住），`/health` 因此**不能作为就绪判据**；这也正是 O03 的 `health_status=503` 判据失去区分度的原因（故障前后都是 503）。
 - **模型盘现状**（`/media/jtzn/sandisk-ext4/models/`）：`qwen25vl-7b-q4/`（Q4_K_M 4.4G + mmproj 1.3G，已登记为 `qwen-small`）、`qwen36-35b-aggr/`（Q4_K_M 19.7G、Q4_K_P 21.8G、mmproj f16 858M，**未登记**）、`moss_td/`（safetensors 1.7G，非 GGUF profile，不能由当前 runtime 加载）。登记 qwen3.6 需要按 C02/P21 重做测量 + fixtures + 重建候选，不是改配置就能生效。
 - 本次网关是在目标机**手工拉起**的（`deploy/gateway.py` 直接运行）；作为 systemd 单元正式安装属 P27/P31，尚未执行。
+
+## 站点改名与网关放开（2026-09-20）
+
+- 模型 ID `qwen-small` → **`qwen25vl-7b`**（消除"小模型"的误导；它就是盘上的 Qwen2.5-VL-7B）。改名同时覆盖：`registration.models[].model_id`、`scheduler.pinned/preload_models`、lab llama-swap 布置的 models 键、容器名 `sms-sms-orin-lab-qwen25vl-7b` 与标签 `io.self-model-switch.model=qwen25vl-7b`（否则受管观察者无法归因）。原布置备份：`…/p30-lab-20260920T075614Z/llama-swap.lab.json.bak-rename`。
+  验证：`--check-config` 通过（`models=qwen25vl-7b`）；`/api/status` → `qwen25vl-7b: (ready, None)`；容器名与标签均为新 ID；经网关从目标机与**开发机**（LAN `192.168.1.100:8091`）调用均 **200**，返回真实答案。
+- 网关改绑 `0.0.0.0:8091`（调度器仍 `127.0.0.1:8090`），USB 直连 `192.168.55.1` 与有线 LAN `192.168.1.100` 两个地址均验证 200；来源仍由 iptables 两条规则限制在 `192.168.55.0/24`、`192.168.1.0/24`。
+- **遗留一致性**：已冻结候选 `35c4af598332faaf2293614cc52e81e7622b781df60ee4a63c8307dbf5ddd35c` 及其 S/B/O 材料仍使用 `qwen-small`；改名改变了部署身份，因此下次重建候选必须在 `qwen25vl-7b` 下重做全部证据，不得沿用旧材料的通过结论。
