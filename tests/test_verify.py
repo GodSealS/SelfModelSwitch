@@ -103,16 +103,17 @@ def _case_material(case_id: str) -> tuple[dict, dict[str, object]]:
             return facts, samples
         envelope = {"input_tokens": 512, "output_tokens": 64, "parallel": 2}
         document = {"provider": "runtime-1", "observed": dict(envelope),
-                    "output": {"message": {"role": "assistant", "content": "tok out"}},
+                    "output": {"choices": [{"message": {"role": "assistant", "content": "tok out"}}]},
                     "fixture": {"capability": "chat", "fixture_id": "qwen-small-chat", "boundary": dict(envelope)}}
         if kind == "cap":
             capability = parts[3]
             if capability in ("chat", "vision"):
-                document["output"] = {"message": {"role": "assistant", "content": "tok out"}}
+                document["output"] = {"choices": [{"message": {"role": "assistant", "content": "tok out"}}]}
             elif capability == "embeddings":
-                document["output"] = {"vectors": [[0.5, 1.0], [1.5, 2.0]]}
+                document["output"] = {"data": [{"embedding": [0.5, 1.0]}, {"embedding": [1.5, 2.0]}]}
             else:
-                document["output"] = {"results": [{"index": 0, "score": 0.5}, {"index": 1, "score": 0.25}]}
+                document["output"] = {"results": [{"index": 0, "relevance_score": 0.5},
+                                                  {"index": 1, "relevance_score": 0.25}]}
         return document, samples
     if case_id == "O01":
         return {"policy": POLICY, "final_state": CLEAN_STATE}, {

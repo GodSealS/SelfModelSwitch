@@ -111,18 +111,20 @@ class FakeDriver:
             output_tokens = int(request.get("max_tokens", 0))
             if self.split_boundary:
                 tokens = tokens // 2
-            return {**common, "output": {"message": {"role": "assistant",
-                                                     "content": " ".join(f"out{i}" for i in range(output_tokens))}},
+            return {**common, "output": {"choices": [{"message": {"role": "assistant",
+                                                                  "content": " ".join(f"out{i}"
+                                                                                      for i in range(output_tokens))}}]},
                     "observed": {"input_tokens": tokens, "output_tokens": output_tokens, "images": images,
                                  "parallel": int(request.get("n_parallel", 1))}}
         if "inputs" in request:
             if self.empty_vectors:
-                return {**common, "output": {"vectors": []}, "observed": {"batch": len(request["inputs"])}}
+                return {**common, "output": {"data": []}, "observed": {"batch": len(request["inputs"])}}
             vectors = [[float(index), 1.0] for index in range(len(request["inputs"]))]
             if self.nan_embeddings:
                 vectors[0] = [math.nan, 1.0]
-            return {**common, "output": {"vectors": vectors}, "observed": {"batch": len(request["inputs"])}}
-        return {**common, "output": {"results": [{"index": index, "score": 0.5}
+            return {**common, "output": {"data": [{"embedding": vector} for vector in vectors]},
+                    "observed": {"batch": len(request["inputs"])}}
+        return {**common, "output": {"results": [{"index": index, "relevance_score": 0.5}
                                                  for index in range(len(request["documents"]))]},
                 "observed": {"documents": len(request["documents"])}}
 

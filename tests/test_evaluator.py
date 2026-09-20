@@ -32,7 +32,8 @@ def _material(directory: Path, case_id: str, *, samples: dict[str, list[str]] | 
 
 
 def _backend_document(case_id: str, **overrides) -> dict:
-    document = {"provider": "runtime-1", "output": {"message": {"role": "assistant", "content": "tok out"}},
+    document = {"provider": "runtime-1",
+               "output": {"choices": [{"message": {"role": "assistant", "content": "tok out"}}]},
                 "observed": {"input_tokens": 512, "output_tokens": 64, "parallel": 2},
                 "fixture": {"capability": "chat", "fixture_id": "qwen-small-chat",
                             "boundary": {"input_tokens": 512, "output_tokens": 64, "parallel": 2}}}
@@ -76,12 +77,12 @@ def test_a_case_without_raw_samples_or_below_the_boundary_fails_even_if_it_claim
 def test_a_capability_case_is_recomputed_from_its_real_output(tmp_path) -> None:
     healthy = _material(tmp_path / "cap-ok", "B:qwen-small:cap:embeddings", samples={"tegrastats": [TEGRA_ACTIVE]},
                         provider="runtime-1", observed={"batch": 2},
-                        output={"vectors": [[0.5, 1.0], [1.5, 2.0]]})
+                        output={"data": [{"embedding": [0.5, 1.0]}, {"embedding": [1.5, 2.0]}]})
     assert ev.evaluate_case(case_id="B:qwen-small:cap:embeddings", directory=healthy).passed is True
 
     nan = _material(tmp_path / "cap-nan", "B:qwen-small:cap:embeddings", samples={"tegrastats": [TEGRA_ACTIVE]},
                     status="passed", provider="runtime-1", observed={"batch": 2},
-                    output={"vectors": [[float("nan"), 1.0], [1.5, 2.0]]})
+                    output={"data": [{"embedding": [float("nan"), 1.0]}, {"embedding": [1.5, 2.0]}]})
     verdict = ev.evaluate_case(case_id="B:qwen-small:cap:embeddings", directory=nan)
     assert verdict.passed is False and any("non-finite" in reason for reason in verdict.reasons)
 

@@ -88,25 +88,29 @@ class Attempt:
 
 
 def capability_output_problems(capability: str, output: Mapping[str, Any]) -> list[str]:
-    """Protocol/shape/finite/range of one capability's real output."""
+    """Protocol/shape/finite/range of the body the deployment publishes.
+
+    The published output *is* the runtime's own response: the chat body carries
+    `choices[].message.content`, embeddings carry `data[].embedding` and rerank
+    carries `results[].relevance_score`. Checking a normalized shape instead would
+    report every healthy answer as empty.
+    """
     problems: list[str] = []
     if capability == "chat" or capability == "vision":
-        message = output.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else output.get("content")
-        if not isinstance(content, str) or not content.strip():
+        if not _chat_content(output).strip():
             problems.append(f"{capability}: the response carries no non-empty content")
     elif capability == "embeddings":
-        vectors = output.get("vectors")
-        if not isinstance(vectors, list) or not vectors:
+        vectors = _embedding_vectors(output)
+        if not vectors:
             problems.append("embeddings: no vectors returned")
             return problems
-        dimensions = {len(vector) for vector in vectors if isinstance(vector, list)}
+        dimensions = {len(vector) for vector in vectors}
         if len(dimensions) != 1 or 0 in dimensions:
             problems.append("embeddings: vectors have inconsistent or empty dimensions")
             return problems
         for index, vector in enumerate(vectors):
-            if not isinstance(vector, list) or any(isinstance(value, bool) or not isinstance(value, (int, float))
-                                                   or not math.isfinite(value) for value in vector):
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                   for value in vector):
                 problems.append(f"embeddings: vector {index} has non-finite or non-numeric values")
                 break
     elif capability == "rerank":
@@ -115,13 +119,42 @@ def capability_output_problems(capability: str, output: Mapping[str, Any]) -> li
             problems.append("rerank: no results returned")
             return problems
         for index, entry in enumerate(results):
-            score = entry.get("score") if isinstance(entry, Mapping) else None
+            score = entry.get("relevance_score") if isinstance(entry, Mapping) else None
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
                 problems.append(f"rerank: result {index} has a non-finite score")
                 break
     else:
         problems.append(f"{capability!r} is not an acceptance capability")
     return problems
+
+
+def _chat_content(output: Mapping[str, Any]) -> str:
+    """The answer text of a chat completion body, whichever choice carried it."""
+    choices = output.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    for entry in choices:
+        if not isinstance(entry, Mapping):
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else entry.get("text")
+        if isinstance(content, str) and content:
+            return content
+    return ""
+
+
+def _embedding_vectors(output: Mapping[str, Any]) -> list[list]:
+    """The vectors of an embeddings body, in the order the runtime returned them."""
+    data = output.get("data")
+    if not isinstance(data, list):
+        return []
+    vectors = []
+    for row in data:
+        vector = row.get("embedding") if isinstance(row, Mapping) else None
+        if not isinstance(vector, list):
+            return []
+        vectors.append(vector)
+    return vectors
 
 
 def attribution_problems(kind: str, facts: Mapping[str, Any]) -> list[str]:
