@@ -1392,3 +1392,33 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. 填充后追加一条短指令（其 token 成本同样实测），让边界轮是一次真实请求。
 3. 非推理 case 的归属：provider=部署身份（`deployment_id@boot_id`，由候选传入、boot_id 取自控制 socket），`load` 的实例事实需在"只读实例视图"与"只读容器观察"之间决策；`cancel` 需轮询到终态并证 `cancelled`。
 4. 之后重跑 B；S 层与 O 层编排仍未交付，P30/P31 依赖本链（`78e4d26` 起需重新同步目标）。
+
+## P29 补记（2026-09-20，B 层首次接近全绿）
+
+| 项 | 值 |
+|---|---|
+| task_id | P29（仍未完成；AC1—AC3 保持未勾） |
+| candidate_sha256 | `d2a1e73030f17c7deb0635a11faad082f2a5e3d523dbfb0b61899af5ff012c76`（run-b18） |
+| source_commit | `48887cf`（run-b18 的代码），记录补丁 `7c84d87` |
+| target_commit | `48887cf`；`7c84d87`（仅一条诊断改进）**待同步**（目标机到 github 再次 `flush 包`/连接失败） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/fresh/run-b18/` |
+
+**真机结果：12 次尝试中 11 次通过**，8 个 case 中 7 个通过：
+
+| case | status | 说明 |
+|---|---|---|
+| `load`×3 | passed | provider=`sms-orin-lab@<boot>` + 只读观察到的容器实例事实 |
+| `infer` / `envelope` | passed | 归因齐备；单请求达到声明边界 |
+| `cancel` | passed | 轮询到终态且终态为 `cancelled` |
+| `stop` / `reload`×3 | passed | `stop_proven` + 每次重载的独立冷启动 |
+| `cap:chat` | passed | 边界达到（8192/4096）且回答非空 |
+| `cap:vision` | **failed** | `AdapterError: input tokens exceed envelope.max_input_tokens`；而同一 fixture 经**适配器同一条计数路径**实测 `charged=8192 = declared`（offset 0），`units=6861、counted=6912、images=1` |
+
+**新增交付（本轮）**
+
+- `48887cf`：非推理 case 的归属——provider 取「候选绑定的 deployment_id + 控制 socket 实际 boot_id」，`load` 的实例事实来自**只读**观察部署自己打标签的容器（列出 + inspect，不启停）；`cancel` 仅在终态确为 `cancelled` 时才算证明；观察不到即缺席，绝不借用别家实例。
+- `79f7f9a`：case 输出检查改读**部署真实发布**的响应体（`choices[].message.content` / `data[].embedding` / `results[].relevance_score`）——此前读归一化形状，导致每个健康回答都被判"空"。
+- `5d1c2e8`：fixture 材料携带两个模板开销与**带实测成本**的指令（chat 19 / vision 50 / 指令 9 token），文本预算按能力分别扣除；`filler_text` 不再重复扣模板。
+- `7c84d87`（待同步）：envelope 拒绝带上具体数字（`(6916 > 8192)`），否则无法离线对账。
+
+**下一步（唯一剩余项）**：`cap:vision` 的拒绝与实测计数矛盾，需在目标机上对比"适配器计数 vs fixture 自算"的具体数字（新拒绝信息就是为此加的），再决定是修正 fixture 的 vision 开销取值，还是修适配器对 vision payload 的计费口径；之后重跑 B，B 层即可全绿，再进入 `verify` 与 S/O 层编排。
