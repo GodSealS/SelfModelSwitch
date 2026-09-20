@@ -237,6 +237,8 @@ class ControlApiCaseDriver:
     owner: str = "acceptance"
     sleep: Callable[[float], None] = field(default=lambda seconds: __import__("time").sleep(seconds))
     sampler_factory: Callable[[], Any] | None = None  # see acceptance.device_activity
+    provider_identity: str | None = None  # the deployment this run is bound to (from its candidate)
+    instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None  # see acceptance.instances
     deadline_seconds: float = 1800.0
     ready_timeout_seconds: float = 1800.0
     heartbeat_interval_seconds: float = 10.0  # the C04 policy's own heartbeat cadence
@@ -244,6 +246,7 @@ class ControlApiCaseDriver:
     _counter: int = field(default=0, init=False)
     _executions: dict[str, str] = field(default_factory=dict, init=False)  # execution_id -> model_id
     _stop_proven: dict[str, bool] = field(default_factory=dict, init=False)
+    _boot: str | None = field(default=None, init=False)
 
     # -- helpers -----------------------------------------------------------
 
@@ -261,6 +264,30 @@ class ControlApiCaseDriver:
             detail = response.document.get("error", response.document)
             raise DriverError(f"{what} failed with {response.status}: {detail}")
         return response.document
+
+    def provider(self) -> str | None:
+        """The deployment that served an action, as the control socket proves it.
+
+        `deployment_id` comes from the candidate this run is frozen against; the
+        boot id comes from the live socket, so a stale or foreign deployment
+        cannot inherit the identity of the one under test.
+        """
+        if self.provider_identity is None:
+            return None
+        if self._boot is None:
+            try:
+                self._boot = self.boot_id()
+            except DriverError:
+                return None
+        return f"{self.provider_identity}@{self._boot}"
+
+    def _observed_instance(self, model_id: str) -> Mapping[str, Any] | None:
+        if self.instance_probe is None:
+            return None
+        try:
+            return self.instance_probe(model_id)
+        except Exception:  # noqa: BLE001 - an unobservable instance is absent, never borrowed
+            return None
 
     def _session_for(self, model_id: str) -> Session:
         session = self._sessions.get(model_id)
@@ -307,7 +334,8 @@ class ControlApiCaseDriver:
         # session may submit"), and a load that returns early would be a false pass.
         view = self._await_active(session)
         return {"session_id": session_id, "cold": cold, "state": view.get("state"),
-                "phase": view.get("phase"), "boot_id": view.get("boot_id"), "view": view}
+                "phase": view.get("phase"), "boot_id": view.get("boot_id"), "view": view,
+                "provider": self.provider(), "instance": self._observed_instance(model_id)}
 
     def _await_active(self, session: Session) -> Mapping[str, Any]:
         deadline_seconds = self.ready_timeout_seconds
@@ -441,11 +469,23 @@ class ControlApiCaseDriver:
         return document if isinstance(document, dict) else None
 
     def cancel(self, model_id: str, execution_id: str) -> Mapping[str, Any]:
+        """Cancel one execution and report it cancelled only when it ended cancelled."""
         session = self._session_for(model_id)
         document = self._require(self.transport.request(
             "POST", f"/internal/executions/{execution_id}/cancel", {"session_token": session.token}),
             f"execution cancel {execution_id}")
-        return {"execution_id": execution_id, "view": document}
+        view, waited = document, 0.0
+        while str(view.get("state")) not in EXECUTION_TERMINAL_STATES:
+            if waited >= self.deadline_seconds:
+                break
+            self.sleep(POLL_INTERVAL_SECONDS)
+            waited += POLL_INTERVAL_SECONDS
+            self._beat_if_due(model_id)
+            view = self._require(self.transport.request("GET", f"/internal/executions/{execution_id}"),
+                                 f"execution read {execution_id}")
+        state = str(view.get("state"))
+        return {"execution_id": execution_id, "state": state, "provider": self.provider(),
+                "cancelled": state == "cancelled", "view": view}
 
     def stop(self, model_id: str) -> Mapping[str, Any]:
         """Close the session; the deployment stops what it started.
@@ -459,7 +499,7 @@ class ControlApiCaseDriver:
             # a reload must not be refused just because the stop case already ran.
             proven = self._stop_proven.get(model_id) is True
             return {"session_id": None, "state": "closed" if proven else None, "stop_proven": proven,
-                    "note": "no session was open"}
+                    "provider": self.provider(), "note": "no session was open"}
         self._beat_if_due(model_id)
         closed = self._require(self.transport.request("POST", f"/internal/sessions/{session.session_id}/close",
                                                        {"session_token": session.token}),
@@ -469,7 +509,7 @@ class ControlApiCaseDriver:
         proven = str(closed.get("state")) == "closed"
         self._stop_proven[model_id] = proven
         return {"session_id": session.session_id, "state": closed.get("state"), "stop_proven": proven,
-                "view": closed}
+                "provider": self.provider(), "view": closed}
 
     def cleanup(self, model_id: str) -> Mapping[str, Any]:
         """Close any session left open; inline inputs mean no blobs to delete."""

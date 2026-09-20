@@ -157,7 +157,7 @@ def test_the_driver_refuses_execute_before_a_load() -> None:
         driver.execute("qwen-small", {"messages": []})
     # a stop with nothing open is a no-op, not a failure (the matrix stops, then reloads)
     assert driver.stop("qwen-small") == {"session_id": None, "state": None, "stop_proven": False,
-                                         "note": "no session was open"}
+                                         "provider": None, "note": "no session was open"}
 
 
 def test_an_api_refusal_is_reported_not_guessed() -> None:
@@ -264,9 +264,11 @@ def test_cancel_uses_the_official_cancel_path() -> None:
     cancelled = driver.cancel("qwen-small", started["execution_id"])
     followed = transport.request("GET", f"/internal/executions/{started['execution_id']}")
 
-    assert (transport.requests[-2][0], transport.requests[-2][1]) == ("POST", "/internal/executions/execution-2/cancel")
-    assert transport.requests[-2][2] == {"session_token": "tok-1"}
-    assert cancelled["execution_id"] == "execution-2" and followed.document["state"] == "cancelled"
+    cancels = [(method, path, body) for method, path, body in transport.requests if path.endswith("/cancel")]
+    assert cancels == [("POST", "/internal/executions/execution-2/cancel", {"session_token": "tok-1"})]
+    # The cancel is only reported cancelled once the execution really ended that way.
+    assert cancelled["execution_id"] == "execution-2" and cancelled["cancelled"] is True
+    assert followed.document["state"] == "cancelled"
 
 
 def test_the_transport_speaks_http_over_a_unix_socket_and_sends_the_version_header() -> None:
@@ -410,6 +412,39 @@ def test_device_activity_is_derived_from_raw_rows_never_from_a_boolean() -> None
     assert sampler.instance is not None and sampler.instance["container_id"] == "abc"
     # the rows travel with the result so the executor can persist them as material
     assert executed["samples"] == rows
+
+
+def test_a_load_is_attributed_to_the_deployment_and_the_instance_it_created() -> None:
+    """A load case needs both: who served it, and which container really serves the model."""
+    observed = {"container_id": "abc", "runtime_id": "llama-cpp-1"}
+    transport = _Transport()
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None,
+                                  provider_identity="sms-orin-lab", instance_probe=lambda _model: observed)
+
+    loaded = driver.load("qwen-small", cold=True)
+
+    assert loaded["provider"] == "sms-orin-lab@boot-x"  # the deployment id plus the live boot
+    assert loaded["instance"] == observed
+    assert driver.stop("qwen-small")["provider"] == "sms-orin-lab@boot-x"
+
+
+def test_without_a_bound_deployment_the_provider_stays_absent() -> None:
+    driver = ControlApiCaseDriver(_Transport(), sleep=lambda _seconds: None)
+
+    assert driver.load("qwen-small", cold=True)["provider"] is None  # never invented
+    assert driver.load("qwen-small", cold=True)["instance"] is None
+
+
+def test_a_cancel_is_only_called_cancelled_when_it_really_ended_that_way() -> None:
+    transport = _Transport(execution_states=["succeeded"])
+    driver = ControlApiCaseDriver(transport, sleep=lambda _seconds: None, provider_identity="sms-orin-lab")
+    driver.load("qwen-small", cold=True)
+    started = driver.start("qwen-small", _chat_payload())
+    transport.terminal = "succeeded"  # the execution finished before the cancel landed
+
+    cancelled = driver.cancel("qwen-small", started["execution_id"])
+
+    assert cancelled["cancelled"] is False and cancelled["state"] == "succeeded"
 
 
 def test_a_fixtures_generation_controls_reach_the_protocol() -> None:

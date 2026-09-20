@@ -41,6 +41,7 @@ from ..evidence_contracts import (
 )
 from .collector import FileCollector, collector_sha256
 from .device_activity import ManagedComputeSampler
+from .instances import ManagedInstanceProbe
 from .fixtures import FillerSpec
 
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
@@ -159,6 +160,7 @@ def compute_sampler_factory(scratch: Path) -> Callable[[], ManagedComputeSampler
 def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None = None,
                 transport: Any = None, executor: Any = None, run_id: str | None = None,
                 sampler_factory: Callable[[], Any] | None = None,
+                instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
                 collector_factory: Callable[..., FileCollector] = FileCollector,
                 fixtures_root: Path | None = None, filler_of: Mapping[str, Any] | None = None,
                 clock: Callable[[], float] | None = None) -> dict:
@@ -188,7 +190,9 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
     else:
         scratch = None
     factory = sampler_factory if sampler_factory is not None else compute_sampler_factory(scratch)
-    driver = ControlApiCaseDriver(link, sampler_factory=factory)
+    probe = instance_probe if instance_probe is not None else ManagedInstanceProbe(candidate.deployment_id).of
+    driver = ControlApiCaseDriver(link, sampler_factory=factory, provider_identity=candidate.deployment_id,
+                                  instance_probe=probe)
     if scratch is not None:
         atexit.register(shutil.rmtree, scratch, True)  # a device window is scratch, never evidence
     try:
