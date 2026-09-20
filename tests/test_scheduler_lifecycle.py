@@ -399,6 +399,33 @@ async def test_preload_residency_does_not_create_a_user_lease_or_heat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_warm_loads_one_model_without_a_lease() -> None:
+    """C06: an envelope count needs the runtime, so loading must not be a dispatch."""
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+
+    await scheduler.warm("chat", asyncio.get_running_loop().time() + 1)
+
+    runtime = registry.runtime["chat"]
+    assert runtime.state.value == "ready"
+    assert not runtime.leases and runtime.total_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_warm_refuses_a_model_that_is_not_registered() -> None:
+    spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100)
+    registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)
+    registry.bootstrap_stopped("chat")
+    scheduler = ModelScheduler(registry, Resources(), Backend())
+
+    with pytest.raises(KeyError):
+        await scheduler.warm("ghost", asyncio.get_running_loop().time() + 1)
+
+
+@pytest.mark.asyncio
 async def test_preload_waits_for_a_new_resource_sample_instead_of_spinning() -> None:
     spec = ModelSpec("chat", "http://127.0.0.1:10003", frozenset({Capability.CHAT}), 100, preload=True)
     registry = Book({"chat": spec}, model_budget=1_000, free_floor=20, margin=0)

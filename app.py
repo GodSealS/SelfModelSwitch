@@ -500,25 +500,40 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(422, "unsupported_capability", "Model does not support chat", request_id, "model")
         if app.state.scheduler is None or app.state.gateway is None:
             return _error(503, "service_unavailable", "Service is not ready", request_id)
+        deadline = monotonic() + config.gateway.inference_timeout_seconds
         if model.envelope is not None:
             counter = app.state.token_counter
 
             async def _count(messages, image_count):
                 return await counter(body.model, messages, image_count)
 
-            try:
+            async def _check() -> None:
                 await check_chat_input(payload, capabilities=model.capabilities, envelope=model.envelope,
                                        token_counter=_count if counter is not None else None)
+
+            try:
+                await _check()
             except EnvelopeError as exc:
                 return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "messages")
             except Exception:
-                # Counting failed, so compliance cannot be proven: refuse instead of
-                # dispatching a request whose envelope was never checked (C06).
-                return _error(503, "service_unavailable", "The input could not be counted against the envelope",
-                              request_id)
+                # The counter needs the runtime's own tokenizer and a cold model has
+                # none, so a cold deployment could never be counted and therefore
+                # never be loaded. Loading is not a dispatch: warm the model, then
+                # count again, and only refuse if compliance is still unproven (C06).
+                try:
+                    await app.state.scheduler.warm(body.model, deadline)
+                except Exception:
+                    return _error(503, "service_unavailable",
+                                  "The input could not be counted against the envelope", request_id)
+                try:
+                    await _check()
+                except EnvelopeError as exc:
+                    return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "messages")
+                except Exception:
+                    return _error(503, "service_unavailable",
+                                  "The input could not be counted against the envelope", request_id)
         lease = None
         try:
-            deadline = monotonic() + config.gateway.inference_timeout_seconds
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
             opened = await app.state.gateway.open(lease, Capability.CHAT, payload, deadline)
             if body.stream:

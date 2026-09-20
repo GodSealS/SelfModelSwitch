@@ -380,6 +380,17 @@ class ModelScheduler:
             self._forget_session_lease(lease.lease_id)
             self._condition.notify_all()
 
+    async def warm(self, model_id: str, deadline: float) -> None:
+        """Bring one model to READY without granting a user lease.
+
+        Loading is not a dispatch: an envelope count needs the runtime's own
+        tokenizer, so a cold model has to reach READY before its input can be
+        measured (C06).
+        """
+        if model_id not in self.book.specs:
+            raise KeyError(model_id)
+        await self._preload_one(model_id, deadline)
+
     async def preload(self, deadline: float) -> tuple[str, ...]:
         """Bring configured resident models to READY without granting user leases."""
         ready: list[str] = []
