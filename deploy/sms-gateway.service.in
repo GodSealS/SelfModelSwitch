@@ -1,0 +1,23 @@
+[Unit]
+Description=AGX compat gateway (authenticated access to the loopback scheduler)
+After=network-online.target model-scheduler.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=model-scheduler
+Group=model-scheduler
+WorkingDirectory=/opt/self-model-switch/current
+# The gateway is the process that listens on the internal address, so it is the
+# one that opens that port — and only to the networks the deployment names.
+ExecStartPre=+/opt/self-model-switch/current/deploy/open-firewall.sh --cidr ${SMS_ALLOW_CIDR} --port ${SMS_GATEWAY_PORT}
+ExecStart=/opt/self-model-switch/current/.venv/bin/python /opt/self-model-switch/current/deploy/gateway.py --host ${SMS_GATEWAY_HOST} --port ${SMS_GATEWAY_PORT} --upstream http://127.0.0.1:${SMS_SCHEDULER_PORT} --token-file ${SMS_GATEWAY_TOKEN_FILE}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

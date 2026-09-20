@@ -540,7 +540,7 @@ def migrate(source: str | Path, output: str | Path) -> dict[str, Any]:
     return migrated
 
 
-SERVICE_TEMPLATES = ("model-scheduler.service.in", "llama-swap.service.in")
+SERVICE_TEMPLATES = ("model-scheduler.service.in", "llama-swap.service.in", "sms-gateway.service.in")
 FORBIDDEN_UNIT_NAMES = ("video", "media", "transcode", "av1", "nvenc")
 _SOCKET_MODE = "0660"
 _UUIDISH = re.compile(r"[0-9A-Fa-f][0-9A-Fa-f-]{7,}\Z")
@@ -568,6 +568,9 @@ class ServiceInputs:
     allow_cidr: str = "127.0.0.1/32"
     allow_public: bool = False
     scheduler_port: int = 8090
+    gateway_host: str = "127.0.0.1"
+    gateway_port: int = 8091
+    gateway_token_file: str = "/etc/self-model-switch/gateway.token"
     socket_mode: str = _SOCKET_MODE
     video_unit: bool = False
 
@@ -609,6 +612,17 @@ class ServiceInputs:
         if isinstance(self.scheduler_port, bool) or not isinstance(self.scheduler_port, int) \
                 or not 1 <= self.scheduler_port <= 65535:
             raise DeployError("scheduler_port must be a port number")
+        try:
+            ipaddress.ip_address(self.gateway_host)
+        except ValueError as exc:
+            raise DeployError(f"gateway_host must be an address this machine holds: {exc}") from exc
+        if isinstance(self.gateway_port, bool) or not isinstance(self.gateway_port, int) \
+                or not 1 <= self.gateway_port <= 65535:
+            raise DeployError("gateway_port must be a port number")
+        if self.gateway_port == self.scheduler_port:
+            raise DeployError("the gateway must not listen on the scheduler's own port: that one stays loopback")
+        if not self.gateway_token_file.startswith("/") or Path(self.gateway_token_file).parent == Path("/"):
+            raise DeployError("gateway_token_file must be an absolute file path: the token is never inline")
 
 
 def render_service_units(*, inputs: ServiceInputs, output: str | Path,
@@ -660,6 +674,9 @@ def render_service_units(*, inputs: ServiceInputs, output: str | Path,
             # names; the rule is added idempotently and never touches the control socket.
             f"Environment=SMS_ALLOW_CIDR={inputs.allow_cidr}",
             f"Environment=SMS_SCHEDULER_PORT={inputs.scheduler_port}",
+            f"Environment=SMS_GATEWAY_HOST={inputs.gateway_host}",
+            f"Environment=SMS_GATEWAY_PORT={inputs.gateway_port}",
+            f"Environment=SMS_GATEWAY_TOKEN_FILE={inputs.gateway_token_file}",
         ]
         marker = "\n[Install]"
         text = text.replace(marker, "\n" + "\n".join(extras) + marker) if marker in text else text + "\n" + "\n".join(extras) + "\n"
@@ -686,7 +703,9 @@ def render_service_units(*, inputs: ServiceInputs, output: str | Path,
              "mount_unit": inputs.mount_unit, "blob_root": inputs.blob_root,
              "blob_disk_uuid": inputs.blob_disk_uuid, "blob_quota_bytes": inputs.blob_quota_bytes,
              "release_root": inputs.release_root, "allow_cidr": inputs.allow_cidr,
-             "allow_public": inputs.allow_public, "scheduler_port": inputs.scheduler_port, "video_units": 0}
+             "allow_public": inputs.allow_public, "scheduler_port": inputs.scheduler_port,
+             "gateway_host": inputs.gateway_host, "gateway_port": inputs.gateway_port,
+             "gateway_token_file": inputs.gateway_token_file, "video_units": 0}
     (target / "service-facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"ok": True, "output": str(target), "units": [name for name in sorted(rendered)],
             "socket_mode": inputs.socket_mode, "video_units": 0}

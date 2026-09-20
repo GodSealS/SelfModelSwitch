@@ -129,16 +129,21 @@ def _inputs(**overrides) -> ServiceInputs:
     return ServiceInputs(**values)
 
 
-def test_the_unit_opens_only_the_network_the_deployment_names(tmp_path: Path) -> None:
+def test_the_gateway_is_the_unit_that_opens_the_port(tmp_path: Path) -> None:
     output = tmp_path / "units"
-    result = render_service_units(inputs=_inputs(allow_cidr=CIDR, scheduler_port=8090), output=output)
+    result = render_service_units(inputs=_inputs(allow_cidr=CIDR, scheduler_port=8090,
+                                                 gateway_host="192.168.55.1", gateway_port=8091),
+                                  output=output)
 
-    unit = (output / "model-scheduler.service").read_text(encoding="utf-8")
-    assert f"Environment=SMS_ALLOW_CIDR={CIDR}" in unit
-    assert "Environment=SMS_SCHEDULER_PORT=8090" in unit
-    assert "open-firewall.sh --cidr ${SMS_ALLOW_CIDR} --port ${SMS_SCHEDULER_PORT}" in unit
+    gateway = (output / "sms-gateway.service").read_text(encoding="utf-8")
+    scheduler = (output / "model-scheduler.service").read_text(encoding="utf-8")
+    assert f"Environment=SMS_ALLOW_CIDR={CIDR}" in gateway
+    assert "open-firewall.sh --cidr ${SMS_ALLOW_CIDR} --port ${SMS_GATEWAY_PORT}" in gateway
+    assert "--upstream http://127.0.0.1:${SMS_SCHEDULER_PORT}" in gateway
+    assert "open-firewall.sh" not in scheduler  # the scheduler's own port stays loopback
     facts = json.loads((output / "service-facts.json").read_text(encoding="utf-8"))
     assert facts["allow_cidr"] == CIDR and facts["scheduler_port"] == 8090
+    assert facts["gateway_host"] == "192.168.55.1" and facts["gateway_port"] == 8091
     assert result["units"]
 
 
@@ -150,6 +155,15 @@ def test_the_renderer_refuses_the_internet_and_a_bad_network(tmp_path: Path) -> 
     with pytest.raises(DeployError, match="scheduler_port"):
         _inputs(scheduler_port=70000).validate()
     assert _inputs(allow_cidr="0.0.0.0/0", allow_public=True).validate() is None
+
+
+def test_the_gateway_inputs_are_checked(tmp_path: Path) -> None:
+    with pytest.raises(DeployError, match="gateway_host"):
+        _inputs(gateway_host="everywhere").validate()
+    with pytest.raises(DeployError, match="scheduler's own port"):
+        _inputs(scheduler_port=8091, gateway_port=8091).validate()
+    with pytest.raises(DeployError, match="absolute file path"):
+        _inputs(gateway_token_file="/gateway.token").validate()
 
 
 def test_the_script_is_executable() -> None:

@@ -60,17 +60,28 @@ render_service_units(output=Path("build/units"), inputs=ServiceInputs(
     scheduler_port=8090))           # the port `server.port` in the v2 config uses
 ```
 
-**Reaching the service from another machine (P27).** The rendered
-`model-scheduler.service` carries `SMS_ALLOW_CIDR`/`SMS_SCHEDULER_PORT` and runs
-`deploy/open-firewall.sh` as root before the scheduler starts. The rule is
-idempotent (a restart never stacks duplicates) and it only opens the
-compatibility port; the control plane stays on its Unix socket and is never
-reachable over TCP. Review the rule before installing:
-`iptables -S INPUT | grep -- '--dport 8090'`. Opening `0.0.0.0/0` needs
-`allow_public=True` on purpose, and the compatibility surface has no
-authentication of its own: put a reverse proxy (Basic Auth/mTLS) in front of it
-before it leaves a trusted network. To undo the rule by hand:
-`deploy/open-firewall.sh --cidr <cidr> --port <port> --remove`.
+**Reaching the service from another machine (P27).** The scheduler's TCP port is
+loopback by design (`server.host` must be a loopback address) and the
+compatibility surface has no authentication of its own, so another machine
+reaches it through the rendered `sms-gateway.service`:
+
+* it listens on `gateway_host` (an address this machine holds) and
+  `gateway_port`, authenticated by the shared token in `gateway_token_file`
+  (root-owned, mode `0440`; an empty or unreadable file stops the gateway);
+* it forwards only `/v1/*` and answers everything else 404, so `/api/*` and
+  `/internal/*` never leave the machine, and it never passes the caller's
+  `Authorization` header upstream;
+* it streams responses chunk by chunk, so SSE arrives while it is produced;
+* it is the unit that runs `deploy/open-firewall.sh` — the rule is added
+  idempotently (a restart never stacks duplicates) and only for the networks
+  named in `allow_cidr` (comma-separated internal links are allowed; `0.0.0.0/0`
+  needs `allow_public=True` on purpose).
+
+Review before installing: `iptables -S INPUT | grep -- '--dport <gateway_port>'`
+and `systemctl status sms-gateway`. To undo the rule by hand:
+`deploy/open-firewall.sh --cidr <cidr> --port <port> --remove`. The token is a
+shared secret for a trusted network, not an internet-facing credential: put mTLS
+or a hardened proxy in front before the service leaves the site.
 
 Switch order (enforced by `switch_release`): close admission → drain (queue,
 leases, sessions all zero) → **prove the old instances stopped** → preflight the
