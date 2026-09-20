@@ -29,6 +29,28 @@ def test_storage_requires_the_expected_uuid_and_regular_model_file(tmp_path: Pat
     assert snapshot.files["embedding"].size == 5
 
 
+def test_the_mount_lookup_asks_findmnt_for_the_uuid_column(tmp_path: Path) -> None:
+    """`findmnt --json` leaves the UUID out unless it is asked for by name."""
+    mount = tmp_path / "ssd"
+    models = mount / "models"
+    models.mkdir(parents=True)
+    (models / "embedding.gguf").write_bytes(b"model")
+    seen: list[list[str]] = []
+
+    def runner(argv: list[str]) -> str:
+        seen.append(list(argv))
+        return json.dumps({"filesystems": [{"target": str(mount), "source": "/dev/sda1",
+                                            "fstype": "ext4", "options": "rw"}]})
+
+    monitor = StorageMonitor(mount, models, "expected", "ext4", runner=runner)
+
+    snapshot = monitor.check({"embedding": "embedding.gguf"})
+
+    assert any("UUID" in argument for call in seen for argument in call)
+    assert snapshot.ready is False
+    assert snapshot.reason == "mount_identity_mismatch"
+
+
 def test_storage_rejects_wrong_uuid_or_symlink(tmp_path: Path) -> None:
     mount = tmp_path / "ssd"
     models = mount / "models"

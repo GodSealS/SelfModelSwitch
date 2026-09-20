@@ -24,6 +24,9 @@ from typing import Any, Callable, Mapping
 READ_CHUNK_BYTES = 1024 * 1024
 # Default from `storage.verify_timeout_seconds`; the whole set shares one budget.
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 900
+# `findmnt --json` prints target/source/fstype/options by default and leaves the
+# UUID out, so the identity check has to ask for it explicitly.
+FINDMNT_COLUMNS = "TARGET,SOURCE,FSTYPE,UUID"
 
 
 class AssetState(str, enum.Enum):
@@ -230,7 +233,11 @@ class AssetStore:
     # facts
 
     def _check_mount(self) -> None:
-        data = json.loads(self._runner(["findmnt", "--json", "--target", self.mount_path]))
+        # `findmnt --json` does not print the UUID unless it is asked for by name
+        # (util-linux 2.37 prints target/source/fstype/options only), and an
+        # identity that is absent must never be treated as the expected one.
+        data = json.loads(self._runner(["findmnt", "--json", "--output", FINDMNT_COLUMNS,
+                                        "--target", self.mount_path]))
         entries = data.get("filesystems")
         if not isinstance(entries, list) or len(entries) != 1:
             raise AssetFault("mount_not_found")
