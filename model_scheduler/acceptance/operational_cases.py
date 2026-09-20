@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .workload import ArrivalPlan, WorkloadDriver, build_arrival_plan, evaluate_workload, run_workload, validate_arrival_plan
 
@@ -147,8 +147,14 @@ def _finish(case_id: str, *, problems: list[str], failures: list[str], facts: Ma
 
 
 def run_o01(*, plan: ArrivalPlan, driver: WorkloadDriver, policy: Mapping[str, Any] | None,
-            final_state: Mapping[str, Any], clock=None, wait=None, collector=None) -> CaseResult:
-    """The mixed-load run; without operational thresholds the case is `not_run`."""
+            final_state: Mapping[str, Any], clock=None, wait=None, collector=None,
+            quiesce: Callable[[], Mapping[str, Any]] | None = None) -> CaseResult:
+    """The mixed-load run; without operational thresholds the case is `not_run`.
+
+    `quiesce` is how the run proves its own ending: the swap proxy keeps an
+    upstream alive until it is told otherwise, so the zero-tolerance end state
+    is read *after* the release is requested, never assumed.
+    """
     problems = validate_arrival_plan(plan)
     if policy is None:
         return CaseResult(case_id="O01", status="not_run", facts={"plan": plan.document()},
@@ -157,9 +163,18 @@ def run_o01(*, plan: ArrivalPlan, driver: WorkloadDriver, policy: Mapping[str, A
     if problems:
         return CaseResult(case_id="O01", status="failed", facts={"plan": plan.document()}, problems=tuple(problems))
     sent = run_workload(plan, driver, clock=clock, wait=wait, collector=collector)
+    failures: list[str] = []
+    stop_evidence: Mapping[str, Any] = {}
+    if quiesce is not None:
+        try:
+            stop_evidence = dict(quiesce() or {})
+        except Exception as exc:  # noqa: BLE001 - a failed release is material, not an assumed stop
+            failures.append(f"quiesce: {type(exc).__name__}: {exc}")
     metrics = evaluate_workload(sent, final_state=final_state, policy=policy)
-    return _finish("O01", problems=list(metrics["problems"]),
-                   failures=[], facts={"plan": plan.document(), "metrics": metrics})
+    facts: dict[str, Any] = {"plan": plan.document(), "metrics": metrics}
+    if quiesce is not None:
+        facts["stop"] = stop_evidence
+    return _finish("O01", problems=list(metrics["problems"]), failures=failures, facts=facts)
 
 
 def build_o01_plan(*, models: Sequence[str], duration_seconds: float, requests: int) -> ArrivalPlan:

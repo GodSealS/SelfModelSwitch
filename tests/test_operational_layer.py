@@ -148,6 +148,27 @@ def test_a_policy_that_cannot_build_a_plan_fails_with_its_reason(tmp_path) -> No
     assert any("gap" in problem for problem in by_case["O01"].problems)
 
 
+def test_an_o_layer_run_leaves_a_report_the_contract_can_re_read(tmp_path) -> None:
+    """Every case, including O01, must reach the report: a run without a report was never produced."""
+    candidate_path, candidate = _candidate(tmp_path)
+    candidate = _candidate_with_arrivals(candidate, 120)
+    clock = _Clock()
+
+    summary = rn.run_layers(candidate_path=candidate_path, layers=("O",), output=tmp_path / "out",
+                            operational_driver=_HealthyDriver(), final_state_probe=_CleanProbe(),
+                            clock=clock, wait=clock.advance)
+
+    report_path = tmp_path / "out" / "report.json"
+    assert report_path.is_file()
+    document = json.loads(report_path.read_text(encoding="utf-8"))
+    attempts = {(attempt["case_id"], attempt["attempt"]) for attempt in document["case_attempt_refs"]}
+    assert attempts == {("O01", 1), ("O02", 1), ("O03", 1), ("O04", 1), ("O05", 1), ("O06", 1)}
+    for attempt in document["case_attempt_refs"]:
+        assert attempt["started_at"] and attempt["ended_at"]
+    assert {final["case_id"] for final in document["final_attempts"]} == {case for case, _attempt in attempts}
+    assert summary["cases"] == 6 and summary["attempts"] == 6 and summary["artifacts"] > 0
+
+
 def test_o05_primitive_accepts_the_registration_and_refuses_every_tamper(tmp_path) -> None:
     candidate_path, candidate = _candidate(tmp_path)
     document = json.loads(candidate_path.read_text(encoding="utf-8"))

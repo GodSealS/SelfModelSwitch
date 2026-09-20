@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import atexit
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -32,6 +32,7 @@ import math
 import os
 import shutil
 import tempfile
+import time
 from itertools import count
 from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
@@ -181,7 +182,8 @@ def run_layers(*, candidate_path: Path, layers: Sequence[str], output: Path, fix
                config_path: Path | None = None, inference_url: str | None = None,
                service_log: Path | None = None, ports: Mapping[str, Any] | None = None,
                operational_driver: Any = None, final_state_probe: Any = None,
-               deployment_boot_id: str | None = None) -> dict:
+               deployment_boot_id: str | None = None, clock: Callable[[], float] | None = None,
+               wait: Callable[[float], None] | None = None) -> dict:
     """Execute the requested layers against one frozen candidate and persist the run."""
     requested = _requested_layers(layers)
     candidate = _load_candidate(candidate_path)
@@ -206,7 +208,7 @@ def run_layers(*, candidate_path: Path, layers: Sequence[str], output: Path, fix
             candidate=candidate, candidate_path=Path(candidate_path), store=store, output=Path(output),
             config_path=config_path, inference_url=inference_url, service_log=service_log, ports=ports,
             workload_driver=operational_driver, final_state_probe=final_state_probe,
-            deployment_boot_id=deployment_boot_id)
+            deployment_boot_id=deployment_boot_id, clock=clock, wait=wait)
         records.extend((item, operations_boot) for item in o_attempts)
     if not records:
         raise LayerError("no layer produced any case attempt", exit_code=EXIT_FAILED)
@@ -352,6 +354,7 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
 
     # -- O01: the mixed workload and the end state it must end on ----------
     store.begin_case("O01", attempt=1)
+    o01_started = _utc_now()
     result = None
     plan = None
     if policy is None:
@@ -382,7 +385,8 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
         else:
             probe.baseline()
             result = oc.run_o01(plan=plan, driver=workload, policy=policy,
-                                final_state=probe.mapping(), collector=store, clock=clock, wait=wait)
+                                final_state=probe.mapping(), collector=store, clock=clock, wait=wait,
+                                quiesce=_quiesce_of(probe, candidate, inference_url, wait=wait))
     document = dict(result.facts)
     if policy is not None:
         document["policy"] = dict(policy)
@@ -391,7 +395,9 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
         document["final_state"] = dict(metrics["final_state"])
     store.end_case(status=result.status, facts=document, problems=result.problems,
                    failure="; ".join(result.failures) or None)
-    results.append(result)
+    results.append(_OperationalAttempt(case_id=result.case_id, status=result.status,
+                                       started_utc=o01_started, ended_utc=_utc_now(),
+                                       problems=tuple(result.problems), failures=tuple(result.failures)))
 
     # -- O02 — O06: the fault, recovery, preflight and release ports -------
     disk = wired.get("disk") or _namespace_disk_port(config_path)
@@ -432,10 +438,45 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
 
 def _record_o(store: CaseMaterialStore, result: Any) -> Any:
     """O02—O06 material: the collected facts under `observations`, as the evaluator reads them."""
+    started = _utc_now()
     store.begin_case(result.case_id, attempt=1)
     store.end_case(status=result.status, facts={"observations": dict(result.facts)},
                    problems=result.problems, failure="; ".join(result.failures) or None)
-    return result
+    return _OperationalAttempt(case_id=result.case_id, status=result.status, started_utc=started,
+                               ended_utc=_utc_now(), problems=tuple(result.problems),
+                               failures=tuple(result.failures))
+
+
+@dataclass(frozen=True)
+class _OperationalAttempt:
+    """One O case as the report reads it; `CaseResult` carries no attempt identity."""
+
+    case_id: str
+    status: str
+    started_utc: str
+    ended_utc: str
+    attempt: int = 1
+    problems: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _quiesce_of(probe: Any, candidate: Any, inference_url: str | None, *, wait: Any) -> Any:
+    """Release what the workload loaded, so the run can end with nothing running.
+
+    `None` when there is no compat surface to ask, in which case O01 still reads
+    whatever end state exists and the zero-tolerance check judges it as read.
+    """
+    if not inference_url:
+        return None
+    from .operational_ports import DeploymentQuiescer
+
+    return DeploymentQuiescer(base_url=inference_url, probe=probe,
+                              models=tuple(model.model_id for model in candidate.models),
+                              wait=wait if wait is not None else time.sleep)
 
 
 def _operational_policy(candidate: Any) -> Mapping[str, Any] | None:

@@ -8,6 +8,8 @@ before loading, and a rollback that refuses a release with no accepted evidence.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from model_scheduler.acceptance import operational_cases as oc
@@ -151,11 +153,12 @@ class FakeLab:
         return dict(self.applied) if has_accepted_evidence else dict(self.refused)
 
 
-def _o01(driver=None, policy=POLICY, final_state=None):
+def _o01(driver=None, policy=POLICY, final_state=None, quiesce=None):
     clock = FakeClock()
     plan = wl.build_arrival_plan(models=("embedding", "qwen-small"), duration_seconds=1800.0, requests=120)
     return oc.run_o01(plan=plan, driver=driver or HealthyDriver(), policy=policy,
-                      final_state=final_state or CLEAN_STATE, clock=clock, wait=clock.advance)
+                      final_state=final_state or CLEAN_STATE, clock=clock, wait=clock.advance,
+                      quiesce=quiesce)
 
 
 def test_o01_passes_a_clean_1800_second_run() -> None:
@@ -182,6 +185,61 @@ def test_o01_fails_when_a_ratio_breaches_the_cap() -> None:
 
     assert result.status == "failed"
     assert any("queue_full_rate" in problem for problem in result.problems)
+
+
+def test_o01_asks_for_the_release_before_it_reads_the_end_state() -> None:
+    """The proxy keeps an upstream alive, so a stopped end has to be requested."""
+    running = {**CLEAN_STATE, "residual": 1, "instances_running": 1}
+    states = [running, dict(running), dict(CLEAN_STATE)]  # it settles only after the release
+    reads = {"n": 0}
+
+    def quiesce() -> dict:
+        return {"released": ["qwen-small"], "refused": [], "waited_seconds": 4.0, "stopped": True,
+                "final_state": states[-1]}
+
+    class Settling(Mapping):
+        def __getitem__(self, key):
+            reads["n"] += 1
+            return states[min(reads["n"] - 1, len(states) - 1)][key]
+
+        def __iter__(self):
+            return iter(states[-1])
+
+        def __len__(self):
+            return len(states[-1])
+
+    clock = FakeClock()
+    plan = wl.build_arrival_plan(models=("embedding", "qwen-small"), duration_seconds=1800.0, requests=120)
+    result = oc.run_o01(plan=plan, driver=HealthyDriver(), policy=POLICY, final_state=Settling(),
+                        clock=clock, wait=clock.advance, quiesce=quiesce)
+
+    assert result.status == "passed", result.problems
+    assert result.facts["stop"]["released"] == ["qwen-small"]
+    assert result.facts["metrics"]["final_state"]["instances_running"] == 0
+
+
+def test_o01_fails_when_the_release_never_stops_the_instance() -> None:
+    clock = FakeClock()
+    plan = wl.build_arrival_plan(models=("embedding", "qwen-small"), duration_seconds=1800.0, requests=120)
+    busy = {**CLEAN_STATE, "residual": 1, "instances_running": 1}
+
+    result = _o01(final_state=busy, quiesce=lambda: {"released": [], "refused": ["qwen-small"],
+                                                    "waited_seconds": 300.0, "stopped": False,
+                                                    "final_state": busy})
+
+    assert result.status == "failed"
+    assert any("instances_running" in problem for problem in result.problems)
+    assert result.facts["stop"]["refused"] == ["qwen-small"]
+
+
+def test_a_crashed_release_is_a_failure_not_an_assumed_stop() -> None:
+    def broken() -> dict:
+        raise RuntimeError("the control socket is gone")
+
+    result = _o01(quiesce=broken)
+
+    assert result.status == "failed"
+    assert any("quiesce" in failure for failure in result.failures)
 
 
 def test_o02_keeps_the_fault_inside_the_deployment() -> None:

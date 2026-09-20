@@ -157,6 +157,53 @@ class _LazyMapping(Mapping):
         return len(self._resolve())
 
 
+def _all_stopped(state: Mapping[str, Any]) -> bool:
+    return state.get("instances_running") == 0 and state.get("residual") == 0
+
+
+@dataclass
+class DeploymentQuiescer:
+    """The run's own stop evidence: ask the deployment to release what it served.
+
+    The swap proxy keeps an upstream alive until it is told otherwise (the lab's
+    `ttl` is 0), so a run can only *end* with every instance stopped if it asks
+    for the release and then proves it stopped. Whatever the probe reads at the
+    deadline is what the case records: no silent retry and no assumed zero.
+    """
+
+    base_url: str
+    probe: Any
+    models: Sequence[str] = ()
+    timeout_seconds: float = 300.0
+    poll_seconds: float = 2.0
+    post: Callable[..., Any] = field(default=httpx.post)
+    clock: Callable[[], float] = field(default=time.monotonic)
+    wait: Callable[[float], None] = field(default=time.sleep)
+
+    def __call__(self) -> Mapping[str, Any]:
+        started = self.clock()
+        released: list[str] = []
+        refused: list[str] = []
+        for model_id in self.models:
+            try:
+                response = self.post(self.base_url.rstrip("/") + f"/api/models/{model_id}/unload",
+                                     timeout=self.timeout_seconds)
+                refused.append(model_id) if getattr(response, "status_code", 0) != 200 else released.append(model_id)
+            except Exception as exc:  # noqa: BLE001 - a refused release is material, not a crash
+                refused.append(f"{model_id}: {type(exc).__name__}: {exc}")
+        deadline = started + self.timeout_seconds
+        while True:
+            try:
+                state = dict(self.probe.read())
+            except Exception as exc:  # noqa: BLE001 - an unreadable end state must not look stopped
+                state = {"error": f"{type(exc).__name__}: {exc}"}
+            if _all_stopped(state) or self.clock() >= deadline:
+                break
+            self.wait(self.poll_seconds)
+        return {"released": released, "refused": refused, "waited_seconds": round(self.clock() - started, 3),
+                "stopped": _all_stopped(state), "final_state": state}
+
+
 def _get_json(base_url: str, path: str, *, timeout: float) -> dict:
     try:
         response = httpx.get(base_url.rstrip("/") + path, timeout=timeout)
