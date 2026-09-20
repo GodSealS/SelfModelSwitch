@@ -1565,6 +1565,16 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 
 **本轮未做**：O02（私有 mount namespace 探针）、O03（docker socket 故障）、O04（重启/残留/旧 token/再准入）、O06（release 演练与 blob 元数据备份恢复）的真实端口；报告落盘被打断（运行中改目录名是操作失误；材料完整但无 `report.json`，`run-o1`/`run-o1-all-503` 两个目录都保留）。
 
+**第二轮执行记录（2026-09-20，O02 端口 + 两个产品缺陷）:** status=blocked（O02 端口已交付且真机跑通；按 lab 当前配置仍只能 `not_run`，O01 的修复待 lab 重启复验）；提交 `92347a2`（O02 私有 mount namespace 端口 + 9 项测试）、`04cf9cf`（findmnt UUID 列）、`b575225`（故障基线）、`6f36265`（冷启动预热）；python=3.13.5（开发机）/3.12.14（目标 lab venv）；目标 `b5752258…` 树前后为空。
+
+- `acceptance/o02_probe.py` + `operational_ports.NamespaceDiskFaultPort`：`unshare --user --map-root-user --mount --propagation private` 起一个子进程，逐行接收动作；模型盘用 **bind 遮蔽**（从不卸载整机共享盘），暂存故障跑在专用 tmpfs 配额上（从不填满根盘），每次写入都用 `findmnt` 复核落在 tmpfs；故障与恢复的判定全部来自产品自己的 `StorageMonitor`（完整重 hash）。命名空间建不起来 → 该步骤 `available=false` → case `not_run`。
+- **产品缺陷（已修）**：`AssetStore._check_mount` 的 `findmnt --json` 默认不带 UUID 列（util-linux 2.37.2），`entry["uuid"]` 恒为 `None` → 真实机永远 `mount_identity_mismatch`，存储身份永远无法证明。改为显式 `--output TARGET,SOURCE,FSTYPE,UUID` 并补回归测试。
+- **归因要求（已修）**：`isolate` 先做一次完整 hash 作为基线，基线不成立即 `not_run`——不允许把"配置本来就校验失败"当成"磁盘故障"。
+- 真机 O02 探针（`/home/jtzn/self-model-switch-evidence/p30-o02-20260920T071325Z/`）：`private_mount_namespace=true`、`unmounted_shared_disk=false`、`baseline_ready=true`（真 hash）、故障 `model_disk_unavailable=true`、`root_disk_writes=0`、专用配额写满、恢复 `recovered=true`+`rehashed=true`、宿主侧挂载与文件未受影响、11 s。
+- **现场配置缺陷（站点待修，不是产品问题）**：lab 在用的 `scheduler-v2-candidate.yaml` 把 `storage.mount_path` 写成 `/media/jtzn/sandisk-ext4/models`（不是挂载点），且登记了盘上不存在的 `embedding` 资产；因此按现有配置 O02 只能 `not_run`。
+- **O01 冷启动死锁（已修，待复验）**：新增 `ModelScheduler.warm(model_id, deadline)`（复用 `_preload_one`，不给用户租约，加载不是 dispatch）；chat 路由计数失败时先 warm 再计数，仍失败才 503；422 的真实超限路径完全不变。
+- **本轮未做**：lab 服务重启（破坏性现场动作，需授权）、O01/O05 重跑、O03/O04/O06 真实端口；站点配置修正。
+
 ### P31 — 发布包现场preflight与安装验收（M07）
 
 **Primary owner:** backend；**Dependencies:** P30；**Estimated scope:** M。

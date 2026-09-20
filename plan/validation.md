@@ -1575,3 +1575,53 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. **O05 口径修复后重跑**（`read_device_facts` → `collect_facts`）。
 3. **O02—O06 的真实端口**：O02 的 `unshare --user --map-root-user --mount` 探针（模型盘遮蔽 + 专用 tmpfs 配额 + 恢复重 hash）、O03 的 Docker socket 故障（`systemctl stop docker.socket`，容器不受影响）、O04 的服务重启/残留/旧 token/再准入、O06 的 release 演练与 blob 元数据备份恢复。
 4. **O01 重跑**需要：模型可服务（preload 或 ①的修复）+ 30 分钟窗口 + 输出目录全程不动。
+
+## P30 补记二（2026-09-20，O02 端口落地、挂载身份产品缺陷与冷启动修复）
+
+范围：交付 O02 的私有 mount namespace 端口并在目标机真实执行；修复挡住它的产品缺陷；
+修复阻塞 O01 的兼容面冷启动死锁（代码已提交，真机复验待 lab 重启）。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P30（第二轮；AC 仍未勾：O01 待 lab 重启复验，O03/O04/O06 端口未接线） |
+| status | **blocked**（O02 端口已交付并在真机跑通；但按实验室当前在用的配置无法注入故障，见第 4 节） |
+| source_commit | `92347a2`（O02 端口）→ `04cf9cf`（findmnt UUID）→ `b575225`（故障基线）→ `6f36265`（冷启动预热） |
+| target_commit | `b57522581acf3efbd5a39a0bdc71aeac187a265a`（fast-forward；树前后为空；`6f36265` 待同步） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p30-o02-20260920T{070402Z,071113Z,071217Z,071308Z,071325Z}/` |
+
+### 2. 本地命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_operational_namespace.py -q` | 0 | `9 passed`（端口四步、探针不可用→not_run、拒绝步骤→failed、共享盘卸载与根盘写入判失败、close 只关一次、非对象答复拒绝、探针行协议） |
+| `pytest tests -m 'not thor' -q` | 0 | `855 passed, 1 skipped, 1 deselected`（O02 端口前基线 840） |
+| `ruff check .` | 0 | 通过 |
+| `python run.py --check-config` | 0 | `schema_version=1` |
+
+### 3. 目标机命令与结果（O02 探针，`unshare --user --map-root-user --mount --propagation private`）
+
+| 轮次目录 | 结果 |
+|---|---|
+| `…070402Z` | `model_disk_unavailable=true` 但 reason=`mount_not_found`，恢复 `recovered=false`；**同一配置在宿主侧同样是 `mount_not_found`**，即故障与命名空间无关 |
+| `…071113Z` | 配置改为真实挂载点后被 schema 拒绝：`storage must use an absolute mount_path/model_directory and ext4`（`model_directory` 必须是 `mount_path` 的直接子目录） |
+| `…071217Z` | 资产前缀改到 `qwen25vl-7b-q4/` 后 `asset_unavailable`：登记的 `embedding` 模型在盘上没有资产 |
+| `…071308Z` | 只保留 `qwen-small` 后配置拒绝：`scheduler.pinned_models references unregistered model 'embedding'` |
+| `…071325Z` | **通过**：`private_mount_namespace=true`、`unmounted_shared_disk=false`、`baseline_ready=true`、`baseline_files=["qwen-small"]`（真 hash）；故障 `model_disk_unavailable=true`（`asset_path_unsafe`）、`root_disk_writes=0`；专用 tmpfs 配额写满 `scratch_full=true`；恢复 `recovered=true`、`rehashed=true`；耗时 11 s |
+| 宿主侧（每轮后） | `findmnt -no TARGET,FSTYPE,UUID` 仍为 `/media/jtzn/sandisk-ext4 ext4 16d53274-…`；模型文件仍在；无残留挂载 |
+
+### 4. 关键事实
+
+- **产品缺陷（已修，`04cf9cf`）**：`AssetStore._check_mount` 用 `findmnt --json --target …` 取挂载身份，而 util-linux 2.37.2 的 `--json` 默认只输出 target/source/fstype/options，**不含 uuid** → `entry.get("uuid")` 恒为 `None` → 真实机上永远 `mount_identity_mismatch`（存储准入 fail-closed 且永不证明身份）。修复为显式请求 `--output TARGET,SOURCE,FSTYPE,UUID`，并新增回归测试（不请求 UUID 列的答复必须被拒）。
+- **故障必须可归因（`b575225`）**：O02 早期版本只要"资产校验失败"就记 `model_disk_unavailable=true`，而配置错误同样会让校验失败 → 故障无法归因。现在 `isolate` 先做一次完整 hash 作为基线，基线不成立即 `available=false`（case `not_run`），不允许用配置故障冒充磁盘故障。
+- **现场配置缺陷（非产品问题，需站点修复）**：lab 在用的 `scheduler-v2-candidate.yaml` ①`storage.mount_path=/media/jtzn/sandisk-ext4/models` 不是挂载点（真实挂载点是 `/media/jtzn/sandisk-ext4`），产品按登记口径正确报 `mount_not_found`；②登记的 `embedding` 模型在模型盘上没有资产文件。因此**按现有 lab 配置 O02 只能 `not_run`**，探针本身已能跑通（第 3 节 `…071325Z`）。
+- **冷启动死锁已修（`6f36265`，待真机复验）**：`scheduler.warm(model_id, deadline)` 复用 `_preload_one` 把单个模型带到 READY 且不授予用户租约（加载不是 dispatch）；chat 路由在计数失败时先 warm 再计数，仍失败才 503。422 的真实超限拒绝路径不变（不 warm、不 dispatch）。
+
+### 5. 未执行 / 未解决
+
+1. **lab 服务重启**：`6f36265` 与 `04cf9cf` 都要重启目标 lab 部署（`run.py --config …`）才会生效；重启属破坏性现场动作，待授权后执行，随后重跑 O01（120 请求/1800 s）与 O05。
+2. **站点配置修复**：`mount_path` 改为真实挂载点、`model_directory` 改为其直接子目录、资产路径带上模型子目录、去掉盘上不存在的 `embedding` 登记（或补齐其资产）。
+3. **O03/O04/O06 端口**：Docker socket 故障、服务重启/残留/旧 token/再准入、release 演练与 blob 元数据备份恢复。
+4. **O01 重跑**需要：可服务的兼容面（第 1 项）+ 30 分钟窗口 + 输出目录全程不动。
