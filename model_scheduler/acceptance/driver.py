@@ -311,6 +311,9 @@ class ControlApiCaseDriver:
         The API owns the identifiers: `POST /internal/sessions` returns
         `session_id`, `boot_id` and `owner_token`; the driver never invents them.
         """
+        return self._sampled(model_id, lambda: self._load(model_id, cold=cold))
+
+    def _load(self, model_id: str, *, cold: bool) -> Mapping[str, Any]:
         if model_id in self._sessions:
             # The matrix needs independent cold starts, one after another: the open
             # session is closed (its model is unloaded) so the next start really
@@ -373,6 +376,25 @@ class ControlApiCaseDriver:
         session = self._session_for(model_id)
         if time.monotonic() - session.last_heartbeat >= self.heartbeat_interval_seconds:
             self.heartbeat(model_id)
+
+    def _sampled(self, model_id: str, action: Callable[[], Mapping[str, Any]]) -> Mapping[str, Any]:
+        """Run one case action under a device-sampling window.
+
+        Every case must leave raw rows behind: the evaluator refuses to attribute
+        a case without its own `samples/`, so a load, stop or cancel round is
+        sampled exactly like an execution is. The instance identity is read
+        read-only and only used to attach the container's process maps.
+        """
+        sampler = None if self.sampler_factory is None else self.sampler_factory()
+        if sampler is not None:
+            sampler.start(instance=self._observed_instance(model_id))
+        try:
+            result = dict(action() or {})
+        finally:
+            rows = () if sampler is None else tuple(sampler.stop())
+        if rows:
+            result["samples"] = rows
+        return result
 
     def start(self, model_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         """Create an execution without waiting for it (the cancel case needs one)."""
@@ -470,6 +492,9 @@ class ControlApiCaseDriver:
 
     def cancel(self, model_id: str, execution_id: str) -> Mapping[str, Any]:
         """Cancel one execution and report it cancelled only when it ended cancelled."""
+        return self._sampled(model_id, lambda: self._cancel(model_id, execution_id))
+
+    def _cancel(self, model_id: str, execution_id: str) -> Mapping[str, Any]:
         session = self._session_for(model_id)
         document = self._require(self.transport.request(
             "POST", f"/internal/executions/{execution_id}/cancel", {"session_token": session.token}),
@@ -493,6 +518,9 @@ class ControlApiCaseDriver:
         Nothing open means nothing to stop: the matrix runs a stop case and then
         reloads, so a missing session is a no-op, not a failure.
         """
+        return self._sampled(model_id, lambda: self._stop(model_id))
+
+    def _stop(self, model_id: str) -> Mapping[str, Any]:
         session = self._sessions.get(model_id)
         if session is None:
             # Nothing is open because the previous stop was proven: keep that proof,

@@ -26,8 +26,8 @@ import math
 from typing import Any, Mapping, Protocol, Sequence
 
 from ..evidence_contracts import BACKEND_CASE_MIN_COLD_STARTS, BACKEND_CASE_MIN_RELOAD_ROUNDS
-from .collector import FileCollector
 from .fixtures import FillerSpec, Fixture, FixtureError, boundary_shortfalls, fixtures_for
+from .materials import CaseMaterialSink
 
 CASE_KINDS = ("load", "infer", "envelope", "cancel", "stop", "reload")
 STATUSES = ("passed", "failed", "unknown", "not_run")
@@ -181,7 +181,7 @@ def attribution_problems(kind: str, facts: Mapping[str, Any]) -> list[str]:
 class CaseExecutor:
     """Drive the B case matrix for the registered models, recording every attempt."""
 
-    def __init__(self, driver: CaseDriver, *, clock=None, collector: FileCollector | None = None,
+    def __init__(self, driver: CaseDriver, *, clock=None, collector: CaseMaterialSink | None = None,
                  cold_starts: int = BACKEND_CASE_MIN_COLD_STARTS,
                  reload_rounds: int = BACKEND_CASE_MIN_RELOAD_ROUNDS,
                  filler_of: Mapping[str, FillerSpec] | None = None) -> None:
@@ -249,8 +249,11 @@ class CaseExecutor:
         if stopped.get("stop_proven") is not True:
             raise BackendCaseError("a reload needs the previous instance proven stopped")
         loaded = self.driver.load(model_id, cold=True)
+        # Both halves of the round sampled their own window: the case keeps both.
+        samples = (*stopped.get("samples", ()), *loaded.get("samples", ()))
         return {"provider": loaded.get("provider", stopped.get("provider")), "reloaded": True,
-                "stop_proven": True, "instance": loaded.get("instance")}
+                "stop_proven": True, "instance": loaded.get("instance"),
+                **({"samples": samples} if samples else {})}
 
     # -- recording ---------------------------------------------------------
 
@@ -284,6 +287,11 @@ class CaseExecutor:
         try:
             result = dict(action() or {})
             facts = _without_samples(result)
+            if fixture is not None:
+                # The declared boundary belongs to the material: the evaluator
+                # re-checks the round against it, so it cannot stay in memory only.
+                facts["fixture"] = {"capability": fixture.capability, "fixture_id": fixture.fixture_id,
+                                    "boundary": dict(fixture.boundary)}
             self._record_samples(result.get("samples"))
             if result.get("error"):
                 failure = str(result["error"])

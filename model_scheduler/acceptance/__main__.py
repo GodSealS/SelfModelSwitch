@@ -107,12 +107,12 @@ def _source(args) -> int:
 
 
 def _run(args) -> int:
-    """`run --layers` validates its inputs and refuses until the orchestration exists.
+    """`run --layers` executes the delivered layers; an undelivered one refuses first.
 
-    The B executor (P23) and the O executor (P24) are logic with injected drivers;
-    the real layer run needs the deployment's official API driver and the P29
-    environment. Refusing here is honest: no partial run is written and no layer
-    can be claimed as executed.
+    S runs in-process (no socket, no model); B needs the deployment's control
+    socket and never starts a deployment itself. A layer without an
+    orchestration is refused before anything is executed, so no partial run can
+    be mistaken for one that covered every requested layer.
     """
     layers = [layer.strip() for layer in args.layers.split(",") if layer.strip()]
     if not layers or any(layer not in ACCEPTANCE_LAYERS for layer in layers):
@@ -120,17 +120,17 @@ def _run(args) -> int:
     if len(set(layers)) != len(layers):
         raise InputError(f"--layers repeats a layer: {args.layers!r}")
     require_fresh_output(args.output / "report.json")
-    unsupported = sorted(layer for layer in layers if layer != "B")
-    if unsupported:
+    if "O" in layers:
         # No partial run is written: an unexecuted layer must not be claimed.
-        print(f"run: layer(s) {unsupported} have no orchestration yet (the S software cases and the O "
-              "operational cases are not delivered): refusing before anything is executed", file=sys.stderr)
+        print("run: layer(s) ['O'] have no orchestration yet (the O operational cases are not delivered): "
+              "refusing before anything is executed", file=sys.stderr)
         return EXIT_FAILED
-    from .runner import LayerError, run_b_layer
+    from .runner import LayerError, run_layers
 
     try:
-        summary = run_b_layer(candidate_path=args.candidate, output=args.output,
-                              fixtures_root=args.fixtures_root)
+        summary = run_layers(candidate_path=args.candidate, layers=layers, output=args.output,
+                             fixtures_root=args.fixtures_root, inventory=args.inventory,
+                             legacy_config=args.legacy_config)
     except LayerError as exc:
         print(f"run: {exc}", file=sys.stderr)
         return exc.exit_code
@@ -209,9 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--candidate", type=Path, required=True)
     run_parser.add_argument("--layers", required=True, help="comma-separated subset of S,B,O")
     run_parser.add_argument("--output", type=Path, required=True)
-    run_parser.add_argument("--fixtures-root", type=Path, required=True,
+    run_parser.add_argument("--fixtures-root", type=Path,
                             help="the directory of the fixture material the candidate names (with the measured "
                                  "tokens-per-unit ratio); cases are never built from the package's own fixtures")
+    run_parser.add_argument("--inventory", type=Path,
+                            help="S01: the explicit migration inventory; the runtime/adapter/lock hashes are build "
+                                 "facts the candidate does not carry, and they are never guessed")
+    run_parser.add_argument("--legacy-config", type=Path,
+                            help="S01: the schema-v1 configuration the migration is exercised against")
 
     candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
     candidate_parser.add_argument("--config", type=Path, required=True)

@@ -1,30 +1,37 @@
-"""The real layer run: drive the registered cases through the official control API.
+"""The real layer run: drive the registered cases and persist the v3 report.
 
-The B layer is executed by `backend_cases.CaseExecutor` (P23), which only ever
-touches the deployment through `CaseDriver`. This module supplies the real driver
-(`driver.ControlApiCaseDriver` over the control socket) and turns the recorded
-attempts into the v3 report the merge/verify steps re-check.
+Two layers run here, in one run directory and one report:
 
-Two rules shape it:
+* **S** — the software checks (`software_cases`), in-process, no socket and no
+  model: fake ports drive the real scheduler/Book, the real session/queue/
+  idempotency objects, a real BlobStore over scratch directories and the real
+  parsers/preflight;
+* **B** — `backend_cases.CaseExecutor` (P23), which only ever touches the
+  deployment through `CaseDriver`. The real driver (`driver.ControlApiCaseDriver`)
+  talks to the control socket.
 
-* **A run never starts a deployment.** Without a live control socket there is no
-  run at all — and no partial output is written, so nothing can be mistaken for
-  executed evidence.
-* **Unknown is never a pass.** Every attempt is kept, and the report's verdict is
+Three rules shape it:
+
+* **A run never starts a deployment.** The B layer without a live control socket
+  fails before anything is executed, and no partial output is written.
+* **Material is written once, in the shape recomputation reads** (`materials`):
+  one directory per attempt with `case.json` and `samples/`, which is exactly
+  what `evaluator` and `verify.merge_runs` re-read.
+* **Unknown is never a pass.** Every attempt is kept and the report's verdict is
   a pass only when every case's final attempt passed.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
 import atexit
 import hashlib
+import json
 import math
 import os
 import shutil
 import tempfile
 from itertools import count
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from ..evidence_contracts import (
@@ -39,16 +46,18 @@ from ..evidence_contracts import (
     parse_acceptance_report,
     parse_candidate,
 )
-from .collector import FileCollector, collector_sha256
+from .collector import collector_sha256
 from .device_activity import ManagedComputeSampler
-from .instances import ManagedInstanceProbe
 from .fixtures import FillerSpec
+from .instances import ManagedInstanceProbe
+from .materials import CaseMaterialStore
 
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
 FIXTURE_MATERIAL_NAME = "fillers.json"
 FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
 FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens",
                                "vision_template_overhead_tokens", "instruction", "instruction_tokens", "unit"})
+LAYERS = ("S", "B")
 EXIT_INPUT = 2
 EXIT_FAILED = 3
 
@@ -157,83 +166,45 @@ def compute_sampler_factory(scratch: Path) -> Callable[[], ManagedComputeSampler
     return factory
 
 
-def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None = None,
-                transport: Any = None, executor: Any = None, run_id: str | None = None,
-                sampler_factory: Callable[[], Any] | None = None,
-                instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
-                collector_factory: Callable[..., FileCollector] = FileCollector,
-                fixtures_root: Path | None = None, filler_of: Mapping[str, Any] | None = None,
-                clock: Callable[[], float] | None = None) -> dict:
-    """Execute the B matrix of every registered model and persist its v3 report."""
-    from .backend_cases import CaseExecutor
-    from .driver import ControlApiCaseDriver, UnixControlTransport
-
-    socket = socket_path or os.environ.get(CONTROL_SOCKET_ENV)
-    if not isinstance(socket, str) or not socket:
-        raise LayerError(f"the control socket is required: set {CONTROL_SOCKET_ENV} (a run never starts "
-                         "a deployment)", exit_code=EXIT_INPUT)
-    if not Path(socket).exists():
-        raise LayerError(f"the control socket {socket} is not present: the deployment must be running",
-                         exit_code=EXIT_INPUT)
-
-    candidate_document = _read_json(candidate_path)
-    try:
-        candidate = parse_candidate(candidate_document)
-    except ContractError as exc:
-        raise LayerError(f"{candidate_path}: {exc}", exit_code=EXIT_INPUT) from exc
-    digest = candidate_digest(candidate)
-    device = device_digest(candidate.device)
-
-    link = transport if transport is not None else UnixControlTransport(socket)
-    if sampler_factory is None:
-        scratch = Path(tempfile.mkdtemp(prefix="sms-acceptance-device-"))
-    else:
-        scratch = None
-    factory = sampler_factory if sampler_factory is not None else compute_sampler_factory(scratch)
-    probe = instance_probe if instance_probe is not None else ManagedInstanceProbe(candidate.deployment_id).of
-    driver = ControlApiCaseDriver(link, sampler_factory=factory, provider_identity=candidate.deployment_id,
-                                  instance_probe=probe)
-    if scratch is not None:
-        atexit.register(shutil.rmtree, scratch, True)  # a device window is scratch, never evidence
-    try:
-        boot_id = driver.boot_id()
-    except Exception as exc:
-        raise LayerError(f"cannot read the deployment identity over {socket}: {exc}",
-                         exit_code=EXIT_FAILED) from exc
-
+def run_layers(*, candidate_path: Path, layers: Sequence[str], output: Path, fixtures_root: Path | None = None,
+               inventory: Path | None = None, legacy_config: Path | None = None,
+               socket_path: str | None = None, transport: Any = None, executor: Any = None,
+               driver: Any = None, run_id: str | None = None, sampler_factory: Callable[[], Any] | None = None,
+               instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
+               software_runner: Callable[..., Any] | None = None,
+               check_config: Callable[[Path], int] | None = None,
+               filler_of: Mapping[str, Any] | None = None) -> dict:
+    """Execute the requested layers against one frozen candidate and persist the run."""
+    requested = _requested_layers(layers)
+    candidate = _load_candidate(candidate_path)
+    digest, device = candidate_digest(candidate), device_digest(candidate.device)
     run = run_id or uuid4().hex
-    collector = collector_factory(output, run_id=run, candidate_sha256=digest, device_digest=device,
-                                  boot_id=boot_id)
-    fillers = dict(filler_of) if filler_of is not None else load_filler_specs(Path(fixtures_root), candidate) \
-        if fixtures_root is not None else None
-    if executor is None and fillers is None:
-        raise LayerError("the fixture material is required: a run may not build cases from the package's own "
-                         "fixtures", exit_code=EXIT_INPUT)
-    machine = executor if executor is not None else CaseExecutor(driver, collector=collector, filler_of=fillers)
+    store = CaseMaterialStore(output, run_id=run, candidate_sha256=digest, device_digest=device)
 
-    attempts: list[Any] = []
-    for model in candidate.models:
-        attempts.extend(machine.run_model(model_id=model.model_id,
-                                          capabilities=tuple(model.capabilities),
-                                          envelope=model.envelope))
-    manifest = collector.close()
+    records: list[tuple[Any, str]] = []
+    if "S" in requested:
+        s_attempts, software_boot = run_s_layer(
+            candidate=candidate, candidate_path=Path(candidate_path), store=store, inventory=inventory,
+            legacy_config=legacy_config, check_config=check_config, runner=software_runner)
+        records.extend((item, software_boot) for item in s_attempts)
+    if "B" in requested:
+        b_attempts, deployment_boot = run_backend_layer(
+            candidate=candidate, store=store, socket_path=socket_path, transport=transport,
+            executor=executor, driver=driver, sampler_factory=sampler_factory, instance_probe=instance_probe,
+            fixtures_root=fixtures_root, filler_of=filler_of)
+        records.extend((item, deployment_boot) for item in b_attempts)
+    if not records:
+        raise LayerError("no layer produced any case attempt", exit_code=EXIT_FAILED)
 
+    manifest = store.close()
     artifacts = tuple(ArtifactRef(relative_path=entry["relative_path"], size_bytes=entry["size_bytes"],
                                   sha256=entry["sha256"]) for entry in manifest["files"])
-    # The collector appends every case to the run's two journals, so they are this
-    # case's event material: the evaluator re-reads them and matches by case_id.
-    journals = tuple(ref for ref in artifacts if ref.relative_path in ("events.jsonl", "cases.jsonl"))
-    case_attempts = tuple(CaseAttempt(case_id=item.case_id, run_id=run, attempt=item.attempt,
-                                      candidate_sha256=digest, device_digest=device,
-                                      started_at=item.started_utc, ended_at=item.ended_utc, boot_id=boot_id,
-                                      event_refs=journals, collector_sha256=collector_sha256(),
-                                      evaluator_sha256=candidate.evaluator_sha256,
-                                      exit_code=0 if item.status == "passed" else 1)
-                          for item in attempts)
+    case_attempts = tuple(_case_attempt(item, boot_id, run, digest, device, candidate, store)
+                          for item, boot_id in records)
     finals = tuple(CaseFinal(case_id=item.case_id, run_id=run, attempt=item.attempt)
-                   for item in _finals_of(attempts))
-    started_at = min((item.started_utc for item in attempts), default="")
-    ended_at = max((item.ended_utc for item in attempts), default="")
+                   for item in _finals_of(records))
+    started_at = min(item.started_utc for item, _boot in records)
+    ended_at = max(item.ended_utc for item, _boot in records)
     report = AcceptanceReportV3(schema_version=EVIDENCE_SCHEMA_VERSION, candidate_sha256=digest,
                                 device_digest=device, run_id=run, started_at=started_at, ended_at=ended_at,
                                 attempts=case_attempts, finals=finals, artifacts=artifacts)
@@ -244,28 +215,138 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
         raise LayerError(f"the report does not satisfy the v3 contract: {exc}", exit_code=EXIT_FAILED) from exc
 
     (Path(output) / "report.json").write_text(_dump(document), encoding="utf-8")
-    passed = [item for item in attempts if item.status == "passed"]
+    passed = [item for item, _boot in records if item.status == "passed"]
     return {
         "run_id": run,
-        "boot_id": boot_id,
         "candidate_sha256": digest,
         "device_digest": device,
+        "layers": list(requested),
+        "boot_ids": sorted({boot_id for _item, boot_id in records}),
         "cases": len(finals),
-        "attempts": len(attempts),
+        "attempts": len(records),
         "passed": len(passed),
-        "failed": len(attempts) - len(passed),
+        "failed": len(records) - len(passed),
         "artifacts": len(artifacts),
         "output": str(Path(output) / "report.json"),
-        "verdict": "passed" if attempts and len(passed) == len(attempts) else "blocked",
+        "verdict": "passed" if len(passed) == len(records) else "blocked",
     }
 
 
-def _finals_of(attempts: list[Any]) -> list[Any]:
+def run_s_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStore,
+                inventory: Path | None = None, legacy_config: Path | None = None,
+                check_config: Callable[[Path], int] | None = None,
+                runner: Callable[..., Any] | None = None) -> tuple[list[Any], str]:
+    """Every S case, in-process; the material goes straight into its own directory.
+
+    The S layer needs no deployment: it runs the real objects with fake ports and
+    scratch directories. A check whose explicit input is missing fails *its own*
+    case and is never skipped into a pass.
+    """
+    from .software_cases import SOFTWARE_CASES, run_software_case
+
+    execute = runner if runner is not None else run_software_case
+    boot_id = f"software-{uuid4().hex}"
+    results: list[Any] = []
+    for case_id in SOFTWARE_CASES:
+        directory = store.begin_case(case_id, attempt=1)
+        result = execute(case_id, candidate=candidate, material_dir=directory, candidate_path=candidate_path,
+                         inventory=inventory, legacy_config=legacy_config, check_config=check_config)
+        store.end_case(status=result.status, facts=result.facts,
+                       failure="; ".join(result.problems) or None, problems=result.problems)
+        results.append(result)
+    return results, boot_id
+
+
+def run_backend_layer(*, candidate: Any, store: CaseMaterialStore, socket_path: str | None = None,
+                      transport: Any = None, executor: Any = None, driver: Any = None,
+                      sampler_factory: Callable[[], Any] | None = None,
+                      instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
+                      fixtures_root: Path | None = None,
+                      filler_of: Mapping[str, Any] | None = None) -> tuple[list[Any], str]:
+    """The B matrix of every registered model, through the official control API."""
+    from .backend_cases import CaseExecutor
+    from .driver import ControlApiCaseDriver, UnixControlTransport
+
+    if driver is None:
+        socket = socket_path or os.environ.get(CONTROL_SOCKET_ENV)
+        if not isinstance(socket, str) or not socket:
+            raise LayerError(f"the control socket is required: set {CONTROL_SOCKET_ENV} (a run never starts "
+                             "a deployment)", exit_code=EXIT_INPUT)
+        if not Path(socket).exists():
+            raise LayerError(f"the control socket {socket} is not present: the deployment must be running",
+                             exit_code=EXIT_INPUT)
+        link = transport if transport is not None else UnixControlTransport(socket)
+        scratch = None if sampler_factory is not None else Path(tempfile.mkdtemp(prefix="sms-acceptance-device-"))
+        factory = sampler_factory if sampler_factory is not None else compute_sampler_factory(scratch)
+        if scratch is not None:
+            atexit.register(shutil.rmtree, scratch, True)
+        probe = instance_probe if instance_probe is not None else ManagedInstanceProbe(candidate.deployment_id).of
+        driver = ControlApiCaseDriver(link, sampler_factory=factory, provider_identity=candidate.deployment_id,
+                                      instance_probe=probe)
+    try:
+        boot_id = driver.boot_id()
+    except Exception as exc:
+        raise LayerError(f"cannot read the deployment identity over the control socket: {exc}",
+                         exit_code=EXIT_FAILED) from exc
+
+    fillers = dict(filler_of) if filler_of is not None else (
+        load_filler_specs(Path(fixtures_root), candidate) if fixtures_root is not None else None)
+    if executor is None and fillers is None:
+        raise LayerError("the fixture material is required: a run may not build cases from the package's own "
+                         "fixtures", exit_code=EXIT_INPUT)
+    machine = executor if executor is not None else CaseExecutor(driver, collector=store, filler_of=fillers)
+    attempts: list[Any] = []
+    for model in candidate.models:
+        attempts.extend(machine.run_model(model_id=model.model_id, capabilities=tuple(model.capabilities),
+                                          envelope=model.envelope))
+    return attempts, boot_id
+
+
+def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None = None,
+                transport: Any = None, executor: Any = None, driver: Any = None, run_id: str | None = None,
+                sampler_factory: Callable[[], Any] | None = None,
+                instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
+                fixtures_root: Path | None = None, filler_of: Mapping[str, Any] | None = None) -> dict:
+    """The B layer alone (the entry point that predates the S orchestration)."""
+    return run_layers(candidate_path=candidate_path, layers=("B",), output=output, fixtures_root=fixtures_root,
+                      socket_path=socket_path, transport=transport, executor=executor, driver=driver,
+                      run_id=run_id, sampler_factory=sampler_factory, instance_probe=instance_probe,
+                      filler_of=filler_of)
+
+
+def _requested_layers(layers: Sequence[str]) -> tuple[str, ...]:
+    items = tuple(str(layer).strip().upper() for layer in layers)
+    if not items or any(layer not in LAYERS for layer in items):
+        raise LayerError(f"layers must be a comma-separated subset of {sorted(LAYERS)}, got {layers!r}",
+                         exit_code=EXIT_INPUT)
+    if len(set(items)) != len(items):
+        raise LayerError(f"layers repeats a layer: {layers!r}", exit_code=EXIT_INPUT)
+    return items
+
+
+def _case_attempt(item: Any, boot_id: str, run: str, digest: str, device: str, candidate: Any,
+                  store: CaseMaterialStore) -> CaseAttempt:
+    return CaseAttempt(case_id=item.case_id, run_id=run, attempt=item.attempt, candidate_sha256=digest,
+                       device_digest=device, started_at=item.started_utc, ended_at=item.ended_utc,
+                       boot_id=boot_id, event_refs=store.refs(item.case_id, item.attempt),
+                       collector_sha256=collector_sha256(), evaluator_sha256=candidate.evaluator_sha256,
+                       exit_code=0 if item.status == "passed" else 1)
+
+
+def _finals_of(records: Sequence[tuple[Any, str]]) -> list[Any]:
     """One final per case: the last attempt recorded for it (failures included)."""
     last: dict[str, Any] = {}
-    for item in attempts:
+    for item, _boot in records:
         last[item.case_id] = item
     return list(last.values())
+
+
+def _load_candidate(path: Path):
+    document = _read_json(path)
+    try:
+        return parse_candidate(document)
+    except ContractError as exc:
+        raise LayerError(f"{path}: {exc}", exit_code=EXIT_INPUT) from exc
 
 
 def _sha256_file(path: Path) -> str:
@@ -277,18 +358,14 @@ def _sha256_file(path: Path) -> str:
 
 
 def _read_json(path: Path) -> Mapping[str, Any]:
-    import json
-
     try:
         document = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise LayerError(f"cannot read the candidate {path}: {exc}", exit_code=EXIT_INPUT) from exc
+        raise LayerError(f"cannot read {path}: {exc}", exit_code=EXIT_INPUT) from exc
     if not isinstance(document, dict):
-        raise LayerError(f"the candidate {path} must be a JSON object", exit_code=EXIT_INPUT)
+        raise LayerError(f"{path} must be a JSON object", exit_code=EXIT_INPUT)
     return document
 
 
 def _dump(document: Mapping[str, Any]) -> str:
-    import json
-
     return json.dumps(document, indent=2, sort_keys=True) + "\n"
