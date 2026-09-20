@@ -1442,3 +1442,15 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. **O 层编排**（`O01`—`O06`）：依赖 S/B 与更长的现场负载。
 3. AC1 要求"全部登记模型/能力有 fixture 及性能阈值"——当前候选只登记 `qwen-small`（一个模型只能验 load/reload，M07 切换验收需要第二个模型，缺失即 blocked）。
 4. `acceptance verify`（P25 离线复算）尚未对 run-b20 执行；P30/P31 依赖 S/O 全集。
+
+## P29 补记（2026-09-20，离线 verify 的第一次运行）
+
+| 项 | 值 |
+|---|---|
+| 命令 | `python -m model_scheduler.acceptance verify --candidate candidate-b20.json --evidence run-b20`（目标 `0219c4d`，发布解释器 3.12.14） |
+| exit | **2**（材料不完整，符合预期） |
+| 输出 | `report: missing final attempts for: O01—O06, S01—S06` |
+
+**结论**：①`verify` **拒绝部分证据**，不会把只有 B 层的 run 当作通过——这是 P25/P28 门禁设计要求的语义；②对 B 层材料本身，`verify` 未提出任何缺失、结构错误或候选绑定问题（报告/材料/manifest 契约成立）。因此"先跑 B 再补 S/O"是可验证的路径：S/O 交付后对同一 run 的重新 verify 才会给出通过与否。
+
+下一次实现入口：`plan/08-execution-plan.md` §4 P29 的 **⑤ S 层实施说明书**（模块、每个 observation 的真实来源、CLI 路由与测试形状已固定）。
