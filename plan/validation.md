@@ -1713,3 +1713,36 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
   验证：`--check-config` 通过（`models=qwen25vl-7b`）；`/api/status` → `qwen25vl-7b: (ready, None)`；容器名与标签均为新 ID；经网关从目标机与**开发机**（LAN `192.168.1.100:8091`）调用均 **200**，返回真实答案。
 - 网关改绑 `0.0.0.0:8091`（调度器仍 `127.0.0.1:8090`），USB 直连 `192.168.55.1` 与有线 LAN `192.168.1.100` 两个地址均验证 200；来源仍由 iptables 两条规则限制在 `192.168.55.0/24`、`192.168.1.0/24`。
 - **遗留一致性**：已冻结候选 `35c4af598332faaf2293614cc52e81e7622b781df60ee4a63c8307dbf5ddd35c` 及其 S/B/O 材料仍使用 `qwen-small`；改名改变了部署身份，因此下次重建候选必须在 `qwen25vl-7b` 下重做全部证据，不得沿用旧材料的通过结论。
+
+## qwen3.6-35B 校准与 C02 静态门槛（2026-09-20，独占维护窗口）
+
+### 1. 窗口与结果
+
+维护窗口：站点关闭（scheduler / llama-swap / gateway 停止、容器清空、控制 socket 删除），另**临时关闭 swap**（C02 §5 把任何 swap 记为 anomaly）。窗口结束后已用目标机自己的 `nvzramconfig.service` 恢复 12×2.6G zram swap，并重启三层服务（7B 已复验 200）。
+
+| 轮次 | 目录 | verdict | 关键值 |
+|---|---|---|---|
+| 第一轮（swap 开） | `…/cal-qwen36/` | **blocked** | 3 轮均 `ready=true`、图像用例跑通（视觉 1037 token）、停止全部 quiescent；但 swap 使用 3.5 MiB / 1.5 MiB / 0 → **3 轮全部 unverified**；`physical_bound_proven=true`、bound 65,456,832,512 B |
+| 第二轮（swap 关） | `…/cal-qwen36-noswap/` | **passed** | `verified_runs=3/3`、`measured_peak_bytes=15,904,792,576`、`reserved_bytes=18,290,511,463`、`physical_resident_peak_bytes=65,243,426,816`、`temporary_budget_bytes=30e9 ≤ bound`、`stops_proven=true` |
+
+即：**模型本身可用**——19.7 GiB 权重在 64GB Orin 上加载、运行、跑视觉用例、优雅停止，MemAvailable 峰值只有 14.8 GiB。
+
+### 2. 但 C02 的静态物理门槛把它挡在门外（需决策）
+
+`Book.physical_admissible` 要求 `ceil(physical_resident_peak_bytes × 1.15) ≤ resources.model_budget_bytes`：
+
+| 模型 | physical bound | ×1.15 | 现预算 36e9 | 结果 |
+|---|---|---|---|---|
+| `qwen25vl-7b` | 29,675,012,096 | 34,126,263,911 | ≤ 36e9 | ✅ 通过（这正是当初把预算抬到 36e9 的原因） |
+| `qwen36-35b` | 65,243,426,816 | **75,029,940,838（69.9 GiB）** | > 36e9 | ❌ 永远不可准入 |
+
+而且 69.9 GiB **大于整机内存**（MemTotal 65,893,224,448 B = 61.4 GiB），所以**无论把预算调到多少都不可满足**。
+
+根因：该 bound 的口径是 `MemTotal − MemFree`（含 page cache）。35B 的 19.7 GiB 权重被 mmap 进 page cache，于是"物理上界"≈整机内存；模型越小这个口径越贴近真实（7B 的 29.7 GiB 里权重只占 5.4 GiB），模型一大它就退化成"文件大小 + OS"。
+
+### 3. 待决策的两条路（不得静默绕过）
+
+1. **保留规则**：本机不登记 35B；规则的本意正是"不要在逼近整机内存的模型上冒险"。
+2. **改口径**：让静态门槛用与准入一致的量（`reserved_bytes`，本轮 18,290,511,463 B）或从 bound 中剔除**可回收的 page cache**。这会同时放宽 7B 的门槛（34.1e9 → 7.0e9），属于 C02 语义变更，需同步改 `contracts_v2.physical_reserved_bytes_from_peak`、evaluator 与 plan/08 C02，并重新定义"物理上界"在验收中的含义。
+
+本轮材料已保留（两轮共 6 个 run 的 `raw/runN/{sampling/meminfo.csv, round.json, container.log}` + `measurements.json`），任一路径都可复算。
