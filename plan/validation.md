@@ -1673,3 +1673,36 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 1. **O03（Docker 通道不可达 / 陌生实例 / stop 超时）、O04（重启残留 / 旧 token / 再准入）、O06（优雅停机 / 日志 / 备份恢复 / 回滚）的真实端口**——三者通过前 P30 的 AC 不能勾，离线 verify 只能是 exit 3。
 2. **第二个真实模型**：M07 切换压力要求 ≥2 个模型；盘上只有 `qwen-small` 有可用资产（`embedding` 无资产文件）。
 3. 目标机 `origin` 仍指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`（P14/P17 遗留拓扑问题）。
+
+## P27/P30 补记（2026-09-20，让其它机器的 Agent 能用：网关 + 部署级防火墙）
+
+范围：把"兼容面被其它电脑使用"做成部署能力，并在目标机真机验证跨机器调用。
+
+### 1. 产品约束（本轮发现，决定了做法）
+
+`model_scheduler/config.py:400`（v2）与 `:509`（v1）都要求 **`server.host` 必须是 loopback**：兼容面的 TCP 监听按设计只在本机，且该面**没有鉴权**。因此"对外可用"不能靠改 `server.host`（会被配置拒绝，实测 `configuration error: server.host must be a loopback address`），只能在部署层加一个**认证网关**。
+
+### 2. 交付（提交 `b3f4b4b`、`3bc42ac`、`71f5c0f`）
+
+- `deploy/gateway.py`：标准库流式反向代理，Bearer token 认证、**只转发 `/v1/*`**（`/api/*`、`/internal/*` 一律 404，绝不暴露控制面）、拒绝含 `..`/`\` 的路径、**不把调用方 Authorization 传给上游**、按块转发（SSE 可流式）、上游不可达 502、无 token 文件拒绝启动。
+- `deploy/open-firewall.sh`：幂等 iptables 规则（`-C` 先查再 `-A`），`--cidr` 支持逗号分隔的多个内网，`0.0.0.0/0` 需显式 `--allow-any`；退出码 2=输入被拒、3=iptables 不可用。
+- `deploy/sms-gateway.service.in`：网关单元才是**打开内网端口的那一个**（`ExecStartPre=+open-firewall.sh`）；`model-scheduler.service.in` 不再打开任何端口。
+- `model_scheduler/deploy.py`：`ServiceInputs` 新增 `allow_cidr/allow_public/scheduler_port/gateway_host/gateway_port/gateway_token_file`（逐项校验；网关端口不得等于调度端口；token 必须是绝对文件路径），渲染第三个单元并把它们写入 `service-facts.json`。
+- 测试：`tests/test_deploy_gateway.py` 8 项（真上游 + 真网关：带 token 转发且不上传凭据、无 token 401 且请求根本没离开、四类控制面路径 404、上游不可达 502、token 文件缺失/空白拒绝启动、非 http 上游拒绝）＋`tests/test_deploy_firewall.py` 16 项（幂等、多网段、移除/检查、七类拒绝、渲染进单元与 facts）。
+
+### 3. 目标机真机验证（`71f5c0f`，开发机 ↔ `192.168.55.1`）
+
+| 项 | 结果 |
+|---|---|
+| 监听 | 调度器 `127.0.0.1:8090`（仍仅本机）；网关 `192.168.55.1:8091` |
+| 防火墙 | `-A INPUT -s 192.168.55.0/24 -p tcp -m tcp --dport 8091 -j ACCEPT` 与 `192.168.1.0/24` 同规则（只开 8091） |
+| 目标机本地无 token | **401** |
+| 目标机本地带 token | **200**，真实回答 |
+| **开发机经网关**（跨机器） | 无 token **401**；带 token **200**，`choices[0].message.content = "2+2 equals 4."`；`/health` 经网关 **404**（非 `/v1`，按设计） |
+| 模型状态 | 重启后 `qwen-small` 恢复可服务（此前的 `error/load_failed` 由我在 O03 探针里遗留的同名容器造成，容器已删、重启后账本清） |
+
+### 4. 同轮发现（未修，记录）
+
+- **`/health` 的 preload 检查恒假**：即使 `preload_models: ["qwen-small"]` 且模型已在服务（请求 200），`/health` 仍是 503、`checks.preload=false`。说明 v2 的 `preload_pending`/`preload_error` 不会被清（任务失败或被卡住），`/health` 因此**不能作为就绪判据**；这也正是 O03 的 `health_status=503` 判据失去区分度的原因（故障前后都是 503）。
+- **模型盘现状**（`/media/jtzn/sandisk-ext4/models/`）：`qwen25vl-7b-q4/`（Q4_K_M 4.4G + mmproj 1.3G，已登记为 `qwen-small`）、`qwen36-35b-aggr/`（Q4_K_M 19.7G、Q4_K_P 21.8G、mmproj f16 858M，**未登记**）、`moss_td/`（safetensors 1.7G，非 GGUF profile，不能由当前 runtime 加载）。登记 qwen3.6 需要按 C02/P21 重做测量 + fixtures + 重建候选，不是改配置就能生效。
+- 本次网关是在目标机**手工拉起**的（`deploy/gateway.py` 直接运行）；作为 systemd 单元正式安装属 P27/P31，尚未执行。

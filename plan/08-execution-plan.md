@@ -1583,6 +1583,8 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 - `merge` → 20 case / 24 attempt；`verify` **exit 3**，问题恰好是 O03/O04/O06（未接线 → 复算拒绝），其余全部由原始材料复算为 passed——不因缺测而宣称通过。
 - **本轮未做**：O03/O04/O06 真实端口；第二个真实模型（盘上只有 `qwen-small` 有资产）。
 
+**P27/P30 补记（2026-09-20，跨机器访问）:** `server.host` 被产品限制为 loopback（`config.py:400/:509`）且兼容面无鉴权，因此跨机器访问做成部署能力：新增 `deploy/gateway.py`（Bearer 认证、只转发 `/v1/*`、流式、不传调用方凭据）、`deploy/sms-gateway.service.in`（**由网关单元**执行 `deploy/open-firewall.sh`，幂等且只开网关端口）、`ServiceInputs` 的 `allow_cidr/allow_public/scheduler_port/gateway_host/gateway_port/gateway_token_file`（提交 `b3f4b4b`/`3bc42ac`/`71f5c0f`，24 项新测试）。目标机验证：调度器仍 `127.0.0.1:8090`，网关 `192.168.55.1:8091`；只对 `192.168.55.0/24` 与 `192.168.1.0/24` 开放 8091；无 token 401、带 token 200，**从开发机跨机器调用成功**；`/health` 经网关 404（按设计）。同轮发现未修：`/health` 的 preload 检查恒假（模型已在服务仍 503），使 O03 的 health 判据失去区分度；登记 qwen3.6 需按 C02/P21 重做测量与 fixtures。
+
 ### P31 — 发布包现场preflight与安装验收（M07）
 
 **Primary owner:** backend；**Dependencies:** P30；**Estimated scope:** M。
