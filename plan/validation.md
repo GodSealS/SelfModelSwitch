@@ -1422,3 +1422,23 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 - `7c84d87`（待同步）：envelope 拒绝带上具体数字（`(6916 > 8192)`），否则无法离线对账。
 
 **下一步（唯一剩余项）**：`cap:vision` 的拒绝与实测计数矛盾，需在目标机上对比"适配器计数 vs fixture 自算"的具体数字（新拒绝信息就是为此加的），再决定是修正 fixture 的 vision 开销取值，还是修适配器对 vision payload 的计费口径；之后重跑 B，B 层即可全绿，再进入 `verify` 与 S/O 层编排。
+
+## P29 补记（2026-09-20，B 层真机全绿）
+
+| 项 | 值 |
+|---|---|
+| task_id | P29（B 层达成；AC1—AC3 仍未勾——S 层与 O 层未交付） |
+| source_commit | `c3661db`（目标 checkout 同 SHA，工作区干净） |
+| candidate_sha256 | `5c63424f2513aa9e922cd80462882c607ac4670c14eef5443e8853cc401b4ec2` |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p21-calibration/fresh/run-b20/` |
+| 运行结果 | `acceptance run --candidate … --layers B --fixtures-root …` **exit 0**，`attempts=12、cases=8、passed=12、failed=0、verdict=passed`，run_id `70547ee9732c43eab4c8d810691c7d41`，boot_id `fb8373a7d0bd48c3b41d92f9dc3b6efa` |
+
+**12 次尝试逐条通过**：`load`×3（三次独立冷启动）、`infer`、`envelope`（单请求达到声明边界）、`cancel`、`stop`、`reload`×3（三轮完整重载）、`cap:chat`、`cap:vision`。每个 case 的 `facts` 含 provider（`sms-orin-lab@<boot>`）、实例身份、设备原始采样（`samples/tegrastats.jsonl`）与真实输出。
+
+**本轮关键修正**：图像按**声明上限**计费（1280）而模型实际只消耗 1196，因此"声明输入边界"对图像轮不可达（实测 `observed.input_tokens=8108`）。vision 边界改为声明**可达到的输入**（文本+模板=6912）并把计费值 8192 作为 fixture 文档字段；图像消耗仍由 `images`/`image_edge_pixels` 证明，计费由校验器在派发前约束。
+
+**尚未完成**：
+1. **S 层编排**（`S01`—`S06`）：`run --layers S` 仍显式拒绝；AC2 要求 S 在发布解释器通过。
+2. **O 层编排**（`O01`—`O06`）：依赖 S/B 与更长的现场负载。
+3. AC1 要求"全部登记模型/能力有 fixture 及性能阈值"——当前候选只登记 `qwen-small`（一个模型只能验 load/reload，M07 切换验收需要第二个模型，缺失即 blocked）。
+4. `acceptance verify`（P25 离线复算）尚未对 run-b20 执行；P30/P31 依赖 S/O 全集。
