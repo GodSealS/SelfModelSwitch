@@ -68,7 +68,10 @@ class FillerSpec:
 
     unit: str
     tokens_per_unit: float
-    template_overhead_tokens: int
+    template_overhead_tokens: int  # the chat template's own cost, measured
+    vision_template_overhead_tokens: int  # the vision template's own cost, measured
+    instruction: str  # a boundary round is still a real request: it ends with an instruction
+    instruction_tokens: int  # what that instruction costs on top of the filler, measured
 
 
 def filler_text(tokens: int, *, filler: FillerSpec) -> str:
@@ -83,9 +86,7 @@ def filler_text(tokens: int, *, filler: FillerSpec) -> str:
         raise FixtureError("the filler needs the measured template overhead in tokens")
     if not isinstance(filler.unit, str) or not filler.unit or any(char.isspace() for char in filler.unit):
         raise FixtureError("the filler unit must be a single non-blank word")
-    if tokens <= overhead:
-        raise FixtureError(f"a declared budget of {tokens} tokens cannot carry a {overhead}-token template")
-    units = math.ceil((tokens - overhead) / ratio) if tokens else 0
+    units = math.ceil(tokens / ratio) if tokens else 0
     return " ".join(filler.unit for _ in range(units))
 
 
@@ -120,6 +121,17 @@ def _filler(tokens: int, filler: FillerSpec | None) -> str:
     return filler_text(tokens, filler=filler)
 
 
+def _sized_text(budget: int, overhead: int, filler: FillerSpec) -> str:
+    """Filler plus instruction, sized so the whole request is exactly `budget` tokens."""
+    if filler.instruction_tokens <= 0 or not filler.instruction.strip():
+        raise FixtureError("a boundary round must end with a real instruction: its measured cost is required")
+    usable = budget - overhead - filler.instruction_tokens
+    if usable <= 0:
+        raise FixtureError(f"a declared budget of {budget} tokens cannot carry the template "
+                           f"({overhead}) and the instruction ({filler.instruction_tokens})")
+    return f"{_filler(usable, filler)} {filler.instruction}"
+
+
 def _text_tokens_within(envelope) -> int:
     """The text budget that is left once the image budget is accounted for."""
     return int(envelope.max_input_tokens)
@@ -145,7 +157,9 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
             raise FixtureError(f"{model_id}: the {capability} fixture needs the measured tokens-per-unit ratio of "
                                "this model's tokenizer (a declared boundary no one can reach is not a boundary)")
         if capability == "chat":
-            payload = {"messages": [{"role": "user", "content": _filler(text_tokens, filler)}],
+            payload = {"messages": [{"role": "user",
+                                     "content": _sized_text(text_tokens, filler.template_overhead_tokens,
+                                                            filler)}],
                        "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel,
                        # A boundary round must really consume its output budget: left to
                        # itself the model may answer shorter and leave the boundary unproven.
@@ -166,10 +180,8 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
             content += [{"type": "image_url", "image_url": {"url": _image_data_url(envelope.max_image_edge_pixels,
                                                                                    envelope.max_image_edge_pixels)}}
                         for _ in range(envelope.max_images - 1)]
-            if text_tokens <= filler.template_overhead_tokens:
-                raise FixtureError(f"{model_id}: the declared input budget cannot carry both the images and the "
-                                   "template, so the vision boundary cannot be reached in one request")
-            content.append({"type": "text", "text": _filler(text_tokens, filler)})
+            content.append({"type": "text",
+                            "text": _sized_text(text_tokens, filler.vision_template_overhead_tokens, filler)})
             payload = {"messages": [{"role": "user", "content": content}],
                        "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel,
                        "ignore_eos": True}

@@ -46,7 +46,8 @@ from .fixtures import FillerSpec
 CONTROL_SOCKET_ENV = "SMS_CONTROL_SOCKET"
 FIXTURE_MATERIAL_NAME = "fillers.json"
 FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
-FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens", "unit"})
+FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens",
+                               "vision_template_overhead_tokens", "instruction", "instruction_tokens", "unit"})
 EXIT_INPUT = 2
 EXIT_FAILED = 3
 
@@ -121,8 +122,21 @@ def load_filler_specs(root: Path, candidate: Any) -> dict[str, FillerSpec]:
         if isinstance(overhead, bool) or not isinstance(overhead, int) or overhead < 0:
             raise LayerError(f"{where}: template_overhead_tokens must be the measured non-negative count",
                              exit_code=EXIT_INPUT)
+        vision_overhead = entry.get("vision_template_overhead_tokens")
+        if isinstance(vision_overhead, bool) or not isinstance(vision_overhead, int) or vision_overhead < 0:
+            raise LayerError(f"{where}: vision_template_overhead_tokens must be the measured non-negative count",
+                             exit_code=EXIT_INPUT)
+        instruction, instruction_tokens = entry.get("instruction"), entry.get("instruction_tokens")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise LayerError(f"{where}: instruction is required: a boundary round is a real request",
+                             exit_code=EXIT_INPUT)
+        if isinstance(instruction_tokens, bool) or not isinstance(instruction_tokens, int) or instruction_tokens <= 0:
+            raise LayerError(f"{where}: instruction_tokens must be the measured positive cost of the instruction",
+                             exit_code=EXIT_INPUT)
         specs[model_id] = FillerSpec(unit=str(entry["unit"]), tokens_per_unit=float(ratio),
-                                     template_overhead_tokens=overhead)
+                                     template_overhead_tokens=overhead,
+                                     vision_template_overhead_tokens=vision_overhead,
+                                     instruction=instruction, instruction_tokens=instruction_tokens)
     return specs
 
 
