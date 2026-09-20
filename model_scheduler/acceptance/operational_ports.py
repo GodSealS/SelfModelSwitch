@@ -423,6 +423,7 @@ class DockerFaultPort:
     base_url: str
     model_id: str
     image: str
+    stranger_image: str = ""
     timeout_seconds: float = 180.0
     poll_seconds: float = 2.0
     runner: Callable[..., tuple[int, str]] | None = None
@@ -506,12 +507,19 @@ class DockerFaultPort:
 
     def present_unknown_instance(self) -> Mapping[str, Any]:
         name = f"{_managed_prefix(self.deployment_id)}ghost"
+        if not self.stranger_image:
+            # Staging a stranger needs an image that can stay up without a model;
+            # the lab's image has no shell and exits without weights. Inventing a
+            # container that dies at once would measure nothing.
+            return {"available": False, "action": "present_unknown_instance",
+                    "reason": ("no stranger image was supplied: this site only has the runtime image, which "
+                               "cannot stay up without a model, so no unmanaged instance can be staged")}
         before = _foreign_containers(self.deployment_id, runner=self.runner)
         baseline = _http_status(self.base_url, "/health")
         code, stdout = self._run(["docker", "run", "-d", "--name", name,
                                   "--label", f"{DEPLOYMENT_LABEL}={self.deployment_id}",
                                   "--label", "io.self-model-switch.model=ghost",
-                                  "--entrypoint", "sleep", self.image, "600"])
+                                  self.stranger_image, "600"])
         if code != 0:
             raise PortError(f"the stranger container could not be started: {stdout.strip()}")
         try:
@@ -531,15 +539,19 @@ class DockerFaultPort:
             self._run(["docker", "rm", "-f", name], timeout=60.0)
 
     def stall_stop(self, model_id: str) -> Mapping[str, Any]:
-        name = f"{_managed_prefix(self.deployment_id)}{model_id}"
-        self._run(["docker", "rm", "-f", name], timeout=60.0)
-        stall_note = ""
-        code, stdout = self._run(["docker", "run", "-d", "--name", name,
-                                  "--label", f"{DEPLOYMENT_LABEL}={self.deployment_id}",
-                                  "--label", f"io.self-model-switch.model={model_id}",
-                                  "--entrypoint", "sh", self.image, "-c", "trap '' TERM; sleep 600"])
+        """Ask for the stop while the Docker channel is gone: it cannot be proven.
+
+        A stop that never proves leaves the booking in place and the model in an
+        error state; the point of the case is that the deployment says so instead
+        of quietly releasing a budget it never verified.
+        """
+        warmed = True
+        if self._model().get("state") == "unloaded":
+            warmed = self._warm()
+        code, stdout = self._run(["sudo", "systemctl", "stop", "docker.socket"], timeout=60.0)
         if code != 0:
-            raise PortError(f"the stalled container could not be started: {stdout.strip()}")
+            raise PortError(f"the Docker socket could not be stopped: {stdout.strip()}")
+        stall_note = ""
         try:
             try:
                 answer = self.post(self.base_url.rstrip("/") + f"/api/models/{model_id}/unload", timeout=60.0)
@@ -557,12 +569,15 @@ class DockerFaultPort:
                     break
                 self.wait(self.poll_seconds)
             health = _http_status(self.base_url, "/health")
-            return {"available": True, "stop_timeout_recorded": model.get("last_error") == "stop_unverified",
-                    "budget_kept": self._budget_kept(model), "health_status": health, "unload_status": unload_code,
-                    "model_state": model.get("state"), "model_last_error": model.get("last_error"),
-                    "stalled_container": name, "note": stall_note or None}
         finally:
-            self._run(["docker", "rm", "-f", name], timeout=60.0)
+            restore_code, restore_output = self._run(["sudo", "systemctl", "start", "docker.socket"], timeout=60.0)
+            if restore_code != 0:
+                raise PortError(f"the Docker socket could not be started again: {restore_output.strip()}")
+        return {"available": True, "warmed": warmed, "docker_channel_down": True,
+                "stop_timeout_recorded": model.get("last_error") == "stop_unverified",
+                "budget_kept": self._budget_kept(model), "health_status": health, "unload_status": unload_code,
+                "model_state": model.get("state"), "model_last_error": model.get("last_error"),
+                "note": stall_note or None}
 
 
 # ---------------------------------------------------------------------------

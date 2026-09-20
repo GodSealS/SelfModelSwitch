@@ -188,6 +188,7 @@ def test_o03_reads_what_the_machine_and_the_service_really_say() -> None:
 
     port = op.DockerFaultPort(deployment_id="sms-orin-lab", base_url="http://127.0.0.1:8090",
                               model_id="qwen-small", image="sms-llama-cpp@sha256:" + "8" * 64,
+                              stranger_image="busybox:1",
                               runner=runner, post=lambda *a, **k: _Posted(200),
                               clock=clock, wait=lambda seconds: None)
 
@@ -225,6 +226,17 @@ class _Posted:
 
     def json(self) -> dict:
         return self._payload
+
+
+def test_o03_reports_a_stranger_it_cannot_stage_as_unavailable() -> None:
+    """No keep-alive image means no unmanaged instance: `not_run`, never a staged nothing."""
+    port = op.DockerFaultPort(deployment_id="sms-orin-lab", base_url="http://127.0.0.1:8090",
+                              model_id="qwen-small", image="sms-llama-cpp@sha256:" + "8" * 64,
+                              runner=lambda argv, *, timeout=None: (0, ""))
+
+    answer = port.present_unknown_instance()
+
+    assert answer["available"] is False and "stranger image" in answer["reason"]
 
 
 def test_o03_refuses_a_fault_it_cannot_stage() -> None:
