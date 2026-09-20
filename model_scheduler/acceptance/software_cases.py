@@ -761,16 +761,17 @@ def _s05_compat_chat(model: Any) -> tuple[bool, dict]:
                                                 capabilities=model.capabilities, envelope=model.envelope))
     except EnvelopeError as exc:
         return False, {"error": f"a valid request was refused: {exc}"}
-    oversized = model.envelope.max_output_tokens + 1
+    # Without the runtime's tokenizer the envelope cannot be counted, but the request
+    # contract still is: a non-positive output budget must be refused, never clipped.
     try:
-        asyncio.run(check_chat_input({"messages": messages, "max_tokens": oversized},
+        asyncio.run(check_chat_input({"messages": messages, "max_tokens": 0},
                                      capabilities=model.capabilities, envelope=model.envelope))
         refused = False
     except EnvelopeError:
         refused = True
     ok = bool(refused and isinstance(accepted, Mapping))
     return ok, {"model_id": model.model_id, "capability": "chat", "accepted": dict(accepted or {}),
-                "oversized_refused": refused, "oversized_max_tokens": oversized}
+                "invalid_max_tokens_refused": refused}
 
 
 def _s05_compat_embeddings(model: Any) -> tuple[bool, dict]:

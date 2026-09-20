@@ -132,6 +132,20 @@ def test_s05_reads_the_capability_the_registration_really_has(tmp_path) -> None:
     assert facts["evidence"]["compat"]["capability"] == "embeddings"
 
 
+def test_s05_compat_checks_the_chat_path_when_a_chat_model_is_registered() -> None:
+    """The path a real candidate takes: a valid body is accepted, an invalid one refused."""
+    from types import SimpleNamespace
+
+    model = SimpleNamespace(model_id="qwen-small", capabilities=("chat",),
+                            envelope=Envelope(ctx_size=32768, max_input_tokens=8192, max_output_tokens=4096,
+                                              max_parallel=2, max_image_tokens=1280,
+                                              max_image_edge_pixels=1024, max_images=1))
+    ok, evidence = sc._s05_compat(SimpleNamespace(models=(model,)))
+
+    assert ok is True, evidence
+    assert evidence["capability"] == "chat" and evidence["invalid_max_tokens_refused"] is True
+
+
 def test_s06_refuses_tampered_and_forged_material(tmp_path) -> None:
     candidate_path, candidate = _candidate(tmp_path)
     observations, facts, problems = sc._check_s06(candidate=candidate, material_dir=tmp_path / "S06",
