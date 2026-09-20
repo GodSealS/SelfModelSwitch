@@ -1454,3 +1454,73 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 **结论**：①`verify` **拒绝部分证据**，不会把只有 B 层的 run 当作通过——这是 P25/P28 门禁设计要求的语义；②对 B 层材料本身，`verify` 未提出任何缺失、结构错误或候选绑定问题（报告/材料/manifest 契约成立）。因此"先跑 B 再补 S/O"是可验证的路径：S/O 交付后对同一 run 的重新 verify 才会给出通过与否。
 
 下一次实现入口：`plan/08-execution-plan.md` §4 P29 的 **⑤ S 层实施说明书**（模块、每个 observation 的真实来源、CLI 路由与测试形状已固定）。
+
+## P29 补记（2026-09-20，S 层实施与 B 层材料离线复算）
+
+范围：把 S01—S06 从实施说明书变成可运行、可真机复算的一层；同时修复 B 层材料的落盘契约
+（`evaluator`/`merge` 读取的形状），并在目标机用同一候选跑通 S+B 与逐 case 离线复算。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P29（⑤a 材料契约 + ⑤b S 层；AC1—AC3 仍未勾——O 层与第二模型未交付） |
+| status | 实现完成并真机验证；S 在发布解释器通过 |
+| source_commit | 起点 `9f6a92f`；实现 `e87b7e1`（材料契约 + S 层）、`73d14f7`（S05 反例修正）、`1f7245f`（采样窗口修正） |
+| target_commit | `1f7245fbb6c432749aba08f4b1f18605a6fbe692`（干净 checkout，fast-forward；树前后为空） |
+| candidate_sha256 | `50f1740727222ea94a907e04d17aee4da48687d69382fc55ffb392a78a2adfa0`（`run-s3`/`run-b22` 绑定） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p29-s-layer-20260920T040254Z/` |
+
+### 2. 本地命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_software_cases.py -q`（实现前） | 4 | `software_cases` 不存在，收集失败，即 RED |
+| 同上（实现后） | 0 | `16 passed` |
+| `pytest tests -m 'not thor' -q`（开发机） | 0 | `831 passed, 1 skipped, 1 deselected` |
+| `ruff check .` | 0 | 通过 |
+| `run.py --check-config` | 0 | 仍为 v1 四 ID，v1 运行行为未变 |
+
+### 3. 目标机命令与结果
+
+目标机 `jtzn-desktop`，`Linux 5.15.148-tegra` aarch64，L4T `R36.4.7`；lab venv 3.12.14。
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests -m 'not thor' -q` | 0 | `831 passed, 1 skipped` |
+| `acceptance source --root .` | 0 | `source-s3.tar.gz` sha256 `ba1ab1f2e55adf8074edb931498a983e6ea91b514340c371ccba11df8e69b1cd` |
+| `acceptance candidate …`（P29 facts + P21 fresh 校准 + P21 policy + P22 fixtures） | 0 | candidate `50f17407…`；`config_sha256=4f5d76c4…`、`collector_sha256=89c56711…` 与 b20 一致，仅 source 因代码变化而变 |
+| `acceptance run --layers S --inventory inventory.json` | 0 | 6/6 passed（`run-s3`，run_id `82a557ff…`） |
+| `acceptance run --layers B --fixtures-root p22` | 0 | 12/12 passed、8 cases（`run-b22`，run_id `4191d9d9…`，13 分钟；窗口 04:37—04:50） |
+| evaluator 逐 case 复算（S/B/merge 后） | — | S 6/6、B 12/12、merge 后 18/18 全部 passed；改写 observation 的副本被拒 |
+| `acceptance merge --runs run-s3 run-b22` | 0 | 18 attempts / 14 cases（`final-sb`） |
+| `acceptance verify --evidence final-sb` | **2** | `report: missing final attempts for: O01—O06`（唯一缺口；S+B 身份/映射/材料通过） |
+| 运行后现场 | — | `docker ps` 0、MemAvailable 回落（50.86 GiB）、无残留 |
+
+### 4. 关键事实
+
+- **材料契约（⑤a）**：`CaseMaterialStore` 是唯一写入者；`run-b22` 每个 attempt 的 `event_refs[0]` 以
+  `/case.json` 结尾，`merge` 复制为 `cases/<case>/<run>-attempt-<n>/`，`evaluator` 仍按
+  `event_refs[0].parent` 定位 `case.json` 与 `samples/`。修复前（`run-b20`）的扁平 `cases.jsonl` 一旦进入
+  evaluator，每个 B case 都会因缺 `case.json` 判失败——首轮 `verify` 因缺 S/O 在映射阶段提前退出，
+  这一缺陷此前不可见。
+- **B 层修复的实证**：`run-b21`（采样窗口修正前）12/12 通过、但离线复算拒绝 `cancel` 与 `stop`
+  （`no raw device samples are present`）；`run-b22`（修正后）12/12 全部可复算。失败材料 `run-b21`
+  保留在同一证据目录。
+- **S 层语义**：每个 observation 由真实调用产生；缺 `--inventory` 的首次 `run-s` 让 S01
+  `legacy_config_migrated=false` 且该 case failed（未被填成 true），其余 5 个 case passed。
+- **S05 反例修正**：无 runtime tokenizer 时超 envelope 的 `max_tokens` 会被截断而非拒绝，反例改为
+  非正输出预算（`73d14f7`）；目标机 `run-s` 首次运行的失败正是该 check 的诚实表现。
+- **inventory（S01 的显式输入）**：`inventory.json` 记录运行时镜像 digest（取自候选）、adapter/lock
+  文件 hash 与 legacy 资产声明；来源逐条写入 `context.txt`；`asset.size_bytes` 取自 v1 登记的
+  `reserved_bytes`（v1 文件不含文件尺寸），迁移只核对 path/sha256。
+
+### 5. 未执行 / 未解决
+
+1. **O 层编排与真实执行**（`O01`—`O06`）：P24 端口与 `workload` 已就绪，缺执行器接线与 1800 s 现场负载；
+   `verify` 的完整通过要等它对同一候选重跑。
+2. **第二个真实模型**：M07 切换验收要求 ≥2 个模型，当前候选只登记 `qwen-small`（缺失即 blocked）。
+3. **服务端版本**：`run-b22` 的服务端进程为本日 02:33 UTC 启动的 `c3661db` 代码（客户端 `1f7245f`）——
+   本轮证据用于材料契约验证；P29 的 S/B/O 全集验收须在两端同版本下重跑。
+4. 目标机 `origin` 仍指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`（P14/P17 遗留拓扑问题）。

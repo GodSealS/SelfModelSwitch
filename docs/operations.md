@@ -138,6 +138,7 @@ needed to re-verify, and none may be added.
 | `p26/` | rendered v3 deployment (`deploy/manifest.json` + service units) and the layer-1 result | `model_scheduler.deploy preflight --manifest …/manifest.json` (layer 1, loads nothing) |
 | `p27/` | rendered service units + `service-facts.json` | `systemd-analyze verify <units>` (exit 0) |
 | `p29/` | `facts.json`, `source.tar.gz` (sha256 `43708bc7…`), `source.log` — the P29 prerequisite audit | re-run `collect`, `source`, `candidate`, `run --layers B` and compare exit codes (2 / 3 by design until the blockers clear) |
+| `p29-s-layer-20260920T040254Z/` | rebuilt `source-s3.tar.gz`/`candidate-s3.json`, `inventory.json` + `context.txt` (S01's explicit migration input and its provenance), `run-s3/` (S layer 6/6), `run-b21/` (kept failure: cancel/stop without raw rows), `run-b22/` (B layer 12/12), `final-sb/` (merged 18 attempts / 14 cases) | `acceptance verify --candidate …/candidate-s3.json --evidence …/final-sb` → exit 2 only for `O01—O06`; recompute any case offline with `acceptance.evaluator.evaluate_case` from its `case.json` + `samples/` |
 
 Re-verification never starts a model, never talks to Docker and never opens a
 socket: `acceptance verify` and the P26 preflight are pure file-and-hash checks.

@@ -1493,6 +1493,45 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
   - **fixtures**：`CaseExecutor.run_model` 内部用 `fixtures_for(model_id, capabilities, envelope)`；因此运行前必须按 candidate 的 `fixture_refs` 装载 fixtures 目录（P23 的 fixtures 模块），缺失即拒绝——**不能只靠包内默认 fixture**。
   - **层范围**：S 层（`S01`—`S06` 软件验证）与 O 层（`O01`—`O06`，端口对象在 `operational_cases.py`）需要各自的编排与前置，本轮只设计 B 层；S/O 在实现前保持显式拒绝。
 
+**⑥ S 层实施与材料契约修复（2026-09-20，已交付并真机验证；两个切片同一提交）**
+
+代码（本地 commit `e87b7e1`、`73d14f7`、`1f7245f`，均已推送 GitHub 与目标裸仓）：
+
+- **P29-⑤a 材料契约**：新增 `acceptance/materials.py` 的 `CaseMaterialStore`，每 attempt 一个目录
+  （`cases/<case>/attempt-<n>/case.json` + `samples/<kind>.jsonl`）——正是 `evaluator.load_case_material`
+  读取、`verify.merge_runs` 取 `event_refs[0].parent` 作材料根的形状；case 自己的 facts（含 envelope 的
+  declared boundary）在 `case.json` 顶层。`runner.run_layers` 用同一 store 统一 S/B 编排与一份 v3 报告；
+  B 层材料由此从**扁平 `cases.jsonl`**（此前 `verify` 一旦走到 evaluator，每个 B case 都会因缺
+  `case.json` 失败）改为可复算的 per-case 目录。
+- **P29-⑤b S 层**：新增 `acceptance/software_cases.py`：S01 用候选自己的登记重解析 + 严格 schema 反例
+  + 显式 inventory 的 `migrate_v2`（并以 `run.py --check-config` 核对）+ 服务 import 扫描；S02 用 fake
+  端口驱动真实 `ModelScheduler`/`Book`；S03 用 Book 的边界算术（等号/差 1 byte/新鲜度/不重复计账）并写原始
+  `numbers`；S04 用真实 `SessionManager`/`RequestQueue`/`Book`/`IdempotencyStore`；S05 用 compat 输入契约
+  + 真实 `BlobStore`（owner/hash/quota/expiry/restart/late output）；S06 用真实 parser/verify/preflight 的
+  篡改拒绝。显式输入缺失（`--inventory`、candidate 文档）时该 observation 为 false，绝不填占位。
+- **driver**：load/stop/cancel 也采样，且采样窗口至少跨一个采样间隔——cancel 微秒返回会让材料没有
+  `samples/`，离线复算因此拒绝（修正前的 `run-b21` 保留为该失败证据）。
+- **CLI**：`run --layers S`（与 `S,B`）接线，新增 `--inventory`/`--legacy-config`；O 层仍显式拒绝。
+
+目标机（Linux aarch64，`1f7245f`，lab venv 3.12.14；证据
+`/home/jtzn/self-model-switch-evidence/p29-s-layer-20260920T040254Z/`）：
+
+| 步骤 | 结果 |
+|---|---|
+| `pytest tests -m 'not thor' -q`（目标机） | `831 passed, 1 skipped` |
+| 候选重建（`source-s3.tar.gz` `ba1ab1f2…`） | candidate `50f17407…`；`config_sha256=4f5d76c4…`（与 b20 相同）、`collector_sha256=89c56711…`（未变） |
+| `run --layers S --inventory inventory.json` | 6/6 passed（`run-s3`，run_id `82a557ff…`） |
+| `run --layers B --fixtures-root p22` | 12/12 passed、8 cases（`run-b22`，run_id `4191d9d9…`，约 13 分钟） |
+| 离线复算（evaluator 逐 case） | S 6/6、B 12/12、merge 后 18/18 全部通过；改写 observation 的副本被拒 |
+| `merge --runs run-s3 run-b22` | 18 attempts / 14 cases（`final-sb`） |
+| `verify` | **exit 2**，唯一缺口 `O01—O06`（O 层未交付；S+B 身份、映射与材料均通过） |
+| 运行后现场 | 0 容器、MemAvailable 回落、无残留 |
+
+**本轮未做 / 遗留**：①O 层编排（P24 端口对象已就绪）与 O01—O06 真实执行；②第二个真实模型
+（M07 切换验收要求 ≥2 个模型，当前候选只登记 `qwen-small`）；③B 层运行的服务端进程是本日 02:33 UTC
+启动的 `c3661db` 代码（客户端 `1f7245f`）——本轮证据用于材料契约验证，P29 的 S/B/O 全集验收须在两端
+同版本下重跑；④`verify` 的完整通过要等 O 层交付后对同一候选重跑。
+
 ### P30 — 真实混合负载、故障恢复及离线复核（M07）
 
 **Primary owner:** backend；**Dependencies:** P29；**Estimated scope:** S。
