@@ -18,6 +18,7 @@ from model_scheduler.acceptance.operational_ports import NamespaceDiskFaultPort,
 
 HEALTHY = {
     "isolate": {"available": True, "private_mount_namespace": True, "unmounted_shared_disk": False,
+                "baseline_ready": True, "baseline_files": ["qwen-small"],
                 "workspace": "/tmp/sms-o02-x", "workspace_filesystem": "tmpfs"},
     "fail_model_disk": {"model_disk_unavailable": True, "reason": "the assets stopped verifying",
                         "root_disk_writes": 0},
@@ -62,6 +63,7 @@ def test_o02_passes_through_a_healthy_namespace_probe() -> None:
     assert [command["action"] for command in probe.sent] == [
         "isolate", "fail_model_disk", "fill_scratch", "recover"]
     assert probe.sent[2]["quota_bytes"] == 64 * 1024**2
+    assert result.facts["isolation"]["baseline_ready"] is True  # the fault is attributable
     assert oc.recompute_objections("O02", result.facts) == []
 
 
@@ -72,6 +74,16 @@ def test_a_namespace_that_cannot_isolate_is_not_run() -> None:
     assert result.status == "not_run"
     assert "unshare" in result.facts["isolation"]["reason"]
     assert result.facts["isolation"]["available"] is False
+
+
+def test_a_disk_that_was_never_verified_cannot_claim_a_fault() -> None:
+    port, _ = _port({"isolate": {"available": False, "baseline_ready": False, "baseline_files": [],
+                                 "reason": "the model disk does not verify inside this namespace: "
+                                           "mount_identity_mismatch"}})
+    result = oc.run_o02(port, deployment_id="sms-lab", quota_bytes=1024)
+
+    assert result.status == "not_run"
+    assert "mount_identity_mismatch" in result.facts["isolation"]["reason"]
 
 
 def test_a_refused_step_is_a_failure_and_never_a_pass() -> None:
@@ -147,7 +159,7 @@ def test_the_probe_reports_every_refusal_as_a_line(monkeypatch: pytest.MonkeyPat
             self.kwargs = kwargs
 
         def isolate(self) -> dict:
-            return {"private_mount_namespace": True}
+            return {"private_mount_namespace": True, "baseline_ready": True}
 
         def fill_scratch(self, quota_bytes: int) -> dict:
             return {"bytes_written": quota_bytes}

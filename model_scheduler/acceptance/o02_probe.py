@@ -13,7 +13,11 @@ line on stdout. Nothing outside this namespace changes:
 * the scratch fault runs on a **dedicated tmpfs** with an explicit quota, never
   on the root filesystem;
 * every write the probe performs is checked to live on a `tmpfs`, which is what
-  `root_disk_writes: 0` means.
+  `root_disk_writes: 0` means;
+* the assets are hashed once **before** the fault, so `model_disk_unavailable`
+  is attributable to the fault and not to a configuration the namespace cannot
+  serve — without a verified baseline the namespace reports itself unavailable
+  and the case stays `not_run`.
 
 The verdicts come from the product's own `StorageMonitor`: the fault is real
 only if the registered assets stop verifying, and recovery is real only if a
@@ -73,6 +77,7 @@ class Probe:
         self._workspace: Path | None = None
         self._shadowed = False
         self._scratch_mounted = False
+        self._baseline_ready = False
         self._writes: list[Path] = []
 
     # -- helpers ---------------------------------------------------------
@@ -114,14 +119,27 @@ class Probe:
         self._workspace = workspace
         (workspace / "empty").mkdir()
         mine = _namespace_of(os.getpid())
-        return {
+        answer = {
             "private_mount_namespace": bool(mine) and mine != self._parent_namespace,
             "namespace": mine, "parent_namespace": self._parent_namespace,
             "unmounted_shared_disk": False,  # the disk is shadowed, never unmounted
             "workspace": str(workspace), "workspace_filesystem": _fstype(workspace),
         }
+        # A fault is only attributable if the disk verifies *before* it is staged:
+        # otherwise "unavailable" may just be the configuration or the namespace.
+        baseline = self._monitor().verify_all(self._loaded().models)
+        self._baseline_ready = baseline.ready is True and len(baseline.files) > 0
+        answer["baseline_ready"] = self._baseline_ready
+        answer["baseline_files"] = sorted(baseline.files)
+        if not self._baseline_ready:
+            return {"available": False, "action": "isolate",
+                    "reason": f"the model disk does not verify inside this namespace: {baseline.reason}",
+                    **answer}
+        return answer
 
     def fail_model_disk(self) -> dict:
+        if not self._baseline_ready:
+            raise RuntimeError("the model disk had no verified baseline, so no fault can be attributed to it")
         directory = self._model_directory()
         empty = self._workspace_dir() / "empty"
         _mount(["mount", "--bind", str(empty), str(directory)])
