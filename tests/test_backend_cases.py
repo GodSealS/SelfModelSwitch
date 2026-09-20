@@ -375,6 +375,26 @@ def test_the_run_reads_the_measured_ratio_from_the_frozen_material(tmp_path) -> 
         load_filler_specs(tmp_path, _Candidate())
 
 
+def test_an_image_round_proves_the_reachable_input_and_the_images_it_used() -> None:
+    """An image is charged at its declared bound, so the round cannot consume it exactly."""
+    fixture = fx.fixtures_for("qwen-small", ("vision",), ENVELOPE, filler=FILLER)[0]
+
+    assert fixture.charged_input_tokens == ENVELOPE.max_input_tokens
+    reachable = ENVELOPE.max_input_tokens - ENVELOPE.max_images * ENVELOPE.max_image_tokens
+    assert fixture.boundary["input_tokens"] == reachable
+    assert fixture.boundary["images"] == 1 and fixture.boundary["image_edge_pixels"] == 64
+
+    # What a real round reports: the text it sent, the image it really used.
+    observed = {"input_tokens": reachable, "output_tokens": ENVELOPE.max_output_tokens,
+                "images": 1, "image_edge_pixels": 64, "parallel": ENVELOPE.max_parallel}
+    assert fx.boundary_shortfalls(fixture, observed) == []
+
+    short = {**observed, "input_tokens": reachable - 1}
+    assert "input_tokens" in fx.boundary_shortfalls(fixture, short)[0]
+    no_image = {**observed, "images": 0}
+    assert any("images" in problem for problem in fx.boundary_shortfalls(fixture, no_image))
+
+
 def test_a_boundary_without_a_measured_ratio_is_refused() -> None:
     with pytest.raises(fx.FixtureError, match="measured tokens-per-unit"):
         fx.fixtures_for("qwen-small", ("chat",), ENVELOPE)

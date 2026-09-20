@@ -48,10 +48,14 @@ class Fixture:
     payload: Mapping[str, Any]
     boundary: Mapping[str, int]
     artifact_name: str
+    charged_input_tokens: int | None = None  # what the adapter charges for this round
 
     def document(self) -> dict:
-        return {"fixture_id": self.fixture_id, "capabilities": [self.capability],
-                "boundary": dict(self.boundary), "artifact_name": self.artifact_name}
+        document = {"fixture_id": self.fixture_id, "capabilities": [self.capability],
+                    "boundary": dict(self.boundary), "artifact_name": self.artifact_name}
+        if self.charged_input_tokens is not None:
+            document["charged_input_tokens"] = self.charged_input_tokens
+        return document
 
 
 @dataclass(frozen=True)
@@ -185,7 +189,13 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
             payload = {"messages": [{"role": "user", "content": content}],
                        "max_tokens": envelope.max_output_tokens, "n_parallel": envelope.max_parallel,
                        "ignore_eos": True}
-            boundary = {"input_tokens": envelope.max_input_tokens, "output_tokens": envelope.max_output_tokens,
+            # An image is *charged* at the declared upper bound, not consumed exactly:
+            # the model really used 1196 tokens for a 1024-edge image the envelope
+            # charges 1280 for. The round therefore proves the reachable part of the
+            # input budget (text plus template) and the images it really consumed;
+            # the charge itself is bounded by the validator before dispatch.
+            boundary = {"input_tokens": text_tokens,
+                        "output_tokens": envelope.max_output_tokens,
                         "images": envelope.max_images, "image_edge_pixels": envelope.max_image_edge_pixels,
                         "parallel": envelope.max_parallel}
         elif capability == "embeddings":
@@ -197,7 +207,9 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
             boundary = {"documents": MAX_RERANK_DOCUMENTS}
         fixtures.append(Fixture(capability=capability, fixture_id=f"{model_id}-{capability}",
                                 payload=payload, boundary=boundary,
-                                artifact_name=f"{model_id}-{capability}.json"))
+                                artifact_name=f"{model_id}-{capability}.json",
+                                charged_input_tokens=(envelope.max_input_tokens
+                                                      if capability == "vision" else None)))
     if not fixtures:
         raise FixtureError(f"{model_id}: no declared capability has a fixture")
     return tuple(fixtures)
