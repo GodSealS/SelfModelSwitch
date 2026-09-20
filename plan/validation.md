@@ -1524,3 +1524,54 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 3. **服务端版本**：`run-b22` 的服务端进程为本日 02:33 UTC 启动的 `c3661db` 代码（客户端 `1f7245f`）——
    本轮证据用于材料契约验证；P29 的 S/B/O 全集验收须在两端同版本下重跑。
 4. 目标机 `origin` 仍指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`（P14/P17 遗留拓扑问题）。
+
+## P30 补记（2026-09-20，O 层首次真机执行与被兼容面缺陷挡住）
+
+范围：把 O01—O06 接进 `run --layers O`（未接线端口给 `not_run`），实现 O01 的兼容面负载驱动与零容忍终态探针、O05 的 P26 preflight 原语，并在目标机执行一次真实 O 层运行。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P30（首次执行；AC 全未勾——O01 被产品缺陷挡住，O02—O06 端口未接线） |
+| status | **blocked**（编排已交付；真机 O01 120/120 请求 503；O05 因现场口径被拒，已修待重跑） |
+| source_commit | 起点 `544caee`；实现 `3a0e8ce`（O 层编排与端口） |
+| target_commit | `3a0e8cea976b5eac42b0eebdacfe3f88e66a388c`（fast-forward；树前后为空） |
+| candidate_sha256 | `eb09c9b183c02de36c8d7b1728f8e39dda87696eb3983880e26286bb5b8f81bf`（candidate-t1；`policy-o1.json` 把 `arrival_requests` 从 100 改为 120） |
+| python_version | 3.13.5（开发机 `.venv`）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p29-s-layer-20260920T040254Z/{policy-o1.json, candidate-t1.json, run-o1, run-o1-all-503}` |
+
+### 2. 本地命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `pytest tests/test_operational_layer.py -q`（实现前） | 4 | `operational_ports`/`run_o_layer` 不存在，收集失败，即 RED |
+| 同上（实现后） | 0 | `7 passed` |
+| `pytest tests -m 'not thor' -q` | 0 | `838 passed, 1 skipped, 1 deselected` |
+| `ruff check .` | 0 | 通过 |
+
+### 3. 目标机命令与结果
+
+| 命令 | exit | 结果 |
+|---|---|---|
+| `acceptance source` / `candidate`（policy-o1） | 0 | candidate `eb09c9b1…`；`config_sha256` 仍 `4f5d76c4…` |
+| `acceptance run --layers O --config … --inference-url http://127.0.0.1:8090 --service-log …` | — | 运行完成但无 `report.json`（输出目录在运行中被改名）；材料逐 case 保留 |
+| 直接 `curl` 一次 chat | 503 | `{"code":"service_unavailable","message":"The input could not be counted against the envelope"}` |
+| `/api/status` | 200 | `readiness_reason: null`；`models: {qwen-small: unloaded}`；`queue_size: 0` |
+| `/health` | 503 | `checks.preload=false`（`preload_models: []`） |
+
+### 4. 关键事实
+
+- **O01 = failed，原因可复算**：`samples/workload.jsonl` 里 120 条全部 `outcome=error, status_code=503`；`metrics.error_rate=1.0`；`final_state` 八项全 0（无 OOM、无残留容器、无 lease/session/队列）。失败原因是请求侧的 503，不是负载或调度。
+- **根因（产品缺陷）**：`app.py` 的 chat 路由先做 envelope 计数（`check_chat_input(..., token_counter=…)`）再 `scheduler.acquire`；计数经 adapter 的 `/apply-template`+`/tokenize`，需要模型在线。模型未加载时计数必失败 → 503 → 而加载只在 `acquire` 里发生 → **冷启动死锁**。lab 配置 `preload_models: []`，因此兼容面不可用（P29 的"直连 0.5s 回答"是在会话已加载期间测的）。修复路径见 08 的 P30 记录（先加载再计数，或站点 preload）。
+- **O05 = failed，口径不一致**：`read_device_facts` 曾自行实现 `device_tree_sha256`，与 `acceptance collect`（候选 facts 的来源）不同 → 正确候选被拒。已改为复用 `collect_facts` 的同一实现（提交待随本轮记录一起落盘），待重跑。
+- **O02/O03/O04/O06 = not_run**：端口未接线；材料里逐项写明缺失条件（私有 mount namespace、Docker 故障、服务重启控制、release 演练），符合"缺条件即 not_run、不填占位通过"。
+- **操作失误（如实记录）**：我曾在 O 层运行期间把输出目录改名（想标记失败），导致进程结束时的 `report.json` 写入失败。材料完整（两个目录都保留：`run-o1-all-503` 是改名前的 119 行样本，`run-o1` 是进程重建的目录，含 O01 的 `case.json` 与 O02—O06 的材料）。同名操作不得再犯。
+- **环境阻塞**：目标机有免密 sudo、`unshare -r -m` 可用，但工具层把"停止/重启 lab 服务"判为需用户批准的破坏性操作；用户不在场时无法完成 preload 重启。
+
+### 5. 未执行 / 未解决
+
+1. **修兼容面冷启动**（产品缺陷）：`app.py` 的 chat 路由在计数前先预热（`acquire`+`release`），加载不属于 dispatch，符合 C06；需回归 P19/P20 的 320+ 相关测试与目标机复验。
+2. **O05 口径修复后重跑**（`read_device_facts` → `collect_facts`）。
+3. **O02—O06 的真实端口**：O02 的 `unshare --user --map-root-user --mount` 探针（模型盘遮蔽 + 专用 tmpfs 配额 + 恢复重 hash）、O03 的 Docker socket 故障（`systemctl stop docker.socket`，容器不受影响）、O04 的服务重启/残留/旧 token/再准入、O06 的 release 演练与 blob 元数据备份恢复。
+4. **O01 重跑**需要：模型可服务（preload 或 ①的修复）+ 30 分钟窗口 + 输出目录全程不动。

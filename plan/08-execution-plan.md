@@ -1543,6 +1543,28 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 - [ ] 最终容器/启动进程/端口/lease/session全部结束，内存与GPU活动回落证据可查。
 **Verification:** `acceptance run --layers O` 后独立 `acceptance verify`；不得用测试进程退出代替模型停止。
 
+**本轮执行记录（2026-09-20）:** status=blocked：O 层编排已交付并在目标机执行，但 O01 被一个真实产品缺陷挡住，O02—O06 的端口尚未接线；三条 AC 均不勾。
+
+代码（提交 `3a0e8ce`；前置提交 `e87b7e1`…`544caee`）：
+
+- `run --layers O` 接线：`runner.run_o_layer` 驱动 O01—O06；未接线或报告自身不可用的端口给出 `not_run`（缺失条件写入材料），绝不填占位通过。
+- `acceptance/operational_ports.py`：O01 的兼容面负载驱动（客户端端到端时延；控制视图没有分段时延，`queue/load` 记 0 并标注来源）、零容忍终态探针（`/api/status` 的 queue/lease/session + 受管容器清单 + `/proc/vmstat` 的 oom_kill 增量 + 服务日志的 500 计数；读不到的字段保持 `None`）、O05 的 P26 preflight 原语 + 四个篡改场景（asset hash / device / image digest / 过期证据）、`NotWiredPort`。
+- 冻结的 operational policy（100 请求 / 1800 s）无法构造满足 §4 的计划（18 s 间隔 > 15 s 上限）→ O01 以该理由 failed 并落盘；需要 ≥120 请求的策略。
+
+目标机（`3a0e8ce`，lab venv 3.12.14；证据 `…/p29-s-layer-20260920T040254Z/`）：
+
+| 步骤 | 结果 |
+|---|---|
+| 候选重建（`policy-o1.json`：`arrival_requests` 100→120，来源记录在 `context.txt`） | candidate `eb09c9b183c02de36c8d7b1728f8e39dda87696eb3983880e26286bb5b8f81bf` |
+| `run --layers O --config … --inference-url http://127.0.0.1:8090` | **未产出 `report.json`**：输出目录在运行中被改名（操作失误，见下）；材料逐 case 保留 |
+| O01 | **failed**：120/120 请求 503 `The input could not be counted against the envelope`；`error_rate=1.0`；终态八项全 0（无残留） |
+| O02 / O03 / O04 / O06 | `not_run`（端口未接线；材料里写明具体缺失条件） |
+| O05 | **failed**：正确候选被拒 `device_tree_sha256 does not match` —— 现场口径与 `acceptance collect` 不一致（已修：`read_device_facts` 改为复用同一采集实现，待重跑） |
+
+**本轮发现的产品缺陷（阻塞 O01，需修复）**：兼容 API 的 envelope 计数发生在 `scheduler.acquire` **之前**（`app.py` 的 chat 路由），而计数需要一个在线的 runtime tokenizer；模型未加载时计数必然失败 → 503，而加载只在 `acquire` 里发生 → **冷启动死锁**，没有 preload 的部署兼容面不可用（lab 的 `preload_models: []`，`/health` 的 preload 检查同时为 false）。两条路径：①按 C06 的语义先加载（`acquire`+`release` 预热，加载不是 dispatch）再计数再 dispatch——产品修复，需回归 P19/P20；②站点配置 preload——lab 需要重启服务，本轮工具层要求授权而用户不在场，未执行。
+
+**本轮未做**：O02（私有 mount namespace 探针）、O03（docker socket 故障）、O04（重启/残留/旧 token/再准入）、O06（release 演练与 blob 元数据备份恢复）的真实端口；报告落盘被打断（运行中改目录名是操作失误；材料完整但无 `report.json`，`run-o1`/`run-o1-all-503` 两个目录都保留）。
+
 ### P31 — 发布包现场preflight与安装验收（M07）
 
 **Primary owner:** backend；**Dependencies:** P30；**Estimated scope:** M。

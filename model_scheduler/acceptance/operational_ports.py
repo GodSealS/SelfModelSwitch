@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-import platform
 import re
 import subprocess
 import time
@@ -309,45 +308,20 @@ def read_site_facts(*, candidate: Any, config_path: Path, model_directory: Path,
 
 
 def read_device_facts(*, config_path: Path, model_directory: Path, scratch_path: Path | None = None) -> dict:
-    """The C09 device fields, read from this machine (no value is guessed)."""
-    machine_id = Path("/etc/machine-id")
-    meminfo = Path("/proc/meminfo")
-    if not machine_id.is_file() or not meminfo.is_file():
-        raise PortError("this machine does not expose /etc/machine-id or /proc/meminfo")
-    found = re.search(r"^MemTotal:\s+(\d+) kB", meminfo.read_text(encoding="utf-8"), re.MULTILINE)
-    if not found:
-        raise PortError("MemTotal is not readable")
+    """The C09 device fields, read with the same collector the candidate was frozen with.
+
+    The preflight compares the registration's device digests byte for byte, so
+    the live values have to come from the *same* collection code (`acceptance
+    collect`) rather than a second implementation of the same idea.
+    """
+    from .collect import FactsError, collect_facts
+
     scratch = Path(scratch_path) if scratch_path is not None else Path(config_path).parent
-    return {
-        "machine_id_sha256": hashlib.sha256(machine_id.read_bytes().strip()).hexdigest(),
-        "architecture": platform.machine(),
-        "device_tree_sha256": _device_tree_sha256(),
-        "mem_total_bytes": int(found.group(1)) * 1024,
-        "kernel_release": platform.release(),
-        "model_disk_uuid": _mount_uuid(model_directory),
-        "scratch_disk_uuid": _mount_uuid(scratch),
-    }
-
-
-def _device_tree_sha256() -> str:
-    root = Path("/proc/device-tree")
-    if not root.is_dir():
-        raise PortError("/proc/device-tree is not present")
-    digest = hashlib.sha256()
-    for path in sorted(entry for entry in root.rglob("*") if entry.is_file()):
-        digest.update(str(path.relative_to(root)).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _mount_uuid(path: Path) -> str:
-    code, stdout = _run(["findmnt", "-no", "UUID", "--target", str(path)])
-    uuid = stdout.strip().splitlines()[0].strip() if stdout.strip() else ""
-    if code != 0 or not uuid:
-        raise PortError(f"no filesystem UUID is readable for {path}")
-    return uuid
+    try:
+        facts = collect_facts(model_disk=str(model_directory), scratch_disk=str(scratch))
+    except FactsError as exc:
+        raise PortError(f"the live site facts cannot be collected: {exc}") from exc
+    return dict(facts.document()["device"])
 
 
 def _filesystem_of(path: Path) -> str:
