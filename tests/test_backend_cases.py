@@ -420,8 +420,8 @@ def test_fixture_material_carries_size_and_hash(tmp_path) -> None:
     assert entry["fixture_id"] == "qwen-small-chat" and entry["capabilities"] == ["chat"]
 
 
-def test_the_run_command_validates_layers_and_refuses_undelivered_ones(tmp_path, capsys) -> None:
-    from model_scheduler.acceptance import EXIT_FAILED, EXIT_INPUT
+def test_the_run_command_validates_layers_and_refuses_a_missing_candidate(tmp_path, capsys) -> None:
+    from model_scheduler.acceptance import EXIT_INPUT
     from model_scheduler.acceptance.__main__ import main
 
     root = str(tmp_path / "fixtures")
@@ -430,21 +430,14 @@ def test_the_run_command_validates_layers_and_refuses_undelivered_ones(tmp_path,
     assert main(["run", "--candidate", "c.json", "--layers", "B,B", "--output", str(tmp_path / "a"),
                  "--fixtures-root", root]) == EXIT_INPUT
 
-    # the O layer has no orchestration yet: an undelivered layer must not be executed, even partly
-    code = main(["run", "--candidate", "c.json", "--layers", "O", "--output", str(tmp_path / "b"),
-                 "--fixtures-root", root])
+    # every layer is wired now; a candidate that cannot be read is refused before any of them runs
+    for layers in ("O", "S,B", "S,B,O"):
+        code = main(["run", "--candidate", "c.json", "--layers", layers,
+                     "--output", str(tmp_path / layers.replace(",", "")), "--fixtures-root", root])
 
-    assert code == EXIT_FAILED
-    assert "no orchestration yet" in capsys.readouterr().err
-    assert not (tmp_path / "b" / "report.json").exists()
-
-    # a candidate that cannot be read is refused before any layer is touched
-    code = main(["run", "--candidate", "c.json", "--layers", "S,B", "--output", str(tmp_path / "c"),
-                 "--fixtures-root", root])
-
-    assert code == EXIT_INPUT
-    assert "c.json" in capsys.readouterr().err
-    assert not (tmp_path / "c" / "report.json").exists()
+        assert code == EXIT_INPUT
+        assert "c.json" in capsys.readouterr().err
+        assert not (tmp_path / layers.replace(",", "") / "report.json").exists()
 
 
 def test_a_model_without_a_usable_capability_is_refused() -> None:

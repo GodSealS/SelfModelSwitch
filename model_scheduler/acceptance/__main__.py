@@ -120,17 +120,13 @@ def _run(args) -> int:
     if len(set(layers)) != len(layers):
         raise InputError(f"--layers repeats a layer: {args.layers!r}")
     require_fresh_output(args.output / "report.json")
-    if "O" in layers:
-        # No partial run is written: an unexecuted layer must not be claimed.
-        print("run: layer(s) ['O'] have no orchestration yet (the O operational cases are not delivered): "
-              "refusing before anything is executed", file=sys.stderr)
-        return EXIT_FAILED
     from .runner import LayerError, run_layers
 
     try:
         summary = run_layers(candidate_path=args.candidate, layers=layers, output=args.output,
                              fixtures_root=args.fixtures_root, inventory=args.inventory,
-                             legacy_config=args.legacy_config)
+                             legacy_config=args.legacy_config, config_path=args.config,
+                             inference_url=args.inference_url, service_log=args.service_log)
     except LayerError as exc:
         print(f"run: {exc}", file=sys.stderr)
         return exc.exit_code
@@ -217,6 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
                                  "facts the candidate does not carry, and they are never guessed")
     run_parser.add_argument("--legacy-config", type=Path,
                             help="S01: the schema-v1 configuration the migration is exercised against")
+    run_parser.add_argument("--config", type=Path,
+                            help="O layer: the deployment's schema-v2 configuration (site paths for the preflight)")
+    run_parser.add_argument("--inference-url",
+                            help="O01: the compat surface base URL (e.g. http://127.0.0.1:8090)")
+    run_parser.add_argument("--service-log", type=Path,
+                            help="O01: the service log the unexpected-500 count is read from")
 
     candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
     candidate_parser.add_argument("--config", type=Path, required=True)

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import atexit
+from dataclasses import asdict
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -57,9 +59,11 @@ FIXTURE_MATERIAL_NAME = "fillers.json"
 FIXTURE_MATERIAL_KEYS = frozenset({"schema_version", "fillers"})
 FILLER_ENTRY_KEYS = frozenset({"model_id", "tokens_per_unit", "template_overhead_tokens",
                                "vision_template_overhead_tokens", "instruction", "instruction_tokens", "unit"})
-LAYERS = ("S", "B")
+LAYERS = ("S", "B", "O")
 EXIT_INPUT = 2
 EXIT_FAILED = 3
+# O02's scratch fault runs on a dedicated small-quota filesystem, never the root disk.
+SCRATCH_FAULT_BYTES = 64 * 1024 ** 2
 
 
 class LayerError(RuntimeError):
@@ -173,7 +177,11 @@ def run_layers(*, candidate_path: Path, layers: Sequence[str], output: Path, fix
                instance_probe: Callable[[str], Mapping[str, Any] | None] | None = None,
                software_runner: Callable[..., Any] | None = None,
                check_config: Callable[[Path], int] | None = None,
-               filler_of: Mapping[str, Any] | None = None) -> dict:
+               filler_of: Mapping[str, Any] | None = None,
+               config_path: Path | None = None, inference_url: str | None = None,
+               service_log: Path | None = None, ports: Mapping[str, Any] | None = None,
+               operational_driver: Any = None, final_state_probe: Any = None,
+               deployment_boot_id: str | None = None) -> dict:
     """Execute the requested layers against one frozen candidate and persist the run."""
     requested = _requested_layers(layers)
     candidate = _load_candidate(candidate_path)
@@ -193,6 +201,13 @@ def run_layers(*, candidate_path: Path, layers: Sequence[str], output: Path, fix
             executor=executor, driver=driver, sampler_factory=sampler_factory, instance_probe=instance_probe,
             fixtures_root=fixtures_root, filler_of=filler_of)
         records.extend((item, deployment_boot) for item in b_attempts)
+    if "O" in requested:
+        o_attempts, operations_boot = run_o_layer(
+            candidate=candidate, candidate_path=Path(candidate_path), store=store, output=Path(output),
+            config_path=config_path, inference_url=inference_url, service_log=service_log, ports=ports,
+            workload_driver=operational_driver, final_state_probe=final_state_probe,
+            deployment_boot_id=deployment_boot_id)
+        records.extend((item, operations_boot) for item in o_attempts)
     if not records:
         raise LayerError("no layer produced any case attempt", exit_code=EXIT_FAILED)
 
@@ -312,6 +327,135 @@ def run_b_layer(*, candidate_path: Path, output: Path, socket_path: str | None =
                       socket_path=socket_path, transport=transport, executor=executor, driver=driver,
                       run_id=run_id, sampler_factory=sampler_factory, instance_probe=instance_probe,
                       filler_of=filler_of)
+
+
+def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStore, output: Path,
+                config_path: Path | None = None, inference_url: str | None = None,
+                service_log: Path | None = None, ports: Mapping[str, Any] | None = None,
+                workload_driver: Any = None, final_state_probe: Any = None,
+                deployment_boot_id: str | None = None,
+                clock: Callable[[], float] | None = None,
+                wait: Callable[[float], None] | None = None) -> tuple[list[Any], str]:
+    """O01—O06 through the injected ports; an unwired port yields `not_run`.
+
+    O01 needs the compat surface and the end-state probe, O05 the live site
+    facts; the remaining ports are supplied by whoever wires the faults. A case
+    whose port is missing never becomes a pass — it is `not_run` with the
+    missing condition recorded as its problem.
+    """
+    from . import operational_cases as oc
+    from .operational_ports import (FinalStateProbe, HttpWorkloadDriver, NotWiredPort, read_boot_id)
+
+    wired = dict(ports or {})
+    policy = _operational_policy(candidate)
+    results: list[Any] = []
+
+    # -- O01: the mixed workload and the end state it must end on ----------
+    store.begin_case("O01", attempt=1)
+    result = None
+    plan = None
+    if policy is None:
+        result = oc.CaseResult(case_id="O01", status="not_run", facts={},
+                               problems=("no operational policy: the run would have no thresholds to meet",))
+    else:
+        try:
+            plan = oc.build_o01_plan(models=[model.model_id for model in candidate.models],
+                                     duration_seconds=float(policy["duration_seconds"]),
+                                     requests=int(policy["arrival_requests"]))
+        except Exception as exc:  # noqa: BLE001 - a policy that cannot plan is a failed case, not a crash
+            plan = None
+            result = oc.CaseResult(case_id="O01", status="failed", facts={},
+                                   problems=(f"the frozen operational policy cannot build a plan that meets the "
+                                             f"acceptance bounds: {exc}",))
+    if plan is not None:
+        workload = workload_driver
+        if workload is None and inference_url:
+            workload = HttpWorkloadDriver(inference_url)
+        probe = final_state_probe
+        if probe is None and inference_url:
+            probe = FinalStateProbe(inference_url, candidate.deployment_id, log_path=service_log)
+        if workload is None or probe is None:
+            missing = "--inference-url (the compat surface)" if workload is None else "the end-state probe"
+            result = oc.CaseResult(case_id="O01", status="not_run", facts={"plan": plan.document()},
+                                   problems=(f"O01 is not wired: {missing} is missing, so neither the workload "
+                                             "nor its end state can be measured",))
+        else:
+            probe.baseline()
+            result = oc.run_o01(plan=plan, driver=workload, policy=policy,
+                                final_state=probe.mapping(), collector=store, clock=clock, wait=wait)
+    document = dict(result.facts)
+    if policy is not None:
+        document["policy"] = dict(policy)
+    metrics = document.get("metrics")
+    if isinstance(metrics, Mapping) and isinstance(metrics.get("final_state"), Mapping):
+        document["final_state"] = dict(metrics["final_state"])
+    store.end_case(status=result.status, facts=document, problems=result.problems,
+                   failure="; ".join(result.failures) or None)
+    results.append(result)
+
+    # -- O02 — O06: the fault, recovery, preflight and release ports -------
+    disk = wired.get("disk") or NotWiredPort(
+        "the deployment-private storage fault port is not wired (O02 needs a private mount namespace "
+        "so the model disk can fail without touching the machine)")
+    results.append(_record_o(store, oc.run_o02(disk, deployment_id=candidate.deployment_id,
+                                               quota_bytes=SCRATCH_FAULT_BYTES)))
+    fault = wired.get("fault") or NotWiredPort(
+        "the Docker fault port is not wired (O03 needs Docker to become unreachable for this deployment only)")
+    results.append(_record_o(store, oc.run_o03(fault, model_id=candidate.models[0].model_id)))
+    recovery = wired.get("recovery") or NotWiredPort(
+        "the restart port is not wired (O04 needs the deployment's stop/start control)")
+    results.append(_record_o(store, oc.run_o04(recovery)))
+    preflight = wired.get("preflight") or _preflight_from_site(
+        candidate=candidate, candidate_path=candidate_path, config_path=config_path)
+    if preflight is None:
+        results.append(_record_o(store, oc.run_o05(
+            NotWiredPort("the preflight port is not wired (O05 needs --config for the live site facts)"),
+            candidate=json.loads(Path(candidate_path).read_text(encoding="utf-8")), evidence={})))
+    else:
+        candidate_document = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
+        evidence = {"started_at": datetime.now(timezone.utc).isoformat()}
+        results.append(_record_o(store, oc.run_o05(preflight, candidate=candidate_document, evidence=evidence)))
+    lab_release = wired.get("lab_release") or NotWiredPort(
+        "the lab release port is not wired (O06 needs the release switch and the blob-metadata backup)")
+    results.append(_record_o(store, oc.run_o06(lab_release)))
+
+    boot = deployment_boot_id or (read_boot_id(inference_url) if inference_url else None) or \
+        f"operations-{uuid4().hex}"
+    return results, boot
+
+
+def _record_o(store: CaseMaterialStore, result: Any) -> Any:
+    """O02—O06 material: the collected facts under `observations`, as the evaluator reads them."""
+    store.begin_case(result.case_id, attempt=1)
+    store.end_case(status=result.status, facts={"observations": dict(result.facts)},
+                   problems=result.problems, failure="; ".join(result.failures) or None)
+    return result
+
+
+def _operational_policy(candidate: Any) -> Mapping[str, Any] | None:
+    operational = getattr(getattr(candidate, "policy", None), "operational", None)
+    if operational is None:
+        return None
+    try:
+        return asdict(operational)
+    except TypeError:
+        return dict(operational) if isinstance(operational, Mapping) else None
+
+
+def _preflight_from_site(*, candidate: Any, candidate_path: Path, config_path: Path | None) -> Any:
+    """O05's port over the live site; without a configuration there is no site to read."""
+    if config_path is None:
+        return None
+    from ..config import load_config
+    from .operational_ports import PreflightPrimitivePort, read_site_facts, tamper_scenarios
+
+    config = load_config(Path(config_path))
+    site = read_site_facts(candidate=candidate, config_path=Path(config_path),
+                           model_directory=Path(config.storage.model_directory),
+                           source_archive_sha256=candidate.source_archive_sha256,
+                           scratch_path=Path(config.blobs.root))
+    document = json.loads(Path(candidate_path).read_text(encoding="utf-8"))
+    return PreflightPrimitivePort(site=site, tamper=tamper_scenarios(document))
 
 
 def _requested_layers(layers: Sequence[str]) -> tuple[str, ...]:
