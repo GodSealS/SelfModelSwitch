@@ -1625,3 +1625,51 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. **站点配置修复**：`mount_path` 改为真实挂载点、`model_directory` 改为其直接子目录、资产路径带上模型子目录、去掉盘上不存在的 `embedding` 登记（或补齐其资产）。
 3. **O03/O04/O06 端口**：Docker socket 故障、服务重启/残留/旧 token/再准入、release 演练与 blob 元数据备份恢复。
 4. **O01 重跑**需要：可服务的兼容面（第 1 项）+ 30 分钟窗口 + 输出目录全程不动。
+
+## P30 补记三（2026-09-20，lab 站点修正 + S/B/O 三层同候选真机执行）
+
+范围：修正 lab 站点配置并重启部署，验证冷启动修复，然后对**同一候选**跑完 S/B/O 三层并离线复核。
+
+### 1. 任务判定
+
+| 项 | 值 |
+|---|---|
+| task_id | P30（第三轮；AC 仍未全勾：O03/O04/O06 端口未接线） |
+| status | **blocked**（S 6/6、B 12/12、O01/O02/O05 真机通过；O03/O04/O06 `not_run`，故离线 verify exit 3） |
+| source_commit / target_commit | `0bd62981bac90071f9430d5fe090927f4ebbe891`（两端一致，目标树前后为空） |
+| candidate_sha256 | `35c4af598332faaf2293614cc52e81e7622b781df60ee4a63c8307dbf5ddd35c`（`candidate-o3.json`） |
+| python_version | 3.13.5（开发机）/ 3.12.14（目标 lab venv） |
+| evidence_directory | `/home/jtzn/self-model-switch-evidence/p30-lab-20260920T075614Z/{scheduler-v2-lab.yaml, facts.json, source-b.tar.gz, candidate-o3.json, run-o3, run-s-o3, run-b-o3, final-o3, run.log}` |
+
+### 2. 站点修正与冷启动复验
+
+| 动作 | exit | 结果 |
+|---|---|---|
+| 旧 lab `run.py` SIGTERM | 0 | 2 s 退出；8090/10002 无监听；无残留容器 |
+| 修正配置（`mount_path=/media/jtzn/sandisk-ext4`、`model_directory=/media/jtzn/sandisk-ext4/models`、资产带 `qwen25vl-7b-q4/`、去掉盘上不存在的 `embedding` 登记） | 0 | `run.py --check-config` → `schema_version=2 models=qwen-small` |
+| 重启 lab（同 `SELFMODEL_SWITCH_DEPLOYMENT_ID`/`SWAP_CONTROL_URL`） | 0 | 8090 与控制 socket 可用 |
+| **冷启动 chat（无 preload）** | **200** | 模型 `unloaded` → 一次请求 warm+加载 → 11 s 返回真实回答 `"Ready"`；`/api/status` 转 `ready`（此前是永久 503） |
+
+### 3. 三层真机结果（同一候选 `35c4af59…`）
+
+| 层 | 命令 | exit | 结果 |
+|---|---|---|---|
+| S | `run --layers S --inventory …/inventory.json --legacy-config config.yaml` | 0 | **6/6 passed**（S01—S06） |
+| B | `run --layers B --fixtures-root …/p22`（`SMS_CONTROL_SOCKET=…`） | 0 | **12/12 passed**（8 个 case：`load/infer/envelope/cancel/stop/reload/cap:chat/cap:vision`） |
+| O | `run --layers O --config … --inference-url http://127.0.0.1:8090 --service-log …` | 0 | `report.json` 写出；O01/O02/O05 **passed**，O03/O04/O06 `not_run` |
+
+- **O01**：120/120 请求、`error_rate=0.0`、p95 0.439 s、p99 0.453 s、发送偏差最大 0.701 ms；结尾八项全 0，并带停止证据 `released=["qwen-small"]`、`stopped=true`、`waited_seconds=1.611`。
+- **O02**：私有命名空间遮蔽模型盘（基线真 hash + 恢复重 hash）、专用 tmpfs 配额写满、`root_disk_writes=0`、宿主挂载与文件未受影响。
+- **O05**：正确候选接受；四种篡改场景全部在 load 之前被拒。
+- **合并与离线复核**：`merge` → 20 case / 24 attempt；`verify` **exit 3**，且问题**恰好**是 `O03/O04/O06 "the attempt exited with 1"`（未接线 → 复算拒绝），其余全部由原始材料复算为 passed。
+
+### 4. 本轮修掉的两个编排缺陷（`0bd6298`）
+
+1. 报告写不出来：O 层返回 `CaseResult`，而报告装配要 `attempt/started_utc/ended_utc` → `AttributeError` → 无 `report.json`（与上一轮"无报告"症状相同，这次定位到真实代码缺陷）。现在 O 层结果带 attempt 身份与起止时间，并有用例断言报告可被 v3 契约复读。
+2. O01 结尾无法为零：代理 `ttl=0` 不会自己退出。现在运行**主动申请释放**（`POST /api/models/{id}/unload`）并轮询证明已停止后才读零容忍终态；释放失败/超时/仍运行均记为失败，绝不假定 0。
+
+### 5. 未执行 / 未解决
+
+1. **O03（Docker 通道不可达 / 陌生实例 / stop 超时）、O04（重启残留 / 旧 token / 再准入）、O06（优雅停机 / 日志 / 备份恢复 / 回滚）的真实端口**——三者通过前 P30 的 AC 不能勾，离线 verify 只能是 exit 3。
+2. **第二个真实模型**：M07 切换压力要求 ≥2 个模型；盘上只有 `qwen-small` 有可用资产（`embedding` 无资产文件）。
+3. 目标机 `origin` 仍指向本地裸仓 `/home/jtzn/git/SelfModelSwitch.git`（P14/P17 遗留拓扑问题）。

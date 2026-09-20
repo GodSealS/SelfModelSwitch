@@ -1575,6 +1575,14 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 - **O01 冷启动死锁（已修，待复验）**：新增 `ModelScheduler.warm(model_id, deadline)`（复用 `_preload_one`，不给用户租约，加载不是 dispatch）；chat 路由计数失败时先 warm 再计数，仍失败才 503；422 的真实超限路径完全不变。
 - **本轮未做**：lab 服务重启（破坏性现场动作，需授权）、O01/O05 重跑、O03/O04/O06 真实端口；站点配置修正。
 
+**第三轮执行记录（2026-09-20，站点修正 + S/B/O 同候选真机执行）:** status=blocked（S/B/O01/O02/O05 真机通过；O03/O04/O06 未接线，离线 verify exit 3）；提交 `0bd6298`（O 层进报告 + O01 结尾证明释放）；两端 `0bd6298…`，目标树前后为空；候选 `35c4af59…`。
+
+- lab 站点修正并重启（授权后）：旧服务 SIGTERM 2 s 退出、端口释放、无残留容器；`mount_path` 改为真实挂载点、`model_directory` 改为其直接子目录、资产带 `qwen25vl-7b-q4/`、去掉盘上不存在的 `embedding` 登记；`--check-config` 通过。
+- **冷启动修复真机复验**：无 preload 的部署，模型 `unloaded` 时一次 chat 请求 11 s 内 warm+加载并返回真实回答，`/api/status` 转 `ready`（此前 120/120 全部 503）。
+- 三层同候选：`run --layers S` **6/6 passed**；`run --layers B` **12/12 passed**（含 `cap:vision`）；`run --layers O` 写出 `report.json`，**O01 passed**（120/120、`error_rate=0`、p95 0.439 s、p99 0.453 s、偏差 0.701 ms、结尾八项全 0 且带 `released/stopped` 证据）、O02 passed、O05 passed、O03/O04/O06 `not_run`。
+- `merge` → 20 case / 24 attempt；`verify` **exit 3**，问题恰好是 O03/O04/O06（未接线 → 复算拒绝），其余全部由原始材料复算为 passed——不因缺测而宣称通过。
+- **本轮未做**：O03/O04/O06 真实端口；第二个真实模型（盘上只有 `qwen-small` 有资产）。
+
 ### P31 — 发布包现场preflight与安装验收（M07）
 
 **Primary owner:** backend；**Dependencies:** P30；**Estimated scope:** M。
