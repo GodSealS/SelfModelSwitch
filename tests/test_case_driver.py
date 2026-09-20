@@ -414,6 +414,22 @@ def test_device_activity_is_derived_from_raw_rows_never_from_a_boolean() -> None
     assert executed["samples"] == rows
 
 
+def test_a_short_action_still_gets_its_sampling_window() -> None:
+    """A cancel returns instantly; the window is held open so raw rows still exist."""
+    transport = _Transport()
+    rows = ({"kind": "tegrastats", "raw": "RAM 1/32000MB GR3D_FREQ 0%"},)
+    sampler = _Sampler(rows)
+    slept: list[float] = []
+    driver = ControlApiCaseDriver(transport, sleep=slept.append, sampler_factory=lambda: sampler)
+    driver.load("qwen-small", cold=True)
+
+    stopped = driver.stop("qwen-small")
+
+    assert stopped["samples"] == rows
+    assert any(seconds > 0 for seconds in slept)  # the window outlives the action itself
+    assert sampler.started and sampler.stopped
+
+
 def test_a_load_is_attributed_to_the_deployment_and_the_instance_it_created() -> None:
     """A load case needs both: who served it, and which container really serves the model."""
     observed = {"container_id": "abc", "runtime_id": "llama-cpp-1"}

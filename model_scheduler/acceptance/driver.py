@@ -27,6 +27,9 @@ from .collector import derive_attribution
 EXECUTION_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 DEFAULT_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.2
+# The sampler emits at this interval; a case action that returns faster than one
+# interval would otherwise leave no raw row behind at all.
+MIN_SAMPLING_WINDOW_SECONDS = 0.25
 
 
 class DriverError(RuntimeError):
@@ -382,16 +385,24 @@ class ControlApiCaseDriver:
 
         Every case must leave raw rows behind: the evaluator refuses to attribute
         a case without its own `samples/`, so a load, stop or cancel round is
-        sampled exactly like an execution is. The instance identity is read
-        read-only and only used to attach the container's process maps.
+        sampled exactly like an execution is. A cancel can return in microseconds
+        while tegrastats emits every 100 ms, so the window is held open for at
+        least one interval — an empty window would make the case unattributable
+        for a reason that is not the model's.
         """
         sampler = None if self.sampler_factory is None else self.sampler_factory()
+        started = time.monotonic()
         if sampler is not None:
             sampler.start(instance=self._observed_instance(model_id))
         try:
             result = dict(action() or {})
         finally:
-            rows = () if sampler is None else tuple(sampler.stop())
+            rows: tuple = ()
+            if sampler is not None:
+                remaining = MIN_SAMPLING_WINDOW_SECONDS - (time.monotonic() - started)
+                if remaining > 0:
+                    self.sleep(remaining)
+                rows = tuple(sampler.stop())
         if rows:
             result["samples"] = rows
         return result
