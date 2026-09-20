@@ -377,6 +377,168 @@ class NamespaceDiskFaultPort:
 
 
 # ---------------------------------------------------------------------------
+# O03: the Docker channel fails, a stranger shows up, and a stop runs out of time
+
+
+def _managed_prefix(deployment_id: str) -> str:
+    return f"sms-{deployment_id}-"
+
+
+def _foreign_containers(deployment_id: str, *, runner: Callable[..., tuple[int, str]] | None = None) -> list[str]:
+    """Containers that are not this deployment's, so a fault can prove it left them alone."""
+    execute = runner or _run
+    code, stdout = execute(["docker", "ps", "--format", "{{.Names}}"], timeout=DOCKER_TIMEOUT_SECONDS)
+    if code != 0:
+        raise PortError("the container listing is not readable, so collateral damage cannot be ruled out")
+    prefix = _managed_prefix(deployment_id)
+    return sorted(name.strip() for name in stdout.splitlines()
+                  if name.strip() and not name.strip().startswith(prefix))
+
+
+def _http_status(base_url: str, path: str, *, timeout: float = 30.0) -> int:
+    try:
+        return httpx.get(base_url.rstrip("/") + path, timeout=timeout).status_code
+    except Exception as exc:  # noqa: BLE001 - an unreachable surface is the fact, not a crash
+        raise PortError(f"cannot read {path}: {type(exc).__name__}: {exc}") from exc
+
+
+@dataclass
+class DockerFaultPort:
+    """O03's three faults against the live deployment, each undone in the same step.
+
+    Every judgement is read from the machine or the service itself:
+
+    * the channel goes down by stopping the Docker socket — containers already
+      running are untouched, and the listing before and after is what proves it;
+    * the stranger carries this deployment's label with a model nobody registered,
+      which is exactly what the observer cannot attribute;
+    * the stalled stop is a container under this deployment's own identity that
+      ignores SIGTERM, so the deployment's stop has to run out of time.
+
+    Nothing here assumes the outcome: if the service stays 200 or releases its
+    budget, the case records that, and that is a finding and not a pass.
+    """
+
+    deployment_id: str
+    base_url: str
+    model_id: str
+    image: str
+    timeout_seconds: float = 180.0
+    poll_seconds: float = 2.0
+    runner: Callable[..., tuple[int, str]] | None = None
+    post: Callable[..., Any] = field(default=httpx.post)
+    clock: Callable[[], float] = field(default=time.monotonic)
+    wait: Callable[[float], None] = field(default=time.sleep)
+
+    def _run(self, argv: Sequence[str], *, timeout: float | None = None) -> tuple[int, str]:
+        return (self.runner or _run)(list(argv), timeout=timeout or self.timeout_seconds)
+
+    def _docker_works(self) -> bool:
+        code, _stdout = self._run(["docker", "ps"], timeout=30.0)
+        return code == 0
+
+    def _listed(self) -> list[str]:
+        code, stdout = self._run(["docker", "ps", "--format", "{{.Names}}"], timeout=30.0)
+        if code != 0:
+            return []
+        return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+    def _status(self) -> dict:
+        return _get_json(self.base_url, "/api/status", timeout=30.0)
+
+    def _model(self) -> Mapping[str, Any]:
+        models = self._status().get("models")
+        if not isinstance(models, Mapping) or self.model_id not in models:
+            raise PortError(f"the service does not report model {self.model_id!r}")
+        entry = models[self.model_id]
+        return entry if isinstance(entry, Mapping) else {}
+
+    def _budget_kept(self, model: Mapping[str, Any]) -> bool:
+        """A stop that never proved leaves the booking in place; only a proven stop clears it."""
+        return model.get("state") != "unloaded"
+
+    def make_docker_unreachable(self) -> Mapping[str, Any]:
+        before = _foreign_containers(self.deployment_id, runner=self.runner)
+        code, stdout = self._run(["sudo", "systemctl", "stop", "docker.socket"], timeout=60.0)
+        if code != 0:
+            raise PortError(f"the Docker socket could not be stopped: {stdout.strip()}")
+        unreachable = not self._docker_works()
+        health = _http_status(self.base_url, "/health")
+        model = self._model()
+        restore_code, restore_output = self._run(["sudo", "systemctl", "start", "docker.socket"], timeout=60.0)
+        if restore_code != 0:
+            raise PortError(f"the Docker socket could not be started again: {restore_output.strip()}")
+        restored = self._docker_works()
+        # Only with the channel back can the neighbours be compared: an unreadable
+        # listing is not evidence that they survived.
+        after = _foreign_containers(self.deployment_id, runner=self.runner)
+        return {"available": True, "docker_unreachable": unreachable, "docker_restored": restored,
+                "health_status": health, "budget_kept": self._budget_kept(model),
+                "other_containers_untouched": before == after, "model_state": model.get("state"),
+                "model_last_error": model.get("last_error"),
+                "readiness_reason": self._status().get("readiness_reason"),
+                "foreign_containers": after}
+
+    def present_unknown_instance(self) -> Mapping[str, Any]:
+        name = f"{_managed_prefix(self.deployment_id)}ghost"
+        before = _foreign_containers(self.deployment_id, runner=self.runner)
+        code, stdout = self._run(["docker", "run", "-d", "--name", name,
+                                  "--label", f"{DEPLOYMENT_LABEL}={self.deployment_id}",
+                                  "--label", "io.self-model-switch.model=ghost",
+                                  self.image, "sleep", "600"])
+        if code != 0:
+            raise PortError(f"the stranger container could not be started: {stdout.strip()}")
+        try:
+            health = _http_status(self.base_url, "/health")
+            status = self._status()
+            after = _foreign_containers(self.deployment_id, runner=self.runner)
+            # It runs under this deployment's label, and the service still does not
+            # serve it: an instance the deployment cannot own, not one it adopted.
+            stranger_running = name in self._listed()
+            unknown_recorded = stranger_running and "ghost" not in (status.get("models") or {})
+            return {"available": True, "unknown_recorded": unknown_recorded, "health_status": health,
+                    "other_containers_untouched": before == after, "stranger": name,
+                    "stranger_running": stranger_running,
+                    "readiness_reason": status.get("readiness_reason"), "foreign_containers": after}
+        finally:
+            self._run(["docker", "rm", "-f", name], timeout=60.0)
+
+    def stall_stop(self, model_id: str) -> Mapping[str, Any]:
+        name = f"{_managed_prefix(self.deployment_id)}{model_id}"
+        self._run(["docker", "rm", "-f", name], timeout=60.0)
+        stall_note = ""
+        code, stdout = self._run(["docker", "run", "-d", "--name", name,
+                                  "--label", f"{DEPLOYMENT_LABEL}={self.deployment_id}",
+                                  "--label", f"io.self-model-switch.model={model_id}",
+                                  "--entrypoint", "sh", self.image, "-c", "trap '' TERM; sleep 600"])
+        if code != 0:
+            raise PortError(f"the stalled container could not be started: {stdout.strip()}")
+        try:
+            try:
+                answer = self.post(self.base_url.rstrip("/") + f"/api/models/{model_id}/unload", timeout=60.0)
+                unload_code = int(getattr(answer, "status_code", 0))
+            except Exception as exc:  # noqa: BLE001 - a refused unload is the fact being measured
+                unload_code = -1
+                stall_note = f"{type(exc).__name__}: {exc}"
+            deadline = self.clock() + self.timeout_seconds
+            model: Mapping[str, Any] = {}
+            while True:
+                model = self._model()
+                if str(model.get("last_error") or "").startswith("stop_unverified"):
+                    break
+                if model.get("admission_blocked") is True or self.clock() >= deadline:
+                    break
+                self.wait(self.poll_seconds)
+            health = _http_status(self.base_url, "/health")
+            return {"available": True, "stop_timeout_recorded": model.get("last_error") == "stop_unverified",
+                    "budget_kept": self._budget_kept(model), "health_status": health, "unload_status": unload_code,
+                    "model_state": model.get("state"), "model_last_error": model.get("last_error"),
+                    "stalled_container": name, "note": stall_note or None}
+        finally:
+            self._run(["docker", "rm", "-f", name], timeout=60.0)
+
+
+# ---------------------------------------------------------------------------
 # O05: the P26 preflight primitive plus the tamper scenarios
 
 

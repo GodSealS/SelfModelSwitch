@@ -14,6 +14,7 @@ import pytest
 
 from model_scheduler.acceptance import o02_probe
 from model_scheduler.acceptance import operational_cases as oc
+from model_scheduler.acceptance import operational_ports as op
 from model_scheduler.acceptance.operational_ports import NamespaceDiskFaultPort, PortError
 
 HEALTHY = {
@@ -151,6 +152,88 @@ def test_a_non_object_answer_is_refused() -> None:
 
     with pytest.raises(PortError):
         port.fail_model_disk()
+
+
+def test_o03_reads_what_the_machine_and_the_service_really_say() -> None:
+    """The fault, the health and the untouched neighbours are all measured, never assumed."""
+    calls: list[list[str]] = []
+    running = ["sms-sms-orin-lab-qwen-small", "postgres"]
+    down: list[bool] = []
+
+    def runner(argv, *, timeout=None):
+        calls.append(list(argv))
+        if argv[:3] == ["sudo", "systemctl", "stop"]:
+            down.append(True)
+            return 0, ""
+        if argv[:3] == ["sudo", "systemctl", "start"]:
+            down.clear()
+            return 0, ""
+        if argv[:2] == ["docker", "ps"]:
+            return (1, "cannot connect to the docker daemon") if down else (0, "\n".join(running))
+        if argv[:2] == ["docker", "run"]:
+            running.append(argv[argv.index("--name") + 1])
+            return 0, "container-id"
+        if argv[:2] == ["docker", "rm"]:
+            name = argv[-1]
+            if name in running:
+                running.remove(name)
+            return 0, name
+        return 1, "unexpected"
+
+    ticks = {"now": 0.0}
+
+    def clock() -> float:
+        ticks["now"] += 1000.0  # every poll of the stalled stop jumps past its deadline
+        return ticks["now"]
+
+    port = op.DockerFaultPort(deployment_id="sms-orin-lab", base_url="http://127.0.0.1:8090",
+                              model_id="qwen-small", image="sms-llama-cpp@sha256:" + "8" * 64,
+                              runner=runner, post=lambda *a, **k: _Posted(200),
+                              clock=clock, wait=lambda seconds: None)
+
+    def statuses(url, **kwargs):
+        return _Posted(503 if url.endswith("/health") else 200,
+                       {"models": {"qwen-small": {"state": "ready", "last_error": None}},
+                        "readiness_reason": None})
+
+    import model_scheduler.acceptance.operational_ports as ports_module
+
+    original = ports_module.httpx
+    try:
+        ports_module.httpx = type("httpx", (), {"get": staticmethod(statuses), "post": staticmethod(statuses)})
+        unreachable = port.make_docker_unreachable()
+        stranger = port.present_unknown_instance()
+        stalled = port.stall_stop("qwen-small")
+    finally:
+        ports_module.httpx = original
+
+    assert unreachable["docker_unreachable"] is True and unreachable["docker_restored"] is True
+    assert unreachable["health_status"] == 503 and unreachable["budget_kept"] is True
+    assert unreachable["other_containers_untouched"] is True
+    assert unreachable["foreign_containers"] == ["postgres"]  # a neighbour that must survive
+    assert stranger["unknown_recorded"] is True and stranger["stranger_running"] is True
+    assert stranger["foreign_containers"] == ["postgres"]
+    assert stalled["stop_timeout_recorded"] is False  # it never proved: the service said "ready"
+    assert stalled["budget_kept"] is True
+    assert any(argv[:2] == ["docker", "rm"] for argv in calls)  # the strangers are cleaned up
+
+
+class _Posted:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_o03_refuses_a_fault_it_cannot_stage() -> None:
+    port = op.DockerFaultPort(deployment_id="sms-orin-lab", base_url="http://127.0.0.1:8090",
+                              model_id="qwen-small", image="sms-llama-cpp@sha256:" + "8" * 64,
+                              runner=lambda argv, *, timeout=None: (1, "permission denied"))
+
+    with pytest.raises(op.PortError, match="container listing is not readable"):
+        port.make_docker_unreachable()
 
 
 def test_the_probe_reports_every_refusal_as_a_line(monkeypatch: pytest.MonkeyPatch) -> None:

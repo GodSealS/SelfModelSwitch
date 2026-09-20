@@ -411,7 +411,8 @@ def run_o_layer(*, candidate: Any, candidate_path: Path, store: CaseMaterialStor
     finally:
         if hasattr(disk, "close"):
             disk.close()
-    fault = wired.get("fault") or NotWiredPort(
+    fault = wired.get("fault") or _docker_fault_port(candidate=candidate, config_path=config_path,
+                                                     inference_url=inference_url) or NotWiredPort(
         "the Docker fault port is not wired (O03 needs Docker to become unreachable for this deployment only)")
     results.append(_record_o(store, oc.run_o03(fault, model_id=candidate.models[0].model_id)))
     recovery = wired.get("recovery") or NotWiredPort(
@@ -503,6 +504,20 @@ def _namespace_disk_port(config_path: Path | None) -> Any:
     config = load_config(Path(config_path))
     directory = Path(config.storage.model_directory)
     return NamespaceDiskFaultPort(config_path=Path(config_path), filesystem=_filesystem_of(directory))
+
+
+def _docker_fault_port(*, candidate: Any, config_path: Path | None, inference_url: str | None) -> Any:
+    """O03's port over the live machine; without the compat surface there is nothing to fault."""
+    if config_path is None or not inference_url:
+        return None
+    from .operational_ports import DockerFaultPort
+
+    image = next((runtime.image_digest for runtime in candidate.runtimes
+                  if getattr(runtime, "image_digest", None)), None)
+    if image is None or not candidate.models:
+        return None
+    return DockerFaultPort(deployment_id=candidate.deployment_id, base_url=inference_url,
+                           model_id=candidate.models[0].model_id, image=image)
 
 
 def _preflight_from_site(*, candidate: Any, candidate_path: Path, config_path: Path | None) -> Any:
