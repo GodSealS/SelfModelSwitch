@@ -457,8 +457,32 @@ class DockerFaultPort:
         """A stop that never proved leaves the booking in place; only a proven stop clears it."""
         return model.get("state") != "unloaded"
 
+    def _warm(self) -> bool:
+        """Load the model through the deployment's own surface: with nothing loaded there is no budget to keep."""
+        try:
+            self.post(self.base_url.rstrip("/") + "/v1/chat/completions",
+                      json={"model": self.model_id,
+                            "messages": [{"role": "user", "content": "Reply with one word."}],
+                            "max_tokens": 8},
+                      timeout=self.timeout_seconds)
+        except Exception:  # noqa: BLE001 - a refused request is the fact, not a crash
+            return False
+        deadline = self.clock() + self.timeout_seconds
+        while self.clock() < deadline:
+            try:
+                if self._model().get("state") != "unloaded":
+                    return True
+            except PortError:
+                return False
+            self.wait(self.poll_seconds)
+        return False
+
     def make_docker_unreachable(self) -> Mapping[str, Any]:
         before = _foreign_containers(self.deployment_id, runner=self.runner)
+        baseline = _http_status(self.base_url, "/health")  # what the service said before anything was staged
+        warmed = True
+        if self._model().get("state") == "unloaded":
+            warmed = self._warm()  # nothing loaded means nothing whose budget could be kept
         code, stdout = self._run(["sudo", "systemctl", "stop", "docker.socket"], timeout=60.0)
         if code != 0:
             raise PortError(f"the Docker socket could not be stopped: {stdout.strip()}")
@@ -472,7 +496,8 @@ class DockerFaultPort:
         # Only with the channel back can the neighbours be compared: an unreadable
         # listing is not evidence that they survived.
         after = _foreign_containers(self.deployment_id, runner=self.runner)
-        return {"available": True, "docker_unreachable": unreachable, "docker_restored": restored,
+        return {"available": True, "warmed": warmed, "docker_unreachable": unreachable,
+                "docker_restored": restored, "health_baseline": baseline,
                 "health_status": health, "budget_kept": self._budget_kept(model),
                 "other_containers_untouched": before == after, "model_state": model.get("state"),
                 "model_last_error": model.get("last_error"),
@@ -482,10 +507,11 @@ class DockerFaultPort:
     def present_unknown_instance(self) -> Mapping[str, Any]:
         name = f"{_managed_prefix(self.deployment_id)}ghost"
         before = _foreign_containers(self.deployment_id, runner=self.runner)
+        baseline = _http_status(self.base_url, "/health")
         code, stdout = self._run(["docker", "run", "-d", "--name", name,
                                   "--label", f"{DEPLOYMENT_LABEL}={self.deployment_id}",
                                   "--label", "io.self-model-switch.model=ghost",
-                                  self.image, "sleep", "600"])
+                                  "--entrypoint", "sleep", self.image, "600"])
         if code != 0:
             raise PortError(f"the stranger container could not be started: {stdout.strip()}")
         try:
@@ -497,6 +523,7 @@ class DockerFaultPort:
             stranger_running = name in self._listed()
             unknown_recorded = stranger_running and "ghost" not in (status.get("models") or {})
             return {"available": True, "unknown_recorded": unknown_recorded, "health_status": health,
+                    "health_baseline": baseline,
                     "other_containers_untouched": before == after, "stranger": name,
                     "stranger_running": stranger_running,
                     "readiness_reason": status.get("readiness_reason"), "foreign_containers": after}
