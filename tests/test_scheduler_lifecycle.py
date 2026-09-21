@@ -33,6 +33,20 @@ class Backend:
         return Observation(Presence.STOPPED, None, False, 0)
 
 
+class ObservableBackend(Backend):
+    """A backend whose runtime presence can be witnessed independently (C03)."""
+
+    def __init__(self, presence: Presence = Presence.RUNNING):
+        super().__init__()
+        self.presence = presence
+        self.observations = 0
+
+    async def observe(self, model_id):
+        self.observations += 1
+        running = self.presence is Presence.RUNNING
+        return Observation(self.presence, "instance" if running else None, running, 0)
+
+
 class Recovery:
     async def recover(self, deadline):
         return RecoveryResult(True, "complete", None, ("chat",))
@@ -423,6 +437,72 @@ async def test_warm_refuses_a_model_that_is_not_registered() -> None:
 
     with pytest.raises(KeyError):
         await scheduler.warm("ghost", asyncio.get_running_loop().time() + 1)
+
+
+@pytest.mark.asyncio
+async def test_warm_keeps_a_ready_model_whose_runtime_is_alive() -> None:
+    """Verifying a READY ledger must not reload a healthy runtime."""
+    registry = book()
+    backend = ObservableBackend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("chat", deadline)
+    await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 1
+    assert backend.observations == 1
+    assert registry.runtime["chat"].state.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_warm_reclaims_a_ready_model_whose_runtime_disappeared() -> None:
+    """A runtime can vanish under a READY ledger; trusting it strands the model for good."""
+    registry = book()
+    backend = ObservableBackend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("chat", deadline)
+    assert registry.runtime["chat"].state.value == "ready"
+
+    backend.presence = Presence.STOPPED
+    await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 2
+    runtime = registry.runtime["chat"]
+    assert runtime.state.value == "ready" and runtime.admission_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_warm_refuses_a_ready_model_it_cannot_verify() -> None:
+    """An unverifiable runtime is refused rather than assumed away (C02)."""
+    registry = book()
+    backend = ObservableBackend(presence=Presence.UNKNOWN); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("chat", deadline)
+
+    with pytest.raises(ModelUnavailable):
+        await scheduler.warm("chat", deadline)
+    assert registry.runtime["chat"].state.value == "ready"
+    assert backend.loads == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_trusts_a_ready_model_when_the_backend_cannot_observe() -> None:
+    """A backend without the observe() port keeps the pre-C03 behaviour."""
+    registry = book()
+    backend = Backend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("chat", deadline)
+    await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 1
+    assert registry.runtime["chat"].state.value == "ready"
 
 
 @pytest.mark.asyncio

@@ -401,17 +401,30 @@ class ModelScheduler:
         return tuple(ready)
 
     async def _preload_one(self, model_id: str, deadline: float) -> None:
+        loaded_here = False
         while True:
             needs_sample = False
+            verify_ready = False
             async with self._condition:
                 if self._storage_unavailable:
                     raise ModelUnavailable("storage_unavailable")
                 runtime = self.book.runtime[model_id]
                 if runtime.state.value == "ready":
-                    return
-                if runtime.state.value == "error":
+                    if loaded_here:
+                        return  # this call already brought it back and the books confirm it
+                    verify_ready = True
+                elif runtime.state.value == "error":
                     raise ModelUnavailable(runtime.last_error or "preload_failed")
-                needs_sample = (runtime.state.value == "unloaded" and not self._loads and self._eviction is None)
+                else:
+                    needs_sample = (runtime.state.value == "unloaded" and not self._loads and self._eviction is None)
+            if verify_ready:
+                # A runtime can disappear underneath a READY ledger (a crashed or
+                # externally stopped container). Trusting READY would leave the model
+                # permanently unserviceable, so an observable backend must witness the
+                # runtime first and a confirmed stop is written back through the books.
+                if await self._reclaim_lost_runtime(model_id):
+                    continue
+                return
             if needs_sample:
                 snapshot = await self.resources.snapshot()
                 sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
@@ -424,7 +437,7 @@ class ModelScheduler:
                         if self.book.can_load(model_id, sample, now):
                             operation = self.book.begin_load(model_id, sample, now)
                             self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
-                            started_operation = True
+                            started_operation, loaded_here = True, True
                         else:
                             candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
                             if candidates:
@@ -443,6 +456,39 @@ class ModelScheduler:
                 except asyncio.TimeoutError as exc:
                     if self._clock() >= deadline:
                         raise TimeoutError("preload deadline elapsed") from exc
+
+    async def _reclaim_lost_runtime(self, model_id: str) -> bool:
+        """Confirm a READY model still has a runtime; reclaim the books when it has none.
+
+        Returns True when the ledger was reclaimed and the caller should load again. A
+        backend without the C03 observe() port keeps the previous trust-the-ledger
+        behaviour, and a presence that is neither RUNNING nor STOPPED is refused rather
+        than guessed (C02). The reclaim itself goes through the books' own stop
+        transition, so `stopped_at` is recorded and a later load still needs a sample
+        that postdates the stop.
+        """
+        observe = getattr(self.backend, "observe", None)
+        if observe is None:
+            return False
+        try:
+            observation = await observe(model_id)
+        except Exception:
+            raise ModelUnavailable("runtime_observation_failed") from None
+        if observation.presence is Presence.RUNNING and observation.healthy:
+            return False
+        if observation.presence is not Presence.STOPPED:
+            raise ModelUnavailable(observation.detail_code or "runtime_unverified")
+        async with self._condition:
+            runtime = self.book.runtime[model_id]
+            if runtime.state.value != "ready" or runtime.leases or runtime.operation_id:
+                return False  # the model moved on while we were observing
+            try:
+                operations = self.book.begin_eviction([model_id], automatic=False)
+            except Conflict:
+                raise ModelUnavailable("runtime_reclaim_refused") from None
+            self.book.stopped(operations[0], self._clock())
+            self._condition.notify_all()
+        return True
 
     async def recover(self, deadline: float) -> None:
         """Reconcile all model accounting through the injected root-owned helper."""
