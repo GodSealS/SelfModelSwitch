@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +46,19 @@ class ObservableBackend(Backend):
         self.observations += 1
         running = self.presence is Presence.RUNNING
         return Observation(self.presence, "instance" if running else None, running, 0)
+
+
+class ManagedStyleBackend(Backend):
+    """The managed lifecycle answers with a deadline and the v3 presence vocabulary."""
+
+    def __init__(self, state: str = "running"):
+        super().__init__()
+        self.state = state
+        self.observations = 0
+
+    async def observe(self, model_id, deadline):
+        self.observations += 1
+        return SimpleNamespace(state=self.state)
 
 
 class Recovery:
@@ -472,6 +486,25 @@ async def test_warm_reclaims_a_ready_model_whose_runtime_disappeared() -> None:
     assert backend.loads == 2
     runtime = registry.runtime["chat"]
     assert runtime.state.value == "ready" and runtime.admission_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_warm_reclaims_through_the_managed_observe_shape() -> None:
+    """The managed lifecycle reports presence with a deadline and a v3 `state`."""
+    registry = book()
+    backend = ManagedStyleBackend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("chat", deadline)
+    assert backend.observations == 0
+
+    backend.state = "stopped"
+    await scheduler.warm("chat", deadline)
+
+    assert backend.observations == 1
+    assert backend.loads == 2
+    assert registry.runtime["chat"].state.value == "ready"
 
 
 @pytest.mark.asyncio

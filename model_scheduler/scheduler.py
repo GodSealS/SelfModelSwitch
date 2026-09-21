@@ -422,7 +422,7 @@ class ModelScheduler:
                 # externally stopped container). Trusting READY would leave the model
                 # permanently unserviceable, so an observable backend must witness the
                 # runtime first and a confirmed stop is written back through the books.
-                if await self._reclaim_lost_runtime(model_id):
+                if await self._reclaim_lost_runtime(model_id, deadline):
                     continue
                 return
             if needs_sample:
@@ -457,27 +457,50 @@ class ModelScheduler:
                     if self._clock() >= deadline:
                         raise TimeoutError("preload deadline elapsed") from exc
 
-    async def _reclaim_lost_runtime(self, model_id: str) -> bool:
+    async def _observe_runtime(self, model_id: str, deadline: float) -> str:
+        """One independent presence fact about a READY model: alive, gone or unknown.
+
+        This codebase witnesses presence through two backends: the managed lifecycle
+        takes a deadline and answers in the v3 vocabulary (`state`), while the
+        llama-swap backend answers in contracts terms (`presence`/`healthy`). The
+        scheduler normalises both instead of guessing which one it holds, and the two
+        vocabularies carry the same string values, so one comparison covers them.
+        """
+        observe = getattr(self.backend, "observe", None)
+        if observe is None:
+            return "unwitnessed"
+        positional = [parameter for parameter in inspect.signature(observe).parameters.values()
+                      if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+        try:
+            if len(positional) >= 2:
+                observation = await observe(model_id, deadline)
+            else:
+                observation = await observe(model_id)
+        except Exception:
+            raise ModelUnavailable("runtime_observation_failed") from None
+        raw = getattr(observation, "presence", None)
+        if raw is None:
+            raw = getattr(observation, "state", None)
+        value = getattr(raw, "value", raw)
+        if value == "running":
+            return "alive" if getattr(observation, "healthy", True) else "unknown"
+        return "gone" if value == "stopped" else "unknown"
+
+    async def _reclaim_lost_runtime(self, model_id: str, deadline: float) -> bool:
         """Confirm a READY model still has a runtime; reclaim the books when it has none.
 
         Returns True when the ledger was reclaimed and the caller should load again. A
-        backend without the C03 observe() port keeps the previous trust-the-ledger
-        behaviour, and a presence that is neither RUNNING nor STOPPED is refused rather
+        backend that cannot witness presence keeps the previous trust-the-ledger
+        behaviour, and a presence that is neither running nor stopped is refused rather
         than guessed (C02). The reclaim itself goes through the books' own stop
         transition, so `stopped_at` is recorded and a later load still needs a sample
         that postdates the stop.
         """
-        observe = getattr(self.backend, "observe", None)
-        if observe is None:
+        verdict = await self._observe_runtime(model_id, deadline)
+        if verdict in ("unwitnessed", "alive"):
             return False
-        try:
-            observation = await observe(model_id)
-        except Exception:
-            raise ModelUnavailable("runtime_observation_failed") from None
-        if observation.presence is Presence.RUNNING and observation.healthy:
-            return False
-        if observation.presence is not Presence.STOPPED:
-            raise ModelUnavailable(observation.detail_code or "runtime_unverified")
+        if verdict == "unknown":
+            raise ModelUnavailable("runtime_unverified")
         async with self._condition:
             runtime = self.book.runtime[model_id]
             if runtime.state.value != "ready" or runtime.leases or runtime.operation_id:
