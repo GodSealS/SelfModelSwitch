@@ -42,9 +42,11 @@ class SwitchIntent:
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic, event_sink: Callable[[str, Mapping[str, object]], None] | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, load_retry_limit: int = 3, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic, event_sink: Callable[[str, Mapping[str, object]], None] | None = None):
         if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds, switch_window_seconds, cooldown_seconds) <= 0 or max_switches_in_window < 1:
             raise ValueError("scheduler intervals must be positive")
+        if load_retry_limit < 0:
+            raise ValueError("the load retry limit must not be negative")
         self.book = book
         self.resources = resources
         self.backend = backend
@@ -56,6 +58,8 @@ class ModelScheduler:
         self._condition = asyncio.Condition()
         self._queue = RequestQueue(capacity=queue_capacity, aging_seconds=priority_aging_seconds)
         self._loads: dict[str, asyncio.Task[None]] = {}
+        self._load_retries: dict[str, int] = {}
+        self.load_retry_limit = load_retry_limit
         self._eviction: asyncio.Task[tuple[str, ...]] | None = None
         self._shutting_down = False
         self._storage_unavailable = False
@@ -405,18 +409,28 @@ class ModelScheduler:
         while True:
             needs_sample = False
             verify_ready = False
+            retry_failed = False
             async with self._condition:
                 if self._storage_unavailable:
                     raise ModelUnavailable("storage_unavailable")
                 runtime = self.book.runtime[model_id]
                 if runtime.state.value == "ready":
+                    self._load_retries.pop(model_id, None)
                     if loaded_here:
                         return  # this call already brought it back and the books confirm it
                     verify_ready = True
                 elif runtime.state.value == "error":
-                    raise ModelUnavailable(runtime.last_error or "preload_failed")
+                    if self._load_retries.get(model_id, 0) >= self.load_retry_limit:
+                        raise ModelUnavailable(runtime.last_error or "preload_failed")
+                    retry_failed = True
                 else:
                     needs_sample = (runtime.state.value == "unloaded" and not self._loads and self._eviction is None)
+            if retry_failed:
+                # A failed load leaves the books ERROR, and a terminal ERROR would answer
+                # 503 for good. A proven stop returns the model to UNLOADED so the load
+                # can be attempted again, up to the configured retry limit.
+                await self._reclaim_failed_model(model_id, deadline)
+                continue
             if verify_ready:
                 # A runtime can disappear underneath a READY ledger (a crashed or
                 # externally stopped container). Trusting READY would leave the model
@@ -456,6 +470,27 @@ class ModelScheduler:
                 except asyncio.TimeoutError as exc:
                     if self._clock() >= deadline:
                         raise TimeoutError("preload deadline elapsed") from exc
+
+    async def _reclaim_failed_model(self, model_id: str, deadline: float) -> None:
+        """Return an ERROR model to UNLOADED through the books' own cleanup transition.
+
+        `begin_cleanup` is the transition that accepts an idle ERROR model, and its stop
+        still has to be proven by the backend, so a model whose runtime is still alive is
+        released before it is loaded again. The attempt is counted here, which is what
+        keeps a model that keeps failing from retrying forever.
+        """
+        async with self._condition:
+            runtime = self.book.runtime[model_id]
+            if runtime.state.value != "error" or runtime.leases or runtime.operation_id:
+                return
+            try:
+                operations = self.book.begin_cleanup([model_id])
+            except Conflict:
+                raise ModelUnavailable("retry_reclaim_refused") from None
+            self._load_retries[model_id] = self._load_retries.get(model_id, 0) + 1
+            self._condition.notify_all()
+        attempt_deadline = min(deadline, self._clock() + self._switch_retry_seconds)
+        await self._finish_eviction(operations, attempt_deadline)
 
     async def _observe_runtime(self, model_id: str, deadline: float) -> str:
         """One independent presence fact about a READY model: alive, gone or unknown.

@@ -385,3 +385,16 @@ class LlamaCppAdapter:
             return StopAck(accepted=False)
         await self._control.unload(identity.model_id)
         return StopAck(accepted=True)
+
+    async def release(self, model_id: str) -> bool:
+        """Unload a model by name when no verified instance was ever recorded.
+
+        A load that fails verification can leave the control plane holding a container
+        this boot never accepted. The unload endpoint is model-scoped, so the orphan can
+        still be let go and the stop proven by observation; without this the model would
+        keep a runtime it can neither use nor address.
+        """
+        if self._control is None:
+            return False
+        await self._control.unload(model_id)
+        return True

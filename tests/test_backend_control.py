@@ -88,6 +88,7 @@ class ManagedFakeAdapter:
         self.load_state = load_state
         self.loads: list[Fence] = []
         self.stops: list[InstanceIdentity] = []
+        self.releases: list[str] = []
 
     def claims_device_quiescence(self) -> bool:
         return False
@@ -99,6 +100,10 @@ class ManagedFakeAdapter:
     async def stop(self, identity: InstanceIdentity, fence: Fence, deadline: float) -> StopAck:
         self.stops.append(identity)
         return StopAck(accepted=True)
+
+    async def release(self, model_id: str) -> bool:
+        self.releases.append(model_id)
+        return True
 
     async def execute(self, request, fence, deadline):  # pragma: no cover
         raise AssertionError("lifecycle never executes")
@@ -183,6 +188,23 @@ async def test_a_stop_ack_with_a_still_running_container_does_not_release() -> N
 
     assert result.presence is Presence.RUNNING  # the book must not move before the facts land
     assert bridge.instance("chat") == INSTANCE
+
+
+@pytest.mark.asyncio
+async def test_a_stop_without_a_verified_instance_releases_the_orphan_by_model() -> None:
+    """A load that never verified leaves a container no per-instance stop can address."""
+    adapter = ManagedFakeAdapter(load_state=pv.UNKNOWN)
+    observer = ScriptedObserver([v3_observation(pv.UNKNOWN),         # the load never verified
+                                 v3_observation(pv.STOPPED, INSTANCE)])  # the release lands
+    bridge = lifecycle(adapter, observer)
+    await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+    assert bridge.instance("chat") is None
+
+    result = await bridge.stop(Operation("op-2", "chat", 1, 0), deadline())
+
+    assert adapter.releases == ["chat"]  # released by name, not through an identity we never had
+    assert adapter.stops == []           # and never with a fabricated instance
+    assert result.presence is Presence.STOPPED
 
 
 @pytest.mark.asyncio

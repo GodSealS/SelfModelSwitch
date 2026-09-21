@@ -142,12 +142,23 @@ class ManagedLifecycle:
     async def stop(self, operation: Operation, deadline: float) -> Observation:
         model_id = operation.model_id
         identity = self._instances.get(model_id)
+        adapter = self._adapter_for(model_id)
         if identity is not None:
             try:
-                await self._adapter_for(model_id).stop(
+                await adapter.stop(
                     identity, self.fence(model_id, operation.generation, operation.operation_id), deadline)
             except Exception:
                 pass  # the facts decide; an ack or a failed control call proves nothing either way
+        else:
+            # A load that failed verification can leave the control plane holding a container
+            # this boot never accepted. Releasing it by model name is the only way that
+            # orphan can be let go, and the facts still have to prove the stop below.
+            release = getattr(adapter, "release", None)
+            if release is not None:
+                try:
+                    await release(model_id)
+                except Exception:
+                    pass
         observation = await self._poll_stopped(model_id, identity, deadline)
         if observation is not None and observation.state == STOPPED:
             self._instances.pop(model_id, None)

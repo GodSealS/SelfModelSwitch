@@ -48,6 +48,25 @@ class ObservableBackend(Backend):
         return Observation(self.presence, "instance" if running else None, running, 0)
 
 
+class FlakyBackend(Backend):
+    """A backend whose first `failures` loads cannot be verified, then holds."""
+
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures = failures
+        self.stops: list[str] = []
+
+    async def load(self, operation, deadline):
+        self.loads += 1
+        if self.loads <= self.failures:
+            return Observation(Presence.UNKNOWN, None, False, 0, "load_unverified")
+        return Observation(Presence.RUNNING, "instance", True, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
 class ManagedStyleBackend(Backend):
     """The managed lifecycle answers with a deadline and the v3 presence vocabulary."""
 
@@ -486,6 +505,53 @@ async def test_warm_reclaims_a_ready_model_whose_runtime_disappeared() -> None:
     assert backend.loads == 2
     runtime = registry.runtime["chat"]
     assert runtime.state.value == "ready" and runtime.admission_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_warm_retries_a_failed_load_until_one_holds() -> None:
+    """A transient load failure must not leave the model terminal for good."""
+    registry = book()
+    backend = FlakyBackend(failures=2); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, load_retry_limit=3)
+    deadline = asyncio.get_running_loop().time() + 5
+
+    await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 3
+    assert backend.stops == ["chat", "chat"]  # each retry released the failed runtime first
+    assert registry.runtime["chat"].state.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_warm_gives_up_after_the_retry_limit() -> None:
+    """The retries are bounded: the first attempt plus the configured limit."""
+    registry = book()
+    backend = FlakyBackend(failures=99); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, load_retry_limit=3)
+    deadline = asyncio.get_running_loop().time() + 5
+
+    with pytest.raises(ModelUnavailable):
+        await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 4
+    runtime = registry.runtime["chat"]
+    assert runtime.state.value == "error" and runtime.admission_blocked is True
+
+
+@pytest.mark.asyncio
+async def test_a_zero_retry_limit_keeps_a_failed_load_terminal() -> None:
+    """Limit zero is the old behaviour: one attempt, then the model stays ERROR."""
+    registry = book()
+    backend = FlakyBackend(failures=99); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, load_retry_limit=0)
+    deadline = asyncio.get_running_loop().time() + 5
+
+    with pytest.raises(ModelUnavailable):
+        await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 1
+    assert backend.stops == []
+    assert registry.runtime["chat"].state.value == "error"
 
 
 @pytest.mark.asyncio
