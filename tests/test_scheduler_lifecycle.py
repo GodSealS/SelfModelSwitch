@@ -67,6 +67,26 @@ class FlakyBackend(Backend):
         return Observation(Presence.STOPPED, None, False, 0)
 
 
+class PresenceBackend(Backend):
+    """A backend whose per-model presence can be scripted after the fact."""
+
+    def __init__(self, presence: dict[str, Presence]):
+        super().__init__()
+        self.presence = dict(presence)
+        self.observations: list[str] = []
+        self.stops: list[str] = []
+
+    async def observe(self, model_id):
+        self.observations.append(model_id)
+        current = self.presence.get(model_id, Presence.RUNNING)
+        running = current is Presence.RUNNING
+        return Observation(current, "instance" if running else None, running, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
 class ManagedStyleBackend(Backend):
     """The managed lifecycle answers with a deadline and the v3 presence vocabulary."""
 
@@ -505,6 +525,52 @@ async def test_warm_reclaims_a_ready_model_whose_runtime_disappeared() -> None:
     assert backend.loads == 2
     runtime = registry.runtime["chat"]
     assert runtime.state.value == "ready" and runtime.admission_blocked is False
+
+
+@pytest.mark.asyncio
+async def test_a_phantom_reservation_is_reclaimed_instead_of_evicted_around() -> None:
+    """committed counts residents, so a reservation without a runtime must not buy an eviction."""
+    specs = {model_id: ModelSpec(model_id, f"http://127.0.0.1:{10003 + index}", frozenset({Capability.CHAT}), 100)
+             for index, model_id in enumerate(("first", "second"))}
+    registry = Book(specs, model_budget=150, free_floor=0, margin=0)
+    for model_id in specs:
+        registry.bootstrap_stopped(model_id)
+    backend = PresenceBackend({"first": Presence.RUNNING, "second": Presence.STOPPED})
+    backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, poll_interval_seconds=0.001)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("first", deadline)
+    assert registry.runtime["first"].state.value == "ready" and backend.loads == 1
+
+    backend.presence["first"] = Presence.STOPPED  # its runtime went away without a proven stop
+    await scheduler.warm("second", deadline)      # only the phantom reservation blocks this load
+
+    assert registry.runtime["first"].state.value == "unloaded"  # reclaimed, not evicted around
+    assert registry.runtime["second"].state.value == "ready"
+    assert backend.loads == 2
+    assert backend.stops == []                    # a live model was never stopped for phantom room
+
+
+@pytest.mark.asyncio
+async def test_a_live_resident_is_still_evicted_when_the_room_is_really_needed() -> None:
+    """The phantom reclaim must not turn a genuine shortage into a refusal."""
+    specs = {model_id: ModelSpec(model_id, f"http://127.0.0.1:{10003 + index}", frozenset({Capability.CHAT}), 100)
+             for index, model_id in enumerate(("first", "second"))}
+    registry = Book(specs, model_budget=150, free_floor=0, margin=0)
+    for model_id in specs:
+        registry.bootstrap_stopped(model_id)
+    backend = PresenceBackend({"first": Presence.RUNNING, "second": Presence.STOPPED})
+    backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, poll_interval_seconds=0.001)
+    deadline = asyncio.get_running_loop().time() + 1
+
+    await scheduler.warm("first", deadline)
+    await scheduler.warm("second", deadline)  # "first" is really there, so it is evicted
+
+    assert backend.stops == ["first"]
+    assert registry.runtime["first"].state.value == "unloaded"
+    assert registry.runtime["second"].state.value == "ready"
 
 
 @pytest.mark.asyncio

@@ -443,7 +443,7 @@ class ModelScheduler:
                 snapshot = await self.resources.snapshot()
                 sample = MemorySample(snapshot.total_bytes, snapshot.available_bytes, snapshot.sampled_at)
                 admitted = await self._admission_allowed()
-                started_operation = False
+                started_operation, eviction_blocked = False, False
                 async with self._condition:
                     runtime = self.book.runtime[model_id]
                     now = self._clock()
@@ -453,12 +453,26 @@ class ModelScheduler:
                             self._loads[model_id] = asyncio.create_task(self._finish_load(operation, deadline))
                             started_operation, loaded_here = True, True
                         else:
+                            eviction_blocked = True
+                    self._condition.notify_all()
+                if eviction_blocked:
+                    # A reservation can outlive its runtime, and `committed` counts every
+                    # resident model. A phantom reservation therefore makes the books call a
+                    # live model over budget, and the scheduler pays a full stop-and-reload
+                    # for room that was never needed. Reclaim the phantom and re-decide
+                    # before spending an eviction on a model that is really there.
+                    if await self._reclaim_phantom_residents(model_id, deadline):
+                        continue
+                    async with self._condition:
+                        runtime = self.book.runtime[model_id]
+                        now = self._clock()
+                        if runtime.state.value == "unloaded" and not self._loads and self._eviction is None:
                             candidates = self.eviction_policy.choose(self._load_deficit(model_id, sample), now=now)
                             if candidates:
                                 operations = self.book.begin_eviction([candidate.model_id for candidate in candidates])
                                 self._eviction = asyncio.create_task(self._run_eviction(operations, deadline))
                                 started_operation = True
-                    self._condition.notify_all()
+                        self._condition.notify_all()
                 if started_operation:
                     continue
             async with self._condition:
@@ -491,6 +505,34 @@ class ModelScheduler:
             self._condition.notify_all()
         attempt_deadline = min(deadline, self._clock() + self._switch_retry_seconds)
         await self._finish_eviction(operations, attempt_deadline)
+
+    async def _reclaim_phantom_residents(self, keep: str, deadline: float) -> bool:
+        """Reclaim resident models whose runtime is gone, so admission sees real memory.
+
+        Returns True when at least one reservation was released, which means the caller
+        should re-decide instead of evicting. Only a witnessed absence is reclaimed: a
+        presence that is alive or cannot be witnessed is left exactly as it was (C02).
+        """
+        reclaimed = False
+        for model_id, runtime in list(self.book.runtime.items()):
+            if model_id == keep or runtime.reservation <= 0 or runtime.leases or runtime.operation_id:
+                continue
+            if runtime.state.value != "ready":
+                continue
+            if await self._observe_runtime(model_id, deadline) != "gone":
+                continue
+            async with self._condition:
+                runtime = self.book.runtime[model_id]
+                if runtime.state.value != "ready" or runtime.leases or runtime.operation_id:
+                    continue
+                try:
+                    operations = self.book.begin_eviction([model_id], automatic=False)
+                except Conflict:
+                    continue
+                self.book.stopped(operations[0], self._clock())
+                self._condition.notify_all()
+            reclaimed = True
+        return reclaimed
 
     async def _observe_runtime(self, model_id: str, deadline: float) -> str:
         """One independent presence fact about a READY model: alive, gone or unknown.
