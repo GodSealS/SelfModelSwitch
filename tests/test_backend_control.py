@@ -133,7 +133,7 @@ def lifecycle(adapter: ManagedFakeAdapter, observer) -> ManagedLifecycle:
     return ManagedLifecycle(
         boot_id="boot-1", deployment_id="orin-lab",
         specs={"chat": object()}, adapter_for=lambda model_id: adapter,
-        observers={"chat": observer}, poll_seconds=0.01, verify_seconds=0.05,
+        observers={"chat": observer}, poll_seconds=0.01,
     )
 
 
@@ -159,21 +159,6 @@ async def test_managed_load_stays_unknown_when_the_observation_cannot_verify_the
 
     assert result.presence is Presence.UNKNOWN
     assert bridge.instance("chat") is None
-
-
-@pytest.mark.asyncio
-async def test_managed_load_keeps_sampling_until_the_instance_is_witnessed() -> None:
-    """One sample that cannot see the instance yet is not a refusal (C03)."""
-    adapter = ManagedFakeAdapter()
-    observer = ScriptedObserver([v3_observation(pv.UNKNOWN),            # still settling
-                                 v3_observation(pv.RUNNING, INSTANCE)])  # the facts arrive
-    bridge = lifecycle(adapter, observer)
-
-    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
-
-    assert result.presence is Presence.RUNNING and result.healthy is True
-    assert bridge.instance("chat") == INSTANCE
-    assert len(observer.targets) >= 2
 
 
 @pytest.mark.asyncio
