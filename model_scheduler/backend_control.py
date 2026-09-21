@@ -100,15 +100,17 @@ class ManagedLifecycle:
         adapter_for: Callable[[str], Any],
         observers: Mapping[str, Any],
         poll_seconds: float = 0.05,
+        verify_seconds: float = 10.0,
     ) -> None:
-        if not boot_id or not deployment_id or poll_seconds <= 0:
-            raise ValueError("a managed lifecycle needs a boot, a deployment and a poll interval")
+        if not boot_id or not deployment_id or poll_seconds <= 0 or verify_seconds <= 0:
+            raise ValueError("a managed lifecycle needs a boot, a deployment and a positive poll interval")
         self._boot_id = boot_id
         self._deployment_id = deployment_id
         self._specs = dict(specs)
         self._adapter_for = adapter_for
         self._observers = dict(observers)
         self._poll_seconds = poll_seconds
+        self._verify_seconds = verify_seconds
         self._instances: dict[str, InstanceIdentity] = {}
 
     def instance(self, model_id: str) -> InstanceIdentity | None:
@@ -132,7 +134,7 @@ class ManagedLifecycle:
         if verified.state != RUNNING:
             return Observation(Presence.UNKNOWN, None, False, monotonic(), "load_unverified")
         # A healthy adapter answer is still a control response: re-verify via the observer.
-        observation = await self._observe(model_id, verified.instance, deadline)
+        observation = await self._verify_running(model_id, verified.instance, deadline)
         if observation is None or observation.state != RUNNING or observation.instance is None:
             return Observation(Presence.UNKNOWN, None, False, monotonic(), "instance_unverified")
         self._instances[model_id] = observation.instance
@@ -166,6 +168,30 @@ class ManagedLifecycle:
         if observation is not None and observation.state == RUNNING:
             return Observation(Presence.RUNNING, None, True, observation.sampled_at_monotonic, "stop_unverified")
         return Observation(Presence.UNKNOWN, None, False, monotonic(), "stop_unverified")
+
+    async def _verify_running(self, model_id: str, identity: InstanceIdentity, deadline: float):
+        """Poll the independent observation until it agrees the instance is running (C03).
+
+        One sample is not a verdict. The control plane reports health as soon as the
+        server answers, while the observation can still see a port that is not open yet
+        or an instance it cannot correlate, so sampling once made a load that really
+        worked look unverifiable — and an unverifiable load can only be refused, which
+        costs a whole stop-and-reload to recover. The stop path already polls for its
+        four facts; the load path now samples within `verify_seconds` the same way, and
+        a proven STOPPED still ends the wait immediately because it is a verdict.
+        """
+        loop = asyncio.get_event_loop()
+        window = min(deadline, loop.time() + self._verify_seconds)
+        last = None
+        while True:
+            last = await self._observe(model_id, identity, deadline)
+            if last is not None and last.state == RUNNING and last.instance is not None:
+                return last
+            if last is not None and last.state == STOPPED:
+                return last
+            if loop.time() >= window:
+                return last
+            await asyncio.sleep(self._poll_seconds)
 
     async def _observe(self, model_id: str, identity: InstanceIdentity | None, deadline: float):
         observer = self._observers.get(model_id)
