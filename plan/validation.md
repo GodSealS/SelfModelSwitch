@@ -1746,3 +1746,56 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
 2. **改口径**：让静态门槛用与准入一致的量（`reserved_bytes`，本轮 18,290,511,463 B）或从 bound 中剔除**可回收的 page cache**。这会同时放宽 7B 的门槛（34.1e9 → 7.0e9），属于 C02 语义变更，需同步改 `contracts_v2.physical_reserved_bytes_from_peak`、evaluator 与 plan/08 C02，并重新定义"物理上界"在验收中的含义。
 
 本轮材料已保留（两轮共 6 个 run 的 `raw/runN/{sampling/meminfo.csv, round.json, container.log}` + `measurements.json`），任一路径都可复算。
+
+## qwen3.6-27B 登记、双模型并发与两个"永久 503"缺陷（2026-09-21）
+
+### 1. 站点与资产（本机 lab）
+
+- 资产落盘 `/media/jtzn/sandisk-ext4/models/qwen36-27b-q6/`：`…-NEO-Q6_K.gguf` 23,582,346,672 B（sha256 `f1e1b337…`）、`…-NEO-MTP-Q6_K.gguf` 24,033,705,440 B（sha256 `2e8a9bdb…`）、`mmproj-BF16.gguf` 931,146,304 B（sha256 `05353347…`）。开发机与目标机两侧各自校验，字节数与官方 tree API 的 LFS oid 一致。
+- 新 lab 配置 `…/qwen36-27b-lab/config.yaml`（渲染 `deploy2/`，`deployment_id=sms-orin-lab2`）：`storage.model_directory` 上提到 `/media/jtzn/sandisk-ext4/models`，两个模型的资产路径带子目录前缀。**两个模型都标 `measured: false`**——`Book.physical_enforced = any(物理峰值非空)`，只要有一个带测量值，未测量的 27B 就会被 `physical_admissible` 一律拒绝，故该配置主动关闭物理门槛。原 `lab-b10` 与冻结候选未改动。
+- 27B 的 `reserved_bytes: 29000000000` 是估算值，不是实测；C02 静态门槛（35B 一节 §3）仍未解决。
+
+### 2. 硬件事实：两个模型可以共存
+
+纯 docker 隔离实验（无调度器、无 llama-swap），7B 常驻下逐档调 27B 的 `-ngl`：
+
+| `-ngl` | 27B | 27B t/s | 7B 同时健康 | 峰值已用 |
+|---|---|---|---|---|
+| 99 | 存活 | 4.08 | 200 | 36.2 GB / 62.8 GB |
+| 80 | 存活 | 4.15 | 200 | |
+| 64 | 存活 | 4.04 | 200 | |
+| 48 | 存活 | 2.08 | 200 | |
+
+即 7B + 27B 合计约 36 GiB 在本机可行，**不需要降卸载或换更小量化**。上一轮得到的 `NvMap error 12 / cudaMalloc failed` 是**实验自身的污染**：隔离实验用了不带 `--rm` 的容器，留下同名已停止容器，后续 `docker run --name` 被 docker 拒绝（退出码 125），并非内存上限。
+
+### 3. 两个"永久 503"缺陷与一个孤儿容器（均已修，真机复验）
+
+- **A：账本 `ready` 而运行时已消失。** 容器无声消失（无人发过 unload，llama-swap 日志可证），账本仍 `ready`；`_preload_one` 的 `if runtime.state.value == "ready": return` 直接返回，`warm` 空转、计数继续失败 → 永久 503，只有重启调度器才恢复。
+- **B：加载失败即终端。** 加载失败把账本置 `ERROR` + `admission_blocked`，而 `_preload_one` 对 `error` 直接抛错；一次瞬时失败 = 进程余下生命周期的永久 503。
+- **C：孤儿容器无法释放。** 加载在 `instance_unverified`（适配器声称 RUNNING、v3 观测器未确认）处失败时 `ManagedLifecycle._instances` 从未记录实例，`stop` 因 `identity is None` 不发卸载命令，容器既不能用也不能停。
+
+修复三段：`b5f230f`（`warm` 先见证 `ready` 的运行时，证实的停止经 `begin_eviction`/`stopped` 写回）→ `b3fa035`（归一化两套后端形态：`ManagedLifecycle.observe(model_id, deadline)` + v3 `state`，`LlamaSwapBackend.observe(model_id)` + contracts `presence`/`healthy`；第一版按单参调用在生产路径抛 `TypeError` 并被折成拒绝）→ `51ddcd1`（`ERROR` 经 `begin_cleanup` 受控回收后重载，**首次 + 最多 3 次重试**，`load_retry_limit=0` 保持原终端行为；`READY` 清零计数；新增 `LlamaCppAdapter.release(model_id)` 与 `ManagedLifecycle.stop` 的无身份回退，让孤儿容器可按模型名卸载）。**回收路径没有放宽任何一条 C02 判据：`stopped()` 仍只在停止被证明后调用。**
+
+### 4. 真机结果（`51ddcd1`）
+
+从**开发机**经网关（`http://192.168.55.1:8091`，Bearer）交替调用，两轮 8/8 全部 200：
+
+| 轮 | 序列 | 结果 |
+|---|---|---|
+| 1 | 7B → 27B → 7B → 27B | 200 / 200 / 200 / 200（10.95 s / 22.84 s / 24.81 s / 45.70 s） |
+| 2 | 27B → 7B → 27B → 7B | 200 / 200 / 200 / 200（0.74 s / 24.78 s / 45.56 s / 25.00 s） |
+
+解码 7B 15.0–15.7 t/s、27B 3.95–4.18 t/s；终态两个模型均 `ready`、`last_error` 为空。切换一次的代价是"回收 + 重载"的 25–46 s（此前是失败）。
+
+### 5. 工程记录
+
+- 本地：`pytest tests -m 'not thor' -q` = **897 passed, 1 skipped, 1 deselected**；`ruff check .` 通过；`run.py --check-config` 输出未变。
+- 交付：开发机 → GitHub（`git@github.com` 通路；HTTPS 拉取端点本轮超时）与目标机裸仓库 `/home/jtzn/git/SelfModelSwitch.git`，三处 SHA 一致；目标 checkout 守卫式 ff-only 到同一 SHA，前后工作区为空。
+- 证据：`/home/jtzn/self-model-switch-evidence/qwen36-27b-lab/`（`coresidency/{sweep.json,sweep.log}`、`scheduler-retry.log`、`llama-swap7.log`、`gateway.log`）。
+
+### 6. 未做与遗留
+
+- `load_retry_limit` 目前只是调度器构造参数（默认 3），**没有接进 v2 配置 schema 与部署渲染**，运营侧改不了。
+- v2 的 `pinned_models`/`preload_models` 仍未落入账本（`plan/08` 既有遗留），本轮配置里的 preload 因此不生效；要压低切换延迟仍须先接线。
+- C02 `physical_resident_peak_bytes` 的口径决策（35B 一节 §3）仍未做；27B 的 `reserved_bytes` 仍是估算值，未按 C02/P21 做三轮实测。
+- `/health` 的 preload 检查恒假（既有遗留）未动；`MTP-Q6_K` 已下载但未做对照测试。

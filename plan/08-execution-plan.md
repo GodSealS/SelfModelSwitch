@@ -1585,6 +1585,15 @@ lab 布置本身修了三处（都不是产品缺陷，是站点输入/布置错
 
 **P27/P30 补记（2026-09-20，跨机器访问）:** `server.host` 被产品限制为 loopback（`config.py:400/:509`）且兼容面无鉴权，因此跨机器访问做成部署能力：新增 `deploy/gateway.py`（Bearer 认证、只转发 `/v1/*`、流式、不传调用方凭据）、`deploy/sms-gateway.service.in`（**由网关单元**执行 `deploy/open-firewall.sh`，幂等且只开网关端口）、`ServiceInputs` 的 `allow_cidr/allow_public/scheduler_port/gateway_host/gateway_port/gateway_token_file`（提交 `b3f4b4b`/`3bc42ac`/`71f5c0f`，24 项新测试）。目标机验证：调度器仍 `127.0.0.1:8090`，网关 `192.168.55.1:8091`；只对 `192.168.55.0/24` 与 `192.168.1.0/24` 开放 8091；无 token 401、带 token 200，**从开发机跨机器调用成功**；`/health` 经网关 404（按设计）。同轮发现未修：`/health` 的 preload 检查恒假（模型已在服务仍 503），使 O03 的 health 判据失去区分度；登记 qwen3.6 需按 C02/P21 重做测量与 fixtures。
 
+**P30 补记二（2026-09-21，两个"永久 503"缺陷与加载重试）:** 承接上一条补记（冷启动死锁已修并复验），本轮把"服务在跑但模型永久 503"的剩余路径补齐。提交 `b5f230f`/`b3fa035`/`51ddcd1`，开发机、GitHub 与目标机裸仓库三处同 SHA，目标 checkout 守卫式 ff-only 到 `51ddcd1…`；本地 `pytest tests -m 'not thor' -q` = 897 passed、`ruff check .` 通过。真机两轮 8/8 全部 200（7B 15.0–15.7 t/s、27B 3.95–4.18 t/s），详见 `plan/validation.md` 同日一节。
+
+- **A 账本 `ready` 而运行时消失**：`_preload_one` 对 `ready` 直接返回、从不看运行时；容器无声消失（llama-swap 日志可证无人发过 unload）后 `warm` 空转，计数继续失败 → 永久 503。现改为：`ready` 时先让后端见证运行时，见证为 stopped 就经 `begin_eviction`+`stopped` 把账本收回再重载；见证既非 running 也非 stopped 则拒绝而不是猜（C02）；拿不到见证的后端保持原行为。
+- **B 加载失败即终端**：`ERROR` 被直接抛出，一次瞬时失败在进程余下生命周期内都是 503。现改为：经 `begin_cleanup` 受控回收后重载，**首次 + 最多 `load_retry_limit` 次重试（默认 3，0 = 原终端行为）**，`READY` 清零计数；单次回收的停止窗口被 `switch_retry_seconds` 夹住，避免一次请求被卡死的停止吃光 deadline。
+- **C 孤儿容器**：`instance_unverified` 一类失败会留下"从未记录身份"的容器，`ManagedLifecycle.stop` 因 `identity is None` 不发卸载，容器既不能用也不能停。新增 `LlamaCppAdapter.release(model_id)`（llama-swap 的卸载端点是按模型名的）与 `stop` 的无身份回退；**停止证据仍必须由观测提供**，回收路径没有放宽任何一条 C02 判据。
+- **两套后端形态**：`ManagedLifecycle.observe(model_id, deadline)` 返回 v3 词汇（`state`），`LlamaSwapBackend.observe(model_id)` 返回 contracts 词汇（`presence`/`healthy`）。`b5f230f` 按单参调用，在生产路径抛 `TypeError` 并被折成拒绝；`b3fa035` 归一化两者并补了驱动 managed 形态的测试。
+- **共存事实**：纯 docker 隔离实验下 7B + 27B 合计约 36 GiB 可行（`-ngl` 99/80/64/48 四档 27B 均存活，7B 全程 200），**不需要降卸载或换更小量化**；上一轮那条 `NvMap error 12` 是隔离实验自身留下同名容器导致的 `docker run` exit 125，不是内存上限。
+- **未做**：`load_retry_limit` 未接进配置 schema；`pinned_models`/`preload_models` 落账本仍未做（切换延迟因此仍是 25–46 s）；C02 物理上界口径决策仍未做。
+
 ### P31 — 发布包现场preflight与安装验收（M07）
 
 **Primary owner:** backend；**Dependencies:** P30；**Estimated scope:** M。
