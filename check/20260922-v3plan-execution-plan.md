@@ -132,10 +132,29 @@ K4 launch 来源已核实：`ports_v3.LaunchOperation`（`ports_v3.py:78`）← 
 **Files likely touched:** `model_scheduler/contracts.py`、`model_scheduler/model_registry.py`、`tests/test_registry.py`、`tests/test_backend_control.py`。
 **Documentation impact:** K2签名如有变化同步C03，公共HTTP/control-v1不变。
 **Acceptance criteria:**
-- [ ] 原五位置参数构造、legacy加载测试仍通过；新字段不改变原字段含义。
-- [ ] Book的当前operation成功同时写READY+完整身份；旧operation和有冲突的状态不产生部分写入。
-- [ ] stopped/bootstrap/finish_recovery清identity，failed/UNKNOWN保留identity；覆盖全部既有Book写入口。
+- [x] 原五位置参数构造、legacy加载测试仍通过；新字段不改变原字段含义。
+- [x] Book的当前operation成功同时写READY+完整身份；旧operation和有冲突的状态不产生部分写入。
+- [x] stopped/bootstrap/finish_recovery清identity，failed/UNKNOWN保留identity；覆盖全部既有Book写入口。
 **Verification:** `"$PY" -m pytest tests/test_registry.py tests/test_backend_control.py -q`，再通用全量检查。
+
+**执行结果（2026-09-22）**：`contracts.Observation` 末尾新增 `instance`、`valid_until` 两个默认 None 字段
+（依赖方向 `contracts -> control_protocol_v1 -> contracts_v2`，与 K2 一致）；`Runtime.instance` 为唯一已接受身份；
+新增只读 `Book.instance(model_id)`；`Book.loaded(operation, now, *, instance=None)` 先校验参数类型、再校验
+operation、最后在同一批赋值中写 READY 与身份（任意拒绝都无部分写入）。`stopped`/`bootstrap_stopped`/
+`finish_recovery` 清身份；`failed`/`begin_recovery`/`release(ABORTED)` 保留身份。
+
+新增 7 个测试（`tests/test_registry.py`）：原五位置参数构造与默认 None、携带身份与截止、当前 operation 一次写入
+READY+身份、旧 operation 与冲突状态均无部分写入、已证 stop 清身份而 failure 保留、bootstrap/finish_recovery 无身份、
+ABORTED 保留身份。RED 阶段确认 7 failed / 21 passed。
+
+验证：定向 `tests/test_registry.py tests/test_backend_control.py` 38 passed；全量
+`pytest tests -m 'not thor' -q` **907 passed、1 skipped、1 deselected**（耗时 15m44s）、`ruff check .` 通过、
+`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11
+（`uv run --no-project --python 3.12 --with-requirements requirements-dev.lock`，仓库 `.venv` 仍是 3.13.5）。
+
+偏差说明：任务列出的 `tests/test_backend_control.py` **未改动**——该文件含用户未提交的改动，编辑会把用户代码混入本
+提交；改为在 `test_registry.py` 内覆盖，并以该文件作为回归（`test_backend_control.py` 全数通过）。
+bridge 私有缓存 `_instances` 的移除仍属 RP04，本片只提供 Book 侧唯一身份底座，**不宣称身份问题已修完**。
 
 ## Task RP02：为v3 observer建立有界事实采集
 

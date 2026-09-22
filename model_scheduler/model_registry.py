@@ -25,6 +25,7 @@ from uuid import uuid4
 from .contracts import Lease, MemorySample, ModelSpec, Operation, Outcome, State
 from .contracts_v2 import ModelSpec as RegisteredModelSpec
 from .contracts_v2 import effective_reserved_bytes, physical_reserved_bytes_from_peak
+from .control_protocol_v1 import InstanceIdentity
 
 # C02: after a proven stop the next admission needs a sample taken after the
 # stop, and the scheduler waits at most this long for the memory to come back.
@@ -56,6 +57,9 @@ class Runtime:
     usage_unknown_requests: int = 0
     stopped_at: float | None = None
     cancelling: dict[str, Lease] = field(default_factory=dict)
+    # K2: the single accepted identity. Only `Book.loaded` writes it and only a
+    # proven stop clears it; a failure, an UNKNOWN or a pending recovery keeps it.
+    instance: InstanceIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,7 @@ class Book:
         if runtime.state is not State.UNKNOWN or runtime.operation_id or runtime.leases:
             raise Conflict("not a bootstrap state")
         runtime.state, runtime.reservation = State.UNLOADED, 0
+        runtime.instance = None
 
     def sample_valid(self, sample: MemorySample, now: float) -> bool:
         return 0 <= now - sample.sampled_at <= self.max_sample_age and sample.total_bytes > 0 and 0 <= sample.available_bytes <= sample.total_bytes
@@ -209,11 +214,23 @@ class Book:
             raise StaleOperation(operation.operation_id)
         return runtime
 
-    def loaded(self, operation: Operation, now: float) -> None:
+    def instance(self, model_id: str) -> InstanceIdentity | None:
+        """The one identity this book accepted; None until a load is proven (K2).
+
+        Read-only on purpose: adapters, bridges and the scheduler all look the
+        identity up through here, so there is exactly one stored copy and no
+        second cache can disagree with it.
+        """
+        return self.runtime[model_id].instance
+
+    def loaded(self, operation: Operation, now: float, *, instance: InstanceIdentity | None = None) -> None:
+        if instance is not None and not isinstance(instance, InstanceIdentity):
+            raise ValueError("instance must be an InstanceIdentity or None")
         runtime = self._operation(operation)
         if runtime.state is not State.LOADING:
             raise Conflict("not loading")
         runtime.state, runtime.operation_id, runtime.admission_blocked, runtime.idle_since = State.READY, None, False, now
+        runtime.instance = instance
 
     def failed(self, operation: Operation, code: str) -> None:
         runtime = self._operation(operation)
@@ -353,6 +370,7 @@ class Book:
         runtime.state, runtime.operation_id, runtime.reservation = State.UNLOADED, None, 0
         runtime.admission_blocked, runtime.idle_since, runtime.last_error = False, None, None
         runtime.stopped_at = now
+        runtime.instance = None  # a proven stop leaves nothing accepted
 
     def ttl_due(self, model_id: str, now: float) -> bool:
         runtime, spec = self.runtime[model_id], self.ledger[model_id]
@@ -379,4 +397,5 @@ class Book:
         for runtime in self.runtime.values():
             runtime.state, runtime.reservation, runtime.operation_id = State.UNLOADED, 0, None
             runtime.admission_blocked, runtime.idle_since, runtime.last_error = False, None, None
+            runtime.instance = None  # every model was proven stopped
         self.recovering = False

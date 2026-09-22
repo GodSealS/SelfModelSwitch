@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncIterator, Mapping, Protocol
 
+from .control_protocol_v1 import InstanceIdentity
+
 
 class State(str, Enum):
     UNKNOWN = "unknown"
@@ -72,11 +74,23 @@ class Operation:
 
 @dataclass(frozen=True)
 class Observation:
+    """A lifecycle fact reported by an adapter or a bridge.
+
+    The first five fields are the shipped contract and keep their exact meaning.
+    `instance` and `valid_until` are additive tail fields: they carry the full
+    identity and the deadline of the verdict so the single owner of the accepted
+    identity (the book) can accept or refuse the fact without re-deriving it.
+    Both default to None, so every existing positional construction still works
+    and no HTTP or control-v1 field is added.
+    """
+
     presence: Presence
     instance_id: str | None
     healthy: bool
     observed_at: float
     detail_code: str | None = None
+    instance: InstanceIdentity | None = None
+    valid_until: float | None = None
 
 
 @dataclass(frozen=True)
