@@ -414,8 +414,9 @@ control listener 适配器必须从 accepted Unix socket 读取 Linux SO_PEERCRE
 
 #### C08 增量：准备/开放分离与唯一 lifespan（K7，RP00 同步）
 
-真源是执行契约 K7；下面接口由 RP13/RP14 交付，其中 RP13 交付 `ControlServer` 的准备/开放/清理生命周期。
-现有 `ControlServer`（`control_server.py:149`）原只有 `start()`/`stop()`。增量：
+真源是执行契约 K7；下面接口由 RP13/RP14 交付——RP13 交付 `ControlServer` 的准备/开放/清理生命周期，RP14 交付
+`listener_lifecycle.py`（gate 与 TCP adapter）与 `run_v2` 这个唯一 owner。现有 `ControlServer`
+（`control_server.py:149`）原只有 `start()`/`stop()`。增量：
 
 - 准备与开放分离（**RP13 已交付**）：`prepare()` 只 bind 不 accept（`start_serving=False`），并在 chmod/chown
   成功后返回；`activate()` 仅能在 prepare 成功后调用，重复 prepare 与错序/重复 activate 都是受控
@@ -424,16 +425,23 @@ control listener 适配器必须从 accepted Unix socket 读取 Linux SO_PEERCRE
   `prepare(); activate()` 的兼容便利入口，**正式双入口装配不得调用**。失败回滚覆盖 bind 失败、`grp.getgrnam`
   的 KeyError、chmod/chown 失败与 prepare 期间的取消：都不留本次的 socket；bind 阶段被中断且 server 对象未返回
   时，只删除"仍是 socket 且无人监听"的残留。
-- 新增进程内共享 `ServingGate`：`ready` 是进程内对象，不能由客户端 header/body 控制。两个业务入口的 ASGI
-  包装都在 **dispatch 前**检查 gate；未 open 时业务请求返回现有 503 格式，不读 body、不创建 Blob、不排队/加载；
-  TCP `/live` 可作存活诊断，`/health` 必须 503 且不触发业务。
-- 新增薄 `TcpServerAdapter`，以 `ready: asyncio.Future` 等 Uvicorn startup 的真实结果（当前锁定 0.53.0）；
-  禁止固定 sleep 推测就绪，禁止其他模块直接读/改 Uvicorn 内部 server 列表。
-- `serve_v2` 是唯一 owner：gate 关闭→准备 TCP 原生 socket 与 Unix listener（`start_serving=False`）→验证组并
-  完成权限→启动 reconcile→进入 TCP 应用**唯一** lifespan（Uvicorn `lifespan="off"`，control app 不跑 lifespan）
-  →启动 TCP 适配器→Unix activate→`gate.open()`。任一 bind 失败不启动 preload；任一失败走统一 finally。
-- 停止顺序固定：gate.close→两入口停止 accept→按截止排空/取消入口连接→退出唯一 lifespan 并执行共享
-  scheduler shutdown **一次**→回收自有 socket/clients。不能先关共享 Book/Blob 再让另一入口继续请求。
+- 新增进程内共享 `ServingGate`（**RP14 已交付**）：`ready` 是进程内对象，不能由客户端 header/body 控制。两个
+  业务入口的 ASGI 包装（`gated_app`）都在 **dispatch 前**检查 gate；未 open 时业务请求返回**该入口自己的** 503
+  形状（网关 `service_unavailable`、控制面 C05 `temporarily_unavailable`），不读 body、不创建 Blob、不排队/加载；
+  TCP `/live` 可作存活诊断，`/health` 由 wrapper 直接回答 503（`ok=false`、全部 checks 为 false），不假称 readiness。
+- 新增薄 `TcpServerAdapter`（**RP14 已交付**），以 `ready: asyncio.Future` 等 Uvicorn startup 的真实结果（当前锁定
+  0.53.0）：`serve(prepared_socket)` 用公开的 `startup()/main_loop()/shutdown()`（`capture_signals` 同 `serve()`）
+  驱动传入的 socket，`ready` 在 startup 返回时 settle 为 `None`、失败时 settle 为异常；`stop(deadline)` 有界且幂等。
+  禁止固定 sleep 推测就绪，禁止其他模块直接读/改 Uvicorn 内部 server 列表（接受 `ready` 的 socket 通过受支持的
+  `sockets=` 参数传入）。
+- `run_v2` 是唯一 owner（`serve_v2` 只是 `asyncio.run(run_v2(...))`）：gate 关闭→准备 TCP 原生 socket（`bind`，
+  端口占用即拒绝）与 Unix listener（`ControlServer.prepare()`，`start_serving=False`）→启动 reconcile 与
+  Blob recovery→进入 TCP 应用**唯一** lifespan（具名 `application_lifespan`，Uvicorn `lifespan="off"`，control app
+  不跑 lifespan）→启动 TCP 适配器并 `await adapter.ready`→Unix `activate()`→`gate.open()`。任一 bind 失败不启动
+  preload（lifespan 尚未进入）；任一失败走统一 finally，把两个入口的 `stop()` 都跑一遍（幂等）。
+- 停止顺序固定：`gate.close()`→两入口停止 accept（`adapter.stop(deadline)` 与 `control.stop()`）→按截止排空/取消
+  入口连接→退出唯一 lifespan 并执行共享 scheduler shutdown **一次**→回收自有 socket。不能先关共享 Book/Blob 再让
+  另一入口继续请求。lifespan 的清理体在 `try/finally` 内，因此取消或异常同样只执行一次共享清理。
 - 0660 与登记客户端组是文件权限层，UID 白名单是连接层：非白名单连接仍在 HTTP 解析前关闭，不改成 403。
   清理只 unlink 仍属于本次 bind 的 inode，不删除已有 live listener 的 socket。
 

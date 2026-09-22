@@ -541,10 +541,36 @@ Linux 真实双 UID 场景留待 RP17；macOS 未冒充。
 **Files likely touched:** `run.py`、`app.py`、`model_scheduler/listener_lifecycle.py`（新）、`tests/integration/test_control_socket.py`、`tests/test_listener_lifecycle.py`（新）。
 **Documentation impact:** C08描述准备→恢复→单lifespan→双ready→gate及反向关闭，库版本适配约束。
 **Acceptance criteria:**
-- [ ] 两边全部准备成功前业务handler调用数为0；同Book/boot_id，lifespan启动/清理恰各一次。
-- [ ] TCP端口占用不触发preload；Unix activate、Uvicorn startup/SystemExit、取消失败均清理自有资源。
-- [ ] shutdown先关闭两入口再清共享状态；日志/health不假称ready；正常兼容API和control端点行为不变。
+- [x] 两边全部准备成功前业务handler调用数为0；同Book/boot_id，lifespan启动/清理恰各一次。
+- [x] TCP端口占用不触发preload；Unix activate、Uvicorn startup/SystemExit、取消失败均清理自有资源。
+- [x] shutdown先关闭两入口再清共享状态；日志/health不假称ready；正常兼容API和control端点行为不变。
 **Verification:** `"$PY" -m pytest tests/test_listener_lifecycle.py tests/integration/test_control_socket.py tests/test_admin_api.py -q`及全量；锁定Uvicorn契约用可观测事件，不用猜测sleep。
+
+**执行结果（2026-09-22）**：新增 `model_scheduler/listener_lifecycle.py`：`ServingGate`（进程内布尔，open/close/
+ready）、`gated_app`（ASGI wrapper，closed 时在 **dispatch 前** 用该入口自己的 503 形状拒绝——网关
+`service_unavailable`、控制面 C05 `temporarily_unavailable`；`/live` 豁免，`/health` 由 wrapper 直接 503 且
+`ok=false`/全 checks false）、`TcpServerAdapter`（`serve(prepared_socket)` 用 uvicorn 公开的
+`startup()/main_loop()/shutdown()` 与 `capture_signals()` 驱动传入 socket，`ready` 在 startup 返回时 settle 为
+`None`、失败 settle 为异常、取消 settle 为 cancelled；`stop(deadline)` 置 `should_exit` 并按时限等待，幂等；
+显式 `interface="asgi3"` 避免 uvicorn 对 bound method 的 ASGI2 误判；不读/改 uvicorn 内部 server 列表）。
+`app.py` 抽出具名 `application_lifespan`（`app.state.config`/`preload_retry_delays` 驱动，清理体包在
+`try/finally`，因此取消/异常同样只执行一次共享清理；`create_app` 仍以它为 lifespan，v1 `uvicorn.run` 路径不变）。
+`run.py` 新增 `_bind_tcp_socket`（端口占用即 `RuntimeCompositionError`）与 `run_v2`（K7 唯一 owner：gate 关闭→
+`control.prepare()`→绑定 TCP→reconcile+blob recover→`async with application_lifespan`→`adapter.serve()`+
+`await adapter.ready`→`control.activate()`→`gate.open()`；停止反向：`gate.close()`→`adapter.stop(deadline)`→
+`control.stop()`→退出 lifespan；`serve_v2` 现在只是 `asyncio.run(run_v2(...))`）。
+
+新增 14 个用例：`tests/test_listener_lifecycle.py` 10 个（gate 初始关闭与开关、closed 时零 handler/零 body 读取且带
+`X-Request-ID`、`/live` 可用与 `/health` 不假称 ready、open 后原样透传、控制面自己的 C05 503、header 不能开 gate、
+真实 uvicorn 启动后 `ready` 与真实请求、失败 startup settle 异常且不服务、未 serve/失败后 `stop` 幂等）与
+`tests/integration/test_control_socket.py` 4 个（owner 全流程：lifespan 起停各一次、控制面与 TCP 可用、socket 与
+端口回收；慢 reconcile 期间两入口都拒连且 preload 未启动；8090 被占用时 lifespan 不启动且自有 socket 回收；
+owner 取消后共享清理恰一次且两入口资源回收）。RED 阶段 3 failed（asgi2 误判、断言形状）随后逐条转绿。
+
+验证：定向 `tests/test_listener_lifecycle.py + tests/test_admin_api.py + tests/integration/test_control_socket.py`
+（新用例与 K7/v2/owner 子集）43 passed；全量 `pytest tests -m 'not thor' -q` **1017 passed、1 skipped、1 deselected**
+（15m48s，较 RP13 的 1003 增加 14）、`ruff check .` 通过、`run.py --check-config` 通过。Uvicorn 契约锁定
+0.53.0，就绪观测只用 `startup()` 的真实返回，没有 sleep 推测。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP15：C02决策记录与最终生产model集合
 

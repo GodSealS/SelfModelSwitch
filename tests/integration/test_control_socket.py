@@ -16,6 +16,8 @@ it skips (not passes) where the environment cannot prove two distinct uids.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+from datetime import datetime, timezone
 import grp
 import os
 import shutil
@@ -23,12 +25,15 @@ import sys
 import socket
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import httpx
 import psutil
 import pytest
 
+from model_scheduler import ports_v3 as pv
 from model_scheduler.control_identity import PeerIdentity
 from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort
 from model_scheduler.control_server import (
@@ -571,6 +576,179 @@ async def test_both_listeners_share_one_boot_and_the_lifespan_runs_exactly_once(
         await asyncio.wait_for(serving, 10)
         await control.stop()
     assert app.state.sms["started"] == 1 and app.state.sms["cleanups"] == 1  # start/cleanup each ONCE
+
+
+# -- K7/RP14: the v2 owner — prepare both entries, ONE lifespan, one gate ---------------------
+
+
+class _StoppedObserver:
+    """The C03 startup witness: none of this deployment's instances is left running."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def observe(self, target, deadline):
+        self.calls += 1
+        return pv.Observation(state=pv.STOPPED, sampled_at_monotonic=time.monotonic(),
+                              sampled_at_utc=datetime.now(timezone.utc), port_state="closed",
+                              subprocess_state="exited", instance=None, launch_operation=None)
+
+
+def _quiet_docker(argv: list[str]) -> tuple[int, str, str]:
+    """`ps` lists none of this deployment's containers; nothing is left to remove."""
+    return (0, "", "") if argv[1] == "ps" else (0, "[]", "")
+
+
+def _owner_context(tmp_path, *, recovery=None):
+    """A REAL v2 context over fake external ports, so the owner can actually run.
+
+    The fixture's `sms-client` peer group is a site input and is not provisioned
+    on a development machine, so it is left unset here (the permissioned-group
+    path itself is covered by the K7 socket tests).
+    """
+
+    def for_this_machine(document) -> None:
+        del document["control"]["peer_group"]  # the site group is not provisioned on a dev machine
+        document["control"]["allowed_uids"] = [os.getuid()]  # the allow list is the connection layer
+
+    config = _v2_config(tmp_path, mutate=for_this_machine)
+    ports = {"control": object(), "resources": None,
+             "recovery": recovery if recovery is not None else DeploymentRecovery("orin-lab", docker=_quiet_docker),
+             "observers": {mid: _StoppedObserver() for mid in config.models},
+             "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    return run_module.build_v2_context(config, config_sha256="a" * 64,
+                                       env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=ports)
+
+
+def _owner_scheduler_stubs(context) -> tuple[list[float], list[float]]:
+    """Record what the ONE lifespan does: preload starts once, shutdown cleans up once."""
+    preloads: list[float] = []
+    shutdowns: list[float] = []
+
+    async def preload(deadline: float) -> None:
+        preloads.append(deadline)
+
+    async def shutdown(deadline: float) -> None:
+        shutdowns.append(deadline)
+
+    context.scheduler.preload = preload
+    context.scheduler.shutdown = shutdown
+    context.scheduler.monitor_storage_once = None  # no storage loop in these tests
+    return preloads, shutdowns
+
+
+def _prebound_socket() -> tuple[socket.socket, int]:
+    prepared = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    prepared.bind(("127.0.0.1", 0))
+    return prepared, prepared.getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_the_v2_owner_runs_both_entries_over_one_lifespan_and_cleans_up(sdir) -> None:
+    context = _owner_context(sdir)
+    preloads, shutdowns = _owner_scheduler_stubs(context)
+    prepared, port = _prebound_socket()
+    owning = asyncio.create_task(run_module.run_v2(context, tcp_socket=prepared))
+    try:
+        assert await _eventually(lambda: "listeners" in context.extras)
+        assert context.extras["listeners"]["gate"].ready is True
+        assert context.extras["listeners"]["port"] == port
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            assert (await client.get("/live")).status_code == 200
+        assert (await _request(str(context.config.control.socket_path))).status_code == 200
+        assert len(preloads) == 1 and shutdowns == []  # the ONE lifespan started exactly once
+        await context.extras["listeners"]["adapter"].stop(time.monotonic() + 5)
+        await asyncio.wait_for(owning, 10)
+    finally:
+        if not owning.done():
+            owning.cancel()
+        with suppress(BaseException):
+            await owning  # retrieve whatever the owner ended with: never leave it unobserved
+    assert len(preloads) == 1 and len(shutdowns) == 1  # started once, cleaned up once
+    assert not Path(context.config.control.socket_path).exists()
+    rebind = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    rebind.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        rebind.bind(("127.0.0.1", port))  # the TCP port was released as well
+    finally:
+        rebind.close()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_reconcile_keeps_both_entries_refusing_and_preload_unstarted(sdir) -> None:
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_docker(argv: list[str]) -> tuple[int, str, str]:
+        if argv[1] == "ps":
+            entered.set()
+            assert release.wait(timeout=5)
+        return 0, "", ""
+
+    context = _owner_context(sdir, recovery=DeploymentRecovery("orin-lab", docker=blocking_docker))
+    preloads, _shutdowns = _owner_scheduler_stubs(context)
+    prepared, port = _prebound_socket()
+    owning = asyncio.create_task(run_module.run_v2(context, tcp_socket=prepared))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)  # the reconcile is in flight
+        socket_path = str(context.config.control.socket_path)
+        assert await _eventually(lambda: Path(socket_path).exists())  # bound and permissioned...
+        with pytest.raises((httpx.HTTPError, OSError)):
+            await _request(socket_path)  # ...and accepting nothing at all
+        with pytest.raises((httpx.HTTPError, OSError)):
+            async with httpx.AsyncClient() as client:
+                await client.get(f"http://127.0.0.1:{port}/live")
+        assert preloads == [] and "listeners" not in context.extras
+    finally:
+        release.set()
+        owning.cancel()
+        with suppress(BaseException):
+            await asyncio.wait_for(owning, 15)
+    assert not Path(context.config.control.socket_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_an_occupied_tcp_port_never_reaches_the_lifespan(sdir) -> None:
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        blocker.bind(("127.0.0.1", 8090))  # the port the v2 fixture registers
+        blocker.listen(1)
+    except OSError:
+        pass  # something else already owns it: the conflict this test needs is there anyway
+    context = _owner_context(sdir)
+    preloads, shutdowns = _owner_scheduler_stubs(context)
+    try:
+        with pytest.raises(run_module.RuntimeCompositionError, match="8090"):
+            await asyncio.wait_for(run_module.run_v2(context), 20)
+    finally:
+        blocker.close()
+    assert preloads == [] and shutdowns == []  # the lifespan never started
+    assert not Path(context.config.control.socket_path).exists()  # and our own socket was reclaimed
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_owner_reclaims_both_entries_and_shuts_down_once(sdir) -> None:
+    context = _owner_context(sdir)
+    preloads, shutdowns = _owner_scheduler_stubs(context)
+    prepared, port = _prebound_socket()
+    owning = asyncio.create_task(run_module.run_v2(context, tcp_socket=prepared))
+    try:
+        assert await _eventually(lambda: "listeners" in context.extras)
+        owning.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(owning, 15)
+    finally:
+        if not owning.done():
+            owning.cancel()
+        with suppress(BaseException):
+            await owning  # retrieve whatever the owner ended with: never leave it unobserved
+    assert len(preloads) == 1 and len(shutdowns) == 1  # the ONE lifespan cleaned up after itself
+    assert not Path(context.config.control.socket_path).exists()
+    rebind = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    rebind.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        rebind.bind(("127.0.0.1", port))  # the TCP port was released too
+    finally:
+        rebind.close()
 
 
 # -- the S-gate case: two REAL distinct UIDs on Linux; skipping never counts as passing -----

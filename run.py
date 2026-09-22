@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 from time import monotonic
 from uuid import uuid4
@@ -293,14 +295,69 @@ def build_v2_tcp_app(context: RunContextV2):
                       health_checks=v2_health_checks(context), token_counter=_v2_token_counter(context))
 
 
-def serve_v2(context: RunContextV2) -> None:
-    """Reconcile, recover blobs, then run both listeners over ONE lifespan."""
+def _bind_tcp_socket(host: str, port: int) -> socket.socket:
+    """Bind the TCP entry BEFORE anything may start (K7).
+
+    A busy port is therefore a plain startup refusal: the lifespan (and with it
+    preload) has not started yet, and nothing has to be rolled back but our own
+    prepared socket.
+    """
+    prepared = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        prepared.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        prepared.bind((host, port))
+    except OSError as exc:
+        prepared.close()
+        raise RuntimeCompositionError(f"cannot bind the TCP entry to {host}:{port}: {exc}") from exc
+    return prepared
+
+
+async def run_v2(context: RunContextV2, *, tcp_socket: socket.socket | None = None) -> None:
+    """The K7 owner of both entries, on one event loop.
+
+    Order (plan/08-execution-plan.md C08): the gate starts closed, BOTH entries
+    are prepared before anything runs (the TCP socket is bound here, the Unix
+    socket is bound and permissioned by `ControlServer.prepare()` — neither
+    accepts), then the reconcile and the Blob recovery run, then the ONE
+    application lifespan is entered, then the TCP adapter is started and its
+    real startup result awaited, then the Unix entry is activated and only then
+    is the gate opened.
+
+    Stopping is the reverse order: gate closed first, both entries stop
+    accepting and drain (bounded by the configured grace), the lifespan exits —
+    running the shared scheduler shutdown exactly once — and this owner closes
+    what is left of its own sockets.
+    """
+    from app import application_lifespan
     from model_scheduler.control_api import ControlAPI
     from model_scheduler.control_server import ControlServer, build_control_app
+    from model_scheduler.listener_lifecycle import (
+        ServingGate,
+        TcpServerAdapter,
+        control_refusal,
+        gated_app,
+    )
 
     config = context.config
-
-    async def main() -> None:
+    gate = ServingGate()
+    api = ControlAPI(boot_id=context.boot_id, blobs=context.blobs, scheduler=context.scheduler,
+                     service=context.service, tokens=context.tokens,
+                     idempotency=context.extras.get("idempotency"))
+    control = ControlServer(gated_app(build_control_app(boot_id=context.boot_id, api=api), gate,
+                                      refusal=control_refusal),
+                            socket_path=config.control.socket_path,
+                            allowed_uids=config.control.allowed_uids,
+                            peer_group=config.control.peer_group)
+    await control.prepare()  # bound and permissioned; not one connection is accepted yet
+    shutdown_deadline = monotonic() + config.server.shutdown_grace_seconds
+    try:
+        prepared = tcp_socket if tcp_socket is not None else _bind_tcp_socket(config.server.host, config.server.port)
+    except BaseException:
+        await control.stop()  # the Unix entry we already prepared is ours to reclaim
+        raise
+    app = build_v2_tcp_app(context)
+    adapter = TcpServerAdapter(gated_app(app, gate), log_level="info")
+    try:
         reconciliation = await reconcile_startup(
             context.book, context.recovery, context.observers,
             deadline=monotonic() + config.scheduler.memory_reclaim_timeout_seconds)
@@ -308,23 +365,34 @@ def serve_v2(context: RunContextV2) -> None:
             # Admission stays closed (Book.recovering) — the process reports instead of serving half-truths.
             raise RuntimeCompositionError(f"startup reconciliation failed: {reconciliation.error_code}")
         await context.blobs.recover(instances_running=False, boot_id=context.boot_id)
-        app = build_v2_tcp_app(context)
-        api = ControlAPI(boot_id=context.boot_id, blobs=context.blobs, scheduler=context.scheduler,
-                         service=context.service, tokens=context.tokens,
-                         idempotency=context.extras.get("idempotency"))
-        control = ControlServer(build_control_app(boot_id=context.boot_id, api=api),
-                                socket_path=config.control.socket_path,
-                                allowed_uids=config.control.allowed_uids,
-                                peer_group=config.control.peer_group)
-        server = uvicorn.Server(uvicorn.Config(app, host=config.server.host, port=config.server.port,
-                                               log_level="info"))
-        await control.start()
-        try:
-            await server.serve()  # the TCP app owns the one shared lifespan
-        finally:
-            await control.stop()
+        async with application_lifespan(app):  # the ONE lifespan owns preload, monitors and shutdown
+            serving = asyncio.create_task(adapter.serve(prepared))
+            try:
+                await adapter.ready        # uvicorn's REAL startup result, never a guessed sleep
+                await control.activate()   # the Unix entry starts accepting
+                gate.open()                # both entries are ready from here on
+                context.extras["listeners"] = {"gate": gate, "control": control, "adapter": adapter,
+                                               "port": prepared.getsockname()[1]}
+                await serving
+            finally:
+                context.extras.pop("listeners", None)
+                gate.close()                            # 1) refuse new business first
+                await adapter.stop(shutdown_deadline)   # 2) TCP stops accepting and drains
+                await control.stop()                    # 3) the Unix entry stops accepting and drains
+                if not serving.done():
+                    serving.cancel()
+                    with suppress(BaseException):
+                        await serving
+    finally:
+        await adapter.stop(shutdown_deadline)
+        with suppress(OSError):
+            prepared.close()  # uvicorn closes it when it served it; this covers every earlier exit
+        await control.stop()  # idempotent: a failure before the serving phase still releases our socket
 
-    asyncio.run(main())
+
+def serve_v2(context: RunContextV2) -> None:
+    """The v2 process entry: run the K7 owner on one event loop."""
+    asyncio.run(run_v2(context))
 
 
 def main(argv: list[str] | None = None) -> int:

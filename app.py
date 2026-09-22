@@ -248,6 +248,80 @@ async def _require_empty_body(request: Request, *, timeout_seconds: float) -> No
         raise BodyError(408, "request_body_timeout", "Request body timed out") from exc
 
 
+@asynccontextmanager
+async def application_lifespan(app: FastAPI):
+    """The ONE process lifespan: monitors, preload and cleanup (C08/K7).
+
+    It is a named module-level function so the owner of both listeners can enter
+    it explicitly — before either entry accepts and before the gate opens —
+    while uvicorn runs with `lifespan="off"`. Running this app under
+    `uvicorn.run` without an explicit owner still works, because the FastAPI
+    app declares this very function as its lifespan.
+    """
+    config = app.state.config
+    timeouts = _lifecycle_timeouts(config)
+    retry_delays = app.state.preload_retry_delays
+    app.state.shutting_down = False
+    app.state.preload_error = None
+    app.state.preload_pending = False
+    app.state.preload_task = None
+    app.state.storage_watch_task = None
+    if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "monitor_storage_once", None)):
+        async def watch_storage() -> None:
+            while not app.state.shutting_down:
+                try:
+                    await app.state.scheduler.monitor_storage_once(monotonic() + timeouts.unload_timeout_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The scheduler is fail-closed; a monitor fault must not
+                    # take down /live or spin a retry loop.
+                    pass
+                await asyncio.sleep(config.resources.sample_interval_seconds)
+        app.state.storage_watch_task = asyncio.create_task(watch_storage())
+    if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "preload", None)):
+        async def preload_with_backoff() -> None:
+            attempt = 0
+            while not app.state.shutting_down:
+                try:
+                    await app.state.scheduler.preload(monotonic() + timeouts.load_timeout_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    app.state.preload_error = str(exc)
+                    delay = retry_delays[min(attempt, len(retry_delays) - 1)]
+                    attempt += 1
+                    await asyncio.sleep(delay)
+                else:
+                    app.state.preload_error = None
+                    app.state.preload_pending = False
+                    return
+        app.state.preload_pending = True
+        task = asyncio.create_task(preload_with_backoff())
+        app.state.preload_task = task
+    try:
+        yield
+    finally:
+        # Also on cancellation or an error: the owner stops both entries first, and
+        # this cleanup (the ONE shared scheduler shutdown) still has to run exactly once.
+        app.state.shutting_down = True
+        storage_task = app.state.storage_watch_task
+        if storage_task is not None:
+            storage_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await storage_task
+        task = app.state.preload_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "shutdown", None)):
+            with suppress(Exception):
+                await app.state.scheduler.shutdown(monotonic() + config.server.shutdown_grace_seconds)
+        if app.state.owned_client is not None:
+            await app.state.owned_client.aclose()
+
+
 def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, token_counter=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover.
 
@@ -278,65 +352,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             max_response_body_bytes=config.gateway.max_response_body_bytes,
         )
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        app.state.shutting_down = False
-        app.state.preload_error = None
-        app.state.preload_pending = False
-        app.state.preload_task = None
-        app.state.storage_watch_task = None
-        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "monitor_storage_once", None)):
-            async def watch_storage() -> None:
-                while not app.state.shutting_down:
-                    try:
-                        await app.state.scheduler.monitor_storage_once(monotonic() + timeouts.unload_timeout_seconds)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # The scheduler is fail-closed; a monitor fault must not
-                        # take down /live or spin a retry loop.
-                        pass
-                    await asyncio.sleep(config.resources.sample_interval_seconds)
-            app.state.storage_watch_task = asyncio.create_task(watch_storage())
-        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "preload", None)):
-            async def preload_with_backoff() -> None:
-                attempt = 0
-                while not app.state.shutting_down:
-                    try:
-                        await app.state.scheduler.preload(monotonic() + timeouts.load_timeout_seconds)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        app.state.preload_error = str(exc)
-                        delay = preload_retry_delays[min(attempt, len(preload_retry_delays) - 1)]
-                        attempt += 1
-                        await asyncio.sleep(delay)
-                    else:
-                        app.state.preload_error = None
-                        app.state.preload_pending = False
-                        return
-            app.state.preload_pending = True
-            task = asyncio.create_task(preload_with_backoff())
-            app.state.preload_task = task
-        yield
-        app.state.shutting_down = True
-        storage_task = app.state.storage_watch_task
-        if storage_task is not None:
-            storage_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await storage_task
-        task = app.state.preload_task
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        if app.state.scheduler is not None and callable(getattr(app.state.scheduler, "shutdown", None)):
-            with suppress(Exception):
-                await app.state.scheduler.shutdown(monotonic() + config.server.shutdown_grace_seconds)
-        if app.state.owned_client is not None:
-            await app.state.owned_client.aclose()
-
-    app = FastAPI(title="AGX Model Scheduler", version="1.0", lifespan=lifespan)
+    app = FastAPI(title="AGX Model Scheduler", version="1.0", lifespan=application_lifespan)
     app.state.config = config
     app.state.catalog = catalog
     app.state.ready = False
@@ -347,6 +363,7 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
     app.state.boot_id = boot_id
     app.state.execution_stats = execution_stats
     app.state.token_counter = token_counter
+    app.state.preload_retry_delays = preload_retry_delays  # the named lifespan reads it from state
 
     async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
         try:
