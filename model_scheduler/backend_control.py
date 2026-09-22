@@ -18,13 +18,13 @@ books saw at READY time (P16 AC1: "instance/Fence consistent at every step").
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from .contracts import Observation, Operation, Presence
 from .control_protocol_v1 import Fence, InstanceIdentity
-from .ports_v3 import STOPPED, RUNNING, ExpectedInstance, LifecyclePolicy, ObservationTarget
+from .ports_v3 import STOPPED, RUNNING, ExpectedInstance, LaunchOperation, LifecyclePolicy, ObservationTarget
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,68 @@ class LlamaSwapBackend:
         return await self.observe(model_id)
 
 
+class BootLaunchRecords:
+    """This boot's own launch provenance — the one positive answer K4 accepts.
+
+    A stop may only be accepted when the launch dimension is settled
+    (`stopped_is_proven`), and the fixed control protocol cannot prove that a
+    launch ended. What this process *can* prove is its own dispatch record:
+
+    * a fresh boot has dispatched nothing, so an unknown target resolves to
+      "no launch" and the observation counts as resolved;
+    * once a load dispatches, the record stays `starting` until a terminal
+      verdict (a witnessed RUNNING or a proven STOPPED) settles it, so a lost
+      instance is never read as a proven stop.
+
+    `ManagedLifecycle` is the only writer; observers only read `launch_lookup`.
+    Both live on this process's own event loop, so no lock is involved.
+    """
+
+    def __init__(self, deployment_id: str, *, now: Callable[[], float] | None = None) -> None:
+        if not isinstance(deployment_id, str) or not deployment_id:
+            raise ValueError("the launch records need a deployment id")
+        self._deployment_id = deployment_id
+        self._now = now or monotonic
+        self._dispatches: dict[str, LaunchOperation] = {}
+
+    @property
+    def deployment_id(self) -> str:
+        return self._deployment_id
+
+    def dispatched(self, model_id: str, fence: Fence) -> None:
+        """Record that THIS boot dispatched a launch; it stays unsettled until a verdict."""
+        self._require_model(model_id)
+        if model_id in self._dispatches:
+            return  # one boot, one launch per model: a second dispatch must not restart the record
+        self._dispatches[model_id] = LaunchOperation(
+            operation_id=fence.operation_id, fence=fence,
+            started_at_monotonic=self._now(), state="starting")
+
+    def settled(self, model_id: str) -> None:
+        """A terminal verdict ends the launch: `completed` here means *over*, not *succeeded*."""
+        self._require_model(model_id)
+        existing = self._dispatches.get(model_id)
+        if existing is None or existing.is_terminal:
+            return  # a verdict without this boot's dispatch never fabricates a launch
+        self._dispatches[model_id] = replace(
+            existing, state="completed", terminal_at_monotonic=self._now())
+
+    def launch_lookup(self, model_id: str) -> Callable[[ObservationTarget], LaunchOperation | None]:
+        """The observer hook: `None` means this boot positively never dispatched that target."""
+        self._require_model(model_id)
+
+        def lookup(target: ObservationTarget) -> LaunchOperation | None:
+            if not isinstance(target, ObservationTarget) or target.deployment_id != self._deployment_id:
+                raise ValueError("the launch records were asked about another deployment")
+            return self._dispatches.get(model_id)
+
+        return lookup
+
+    def _require_model(self, model_id: str) -> None:
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("the launch records need a model id")
+
+
 class ManagedLifecycle:
     """The v1-shaped scheduler backend over a v3 adapter plus a C03 observer (P16).
 
@@ -106,6 +168,7 @@ class ManagedLifecycle:
         now: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         expected: Mapping[str, ExpectedInstance] | None = None,
+        launch_records: BootLaunchRecords | None = None,
     ) -> None:
         if not boot_id or not deployment_id:
             raise ValueError("a managed lifecycle needs a boot and a deployment")
@@ -121,6 +184,12 @@ class ManagedLifecycle:
         self._now = now or monotonic
         self._sleep = sleep or asyncio.sleep
         self._expected = dict(expected) if expected is not None else None
+        self._launch_records = launch_records
+
+    @property
+    def launch_records(self) -> BootLaunchRecords | None:
+        """The composition's one launch registry (K4); None means this lifecycle writes none."""
+        return self._launch_records
 
     def instance(self, model_id: str) -> InstanceIdentity | None:
         """Read-only: the book is the single owner of the accepted identity."""
@@ -136,10 +205,13 @@ class ManagedLifecycle:
     async def load(self, operation: Operation, deadline: float) -> Observation:
         model_id = operation.model_id
         adapter = self._adapter_for(model_id)
+        # K4: this boot's own dispatch is the provenance every observer later reads, and it is
+        # recorded BEFORE the call, so a dispatch that never answers still cannot be read as "no launch".
+        self._record_dispatch(model_id, operation)
         try:
             verified = await adapter.load(self._specs[model_id], self.fence(model_id, operation.generation, operation.operation_id), deadline)
         except Exception:
-            return self._unknown("load_failed")
+            return self._unknown("load_failed")  # stays unsettled: the launcher may still be starting
         if verified.state != RUNNING:
             return self._unknown("load_unverified")
         if self._observers.get(model_id) is None:
@@ -147,7 +219,10 @@ class ManagedLifecycle:
         # A healthy adapter answer is still only a control response, so the instance has
         # to be witnessed. The witness gets its own window *inside* the caller's.
         verify_deadline = min(deadline, self._now() + self._policy.verify_window_seconds)
-        return await self._verify_running(model_id, verified.instance, verify_deadline)
+        observation = await self._verify_running(model_id, verified.instance, verify_deadline)
+        if observation.presence in (Presence.RUNNING, Presence.STOPPED):
+            self._record_settled(model_id)  # a terminal verdict is what ends the launch
+        return observation
 
     async def _verify_running(self, model_id: str, identity: InstanceIdentity | None, verify_deadline: float) -> Observation:
         """Witness the instance inside one bounded window (K1).
@@ -230,7 +305,19 @@ class ManagedLifecycle:
                 pass
         if self._observers.get(model_id) is None:
             return self._unknown("observer_missing")
-        return await self._poll_stopped(model_id, identity, deadline)
+        observation = await self._poll_stopped(model_id, identity, deadline)
+        if observation.presence is Presence.STOPPED:
+            self._record_settled(model_id)  # the instance this boot launched is now provably stopped
+        return observation
+
+    def _record_dispatch(self, model_id: str, operation: Operation) -> None:
+        if self._launch_records is not None:
+            self._launch_records.dispatched(
+                model_id, self.fence(model_id, operation.generation, operation.operation_id))
+
+    def _record_settled(self, model_id: str) -> None:
+        if self._launch_records is not None:
+            self._launch_records.settled(model_id)
 
     async def _poll_stopped(self, model_id: str, identity: InstanceIdentity | None, deadline: float) -> Observation:
         """Poll until the four facts prove STOPPED or a running container contradicts the ack."""

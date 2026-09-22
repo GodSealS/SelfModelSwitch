@@ -232,6 +232,24 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 让控制面暴露逐 load 的启动操作状态（或让 managed 加载改走 `SupervisedLaunch` 监督路径）是**新的控制协议
 能力**，另立任务；本轮不得伪造接口实现，也不得默认 `terminal=True`。
 
+**boot 级 launch 记录的接线（RP17 复验缺陷修复，2026-09-22）**：RP17 的真机冷启动暴露了上述“失败封闭”分支的
+生产接线缺口——`run.py` 构造 `DockerProcessObserver` 时从未传 `launch_lookup`，于是 `launch_resolved` 恒为
+False，任何模型都不可能被见证 STOPPED，`reconcile_startup` 恒返回 `unproven_stop`，v2 服务无法启动（真机复现：
+`configuration error: startup reconciliation failed: unproven_stop`，8090 未监听；套件全绿是因为单测都通过注入的
+observer 自带 launch 来源）。修复落地为 `backend_control.BootLaunchRecords`（**本 boot 自己的派发记录**，是 K4 唯一
+接受的正向事实来源）：
+
+- 空账本 = “本 boot 从未派发过该 model”，`launch_lookup(model_id)(target)` 返回 `None` 即“已解析的无 launch”，
+  观察者据此可证 `stopped_is_proven(..., launch_operation_terminal=True, ...)`；
+- `ManagedLifecycle.load` 在调用 adapter **之前**记 `dispatched(model_id, fence)`；该记录保持 `starting`（非终结），
+  直到出现终态裁决才 `settled()`：见证 RUNNING、加载期间见证 STOPPED、或 `stop()` 证明 STOPPED；
+- 加载异常/未见证/UNKNOWN 一律**不 settle**，因此“派发后失联”仍是 `launch_unresolved → UNKNOWN`（K4 不变），
+  不会因为容器消失+端口关闭就被读成已证停止；
+- 只接受本 deployment 的 target；同一 model 的第二次 `dispatched`/`settled` 幂等；未派发就 `settled` 不伪造记录。
+- 装配：`run.py` 生成一个账本并同时交给观察者（`launch_lookup`）与 `build_managed_execution(launch_records=...)`；
+  账本随 v2 上下文进入 `extras["launch_records"]`，`ManagedLifecycle.launch_records` 与 `DockerProcessObserver.launch_source`
+  使其可被结构化断言（RP17 根因回归）。
+
 **采样时刻与取消边界（RP02 已交付）**：一次观察是一个有界工作单元。`ps`、`inspect`、进程探测与端口探测共用同一个
 `sample_deadline = min(caller_deadline, sampled_at + observation_timeout_seconds)`，在同一 worker 线程内串行执行；
 任一段耗尽窗口即返回不完整事实，**不以其他事实补猜**。返回后在消费前复核：`now >= deadline` 或

@@ -35,6 +35,7 @@ import pytest
 
 from model_scheduler import ports_v3 as pv
 from model_scheduler.control_identity import PeerIdentity
+from model_scheduler.control_protocol_v1 import Fence
 from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort
 from model_scheduler.control_server import (
     CONTROL_APP_NAME,
@@ -641,6 +642,44 @@ def _prebound_socket() -> tuple[socket.socket, int]:
     prepared = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     prepared.bind(("127.0.0.1", 0))
     return prepared, prepared.getsockname()[1]
+
+
+def test_every_v2_observer_is_wired_to_the_boot_launch_records(sdir) -> None:
+    """RP17 root cause guard: without a launch source no model can ever be witnessed STOPPED.
+
+    The production composition must hand every observer this boot's own launch
+    records, and a fresh boot must answer "never launched" — which is exactly the
+    fact `reconcile_startup` needs to prove a clean deployment stopped. The real
+    observers are built here (no injected observers), but nothing is probed.
+    """
+
+    def for_this_machine(document) -> None:
+        del document["control"]["peer_group"]
+        document["control"]["allowed_uids"] = [os.getuid()]
+
+    config = _v2_config(sdir, mutate=for_this_machine)
+    ports = {"control": object(), "resources": None,
+             "recovery": DeploymentRecovery("orin-lab", docker=_quiet_docker),
+             "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    context = run_module.build_v2_context(config, config_sha256="a" * 64,
+                                          env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=ports)
+    records = context.extras["launch_records"]
+
+    assert records.deployment_id == "orin-lab"
+    assert context.extras["runtime"].lifecycle.launch_records is records  # one registry, two sides
+    assert set(context.observers) == set(config.models)
+    for observer in context.observers.values():
+        # a fresh boot positively never launched this model: the fact a clean reconcile needs
+        assert observer.launch_source is not None
+        assert observer.launch_source(pv.ObservationTarget(deployment_id="orin-lab")) is None
+    # and each observer reads THIS registry: what is recorded here is what it reports (K4)
+    model_id = sorted(config.models)[0]
+    records.dispatched(model_id, Fence(context.boot_id, model_id, 1, "op-1", None, None))
+    dispatched = context.observers[model_id].launch_source(pv.ObservationTarget(deployment_id="orin-lab"))
+    assert dispatched is not None and dispatched.is_terminal is False
+    records.settled(model_id)
+    settled = context.observers[model_id].launch_source(pv.ObservationTarget(deployment_id="orin-lab"))
+    assert settled is not None and settled.is_terminal is True
 
 
 @pytest.mark.asyncio

@@ -5,11 +5,12 @@ import asyncio
 from datetime import datetime, timezone
 
 from model_scheduler import ports_v3 as pv
-from model_scheduler.backend_control import LlamaSwapBackend, ManagedLifecycle, ManagedModel
+from model_scheduler.backend_control import BootLaunchRecords, LlamaSwapBackend, ManagedLifecycle, ManagedModel
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Operation, Presence
 from model_scheduler.control_protocol_v1 import Fence, InstanceIdentity
 from model_scheduler.model_registry import Book
 from model_scheduler.ports_v3 import StopAck
+from model_scheduler.process_observer import DockerProcessObserver
 
 
 def deadline() -> float:
@@ -164,7 +165,8 @@ def accepted(book: Book) -> Operation:
 
 
 def lifecycle(adapter: ManagedFakeAdapter, observer, *, book: Book | None = None,
-              clock: Clock | None = None, policy: pv.LifecyclePolicy | None = None) -> ManagedLifecycle:
+              clock: Clock | None = None, policy: pv.LifecyclePolicy | None = None,
+              records: BootLaunchRecords | None = None) -> ManagedLifecycle:
     registry = book if book is not None else make_book()
     current = clock or Clock()
 
@@ -178,6 +180,7 @@ def lifecycle(adapter: ManagedFakeAdapter, observer, *, book: Book | None = None
         specs={"chat": object()}, adapter_for=lambda model_id: adapter,
         observers={"chat": observer}, instance_lookup=registry.instance,
         policy=policy or TEST_POLICY, now=current, sleep=advance,
+        launch_records=records,
     )
 
 
@@ -446,3 +449,82 @@ async def test_the_orphan_release_receives_the_caller_deadline() -> None:
 
     assert adapter.releases == ["chat"]
     assert adapter.release_deadlines == [awaited]  # declared capability, bounded by the caller
+
+
+# -- K4/RP18: this boot's launch provenance, written by the lifecycle --------------------------
+
+
+def clean_observer(records: BootLaunchRecords) -> DockerProcessObserver:
+    """The REAL observer over a deployment with no container, a closed port and no process."""
+
+    def docker(argv: list[str]) -> tuple[int, str, str]:
+        return 0, ("[]" if argv[1] == "inspect" else ""), ""
+
+    return DockerProcessObserver(
+        "orin-lab", "chat", 10001, docker=docker,
+        port_state=lambda port: "closed", process_state=lambda pid: "absent",
+        launch_lookup=records.launch_lookup("chat"),
+    )
+
+
+def test_the_lifecycle_exposes_the_very_records_it_writes() -> None:
+    records = BootLaunchRecords("orin-lab")
+
+    bridge = lifecycle(ManagedFakeAdapter(), ScriptedObserver([]), records=records)
+
+    assert bridge.launch_records is records  # the composition shares one registry with its observers
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_boot_that_never_dispatched_can_prove_a_stop() -> None:
+    """The RP17 regression: this is what the production composition could never do before."""
+    records = BootLaunchRecords("orin-lab")
+
+    observation = await clean_observer(records).observe(pv.ObservationTarget(deployment_id="orin-lab"), deadline())
+
+    assert observation.state == pv.STOPPED and observation.launch_resolved is True
+
+
+@pytest.mark.asyncio
+async def test_a_witnessed_load_settles_this_boots_launch_record() -> None:
+    records = BootLaunchRecords("orin-lab")
+    bridge = lifecycle(ManagedFakeAdapter(),
+                       ScriptedObserver([v3_observation(pv.RUNNING, INSTANCE)]), records=records)
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.RUNNING
+    launch = records.launch_lookup("chat")(pv.ObservationTarget(deployment_id="orin-lab"))
+    assert launch is not None and launch.is_terminal is True
+    assert launch.operation_id == "op-1" and launch.fence == Fence("boot-1", "chat", 1, "op-1", None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_load_that_observes_a_proven_stop_settles_the_record() -> None:
+    records = BootLaunchRecords("orin-lab")
+    bridge = lifecycle(ManagedFakeAdapter(),
+                       ScriptedObserver([v3_observation(pv.STOPPED, INSTANCE)]), records=records)
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.STOPPED
+    launch = records.launch_lookup("chat")(pv.ObservationTarget(deployment_id="orin-lab"))
+    assert launch is not None and launch.is_terminal is True
+
+
+@pytest.mark.asyncio
+async def test_an_unwitnessed_load_keeps_the_launch_unsettled_so_a_lost_instance_is_never_a_stop() -> None:
+    """K4: dispatched-but-unresolved must stay UNKNOWN even with the container gone (RP17's trap)."""
+    records = BootLaunchRecords("orin-lab")
+    bridge = lifecycle(ManagedFakeAdapter(),
+                       ScriptedObserver([v3_observation(pv.UNKNOWN)]), records=records)
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.UNKNOWN  # the load was never witnessed
+    launch = records.launch_lookup("chat")(pv.ObservationTarget(deployment_id="orin-lab"))
+    assert launch is not None and launch.is_terminal is False
+    observation = await clean_observer(records).observe(
+        pv.ObservationTarget(deployment_id="orin-lab"), deadline())
+    assert observation.launch_resolved is True  # the record WAS looked up...
+    assert observation.state == pv.UNKNOWN  # ...and an unsettled launch is still no stop

@@ -405,6 +405,11 @@ class DockerProcessObserver:
             return None, False
         return self._launch_lookup(target), True
 
+    @property
+    def launch_source(self) -> Callable[[ports_v3.ObservationTarget], ports_v3.LaunchOperation | None] | None:
+        """The launch provenance this observer reads (K4); `None` means it can never resolve one."""
+        return self._launch_lookup
+
     async def observe(self, target: ports_v3.ObservationTarget, deadline: float) -> ports_v3.Observation:
         if not isinstance(target, ports_v3.ObservationTarget) or target.deployment_id != self._deployment_id:
             raise ObservationError("the observation target belongs to another deployment")

@@ -96,6 +96,7 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
     """
     import httpx
 
+    from model_scheduler.backend_control import BootLaunchRecords
     from model_scheduler.blob_store import BlobStore
     from model_scheduler.contracts_v2 import GGUF_PROFILE, DeploymentSpec
     from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort
@@ -154,8 +155,13 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
         from model_scheduler.llama_swap_contract import CONTROL_CONTRACT  # only when the profile needs it
         from model_scheduler.llama_swap_client import LlamaSwapClient
         control = LlamaSwapClient(base_url, contract=CONTROL_CONTRACT)
+    # K4: the observers may only accept a stop when the launch dimension is settled, and the fixed
+    # control protocol cannot prove that a launch ended. This boot's own dispatch record can: it
+    # starts empty ("never launched") and stays unsettled after a dispatch until a verdict settles it.
+    launch_records = ports.get("launch_records") or BootLaunchRecords(deployment_id)
     observers = ports.get("observers") or {
         model_id: DockerProcessObserver(deployment_id, model_id, model.port,
+                                        launch_lookup=launch_records.launch_lookup(model_id),
                                         expected=expected_instances[model_id])
         for model_id, model in config.models.items()
     }
@@ -196,12 +202,13 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
         },
         execution_kwargs={"queue_capacity": policy.queue_capacity, "wait_seconds": policy.queue_timeout_seconds},
         expected_instances=expected_instances,
+        launch_records=launch_records,
     )
     return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
                          lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
                          recovery=recovery, observers=dict(observers), config=config,
                          extras={"runtime": runtime, "clients": clients, "idempotency": idempotency,
-                                 "control": control})
+                                 "control": control, "launch_records": launch_records})
 
 
 def _execution_stats(context: RunContextV2):

@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from .adapters.llama_cpp import LlamaCppAdapter
-from .backend_control import LlamaSwapBackend, ManagedLifecycle, ManagedModel
+from .backend_control import BootLaunchRecords, LlamaSwapBackend, ManagedLifecycle, ManagedModel
 from .deploy import DeployError
 from .config import AppConfig, model_specs
 from .contracts_v2 import DeploymentSpec
@@ -250,6 +250,7 @@ def build_managed_execution(
     execution_kwargs: Mapping[str, Any] | None = None,
     lifecycle_policy: LifecyclePolicy | None = None,
     expected_instances: Mapping[str, ExpectedInstance],
+    launch_records: BootLaunchRecords | None = None,
 ) -> ManagedExecutionRuntime:
     """Join one v2 registration, llama-swap control, C03 observers and the queue.
 
@@ -280,6 +281,7 @@ def build_managed_execution(
         boot_id=boot_id, deployment_id=deployment_id, specs=models,
         adapter_for=adapters.__getitem__, observers=observers,
         instance_lookup=book.instance, policy=lifecycle_policy, expected=expected_instances,
+        launch_records=launch_records,
     )
     for model_id, model in models.items():
         adapters[model_id] = LlamaCppAdapter(
