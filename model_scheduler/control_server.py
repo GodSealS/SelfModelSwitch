@@ -16,6 +16,11 @@
   chunks with either Content-Length or chunked framing, and protocol abuse
   closes the connection WITHOUT an HTTP answer (the C05 table has no code for
   framing errors);
+* the listener is bound in two phases (C08/K7): `prepare()` binds the socket and
+  finishes its permissions without accepting a single connection, `activate()`
+  starts accepting, and `stop()` is idempotent and removes only the inode this
+  server bound. `start()` stays as the `prepare(); activate()` convenience for
+  single-entry callers;
 * `stop()` first stops accepting, then cancels and awaits every in-flight
   connection task and closes its transport, so no task or fd survives —
   the shared lifespan cleanup runs exactly once in the owner of this server,
@@ -31,6 +36,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import struct
 import sys
 import time
@@ -176,8 +182,29 @@ class ControlServer:
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[asyncio.Task[None]] = set()
         self._refusing = False
+        self._prepared = False
+        self._activated = False
+        # K7: the identity of the socket THIS server bound, so a stop can never
+        # unlink a file some other process put at the same path.
+        self._socket_identity: tuple[int, int] | None = None
 
     async def start(self) -> None:
+        """Compatibility convenience for single-entry callers: `prepare(); activate()`.
+
+        The formal two-entry composition (C08/K7) calls the two phases itself.
+        """
+        await self.prepare()
+        await self.activate()
+
+    async def prepare(self) -> None:
+        """Bind the socket and finish its permissions; nothing is accepted yet (K7).
+
+        Every failure — a live listener, a missing group, a permission error, a
+        cancellation — rolls the bind back, and only the socket this server bound
+        is ever removed.
+        """
+        if self._prepared:
+            raise ControlServerError("the control listener is already prepared")
         parent = self.socket_path.parent
         if not parent.is_dir():
             raise ControlServerError("the control socket directory must exist before serving")
@@ -187,29 +214,84 @@ class ControlServer:
             if _socket_is_live(self.socket_path):
                 raise ControlServerError("another control listener already owns the socket")
             self.socket_path.unlink()
-        self._server = await asyncio.start_unix_server(self._on_connection, path=str(self.socket_path))
+        self._prepared = True
         try:
-            os.chmod(self.socket_path, self._mode)
-            if self._peer_group is not None:
-                gid = grp.getgrnam(self._peer_group).gr_gid
-                os.chown(self.socket_path, -1, gid)
-        except OSError as exc:
-            await self.stop()
-            raise ControlServerError(f"cannot secure the control socket: {exc}") from exc
+            self._server = await asyncio.start_unix_server(
+                self._on_connection, path=str(self.socket_path), start_serving=False)
+            bound = os.stat(self.socket_path)
+            self._socket_identity = (bound.st_dev, bound.st_ino)
+            try:
+                os.chmod(self.socket_path, self._mode)
+                if self._peer_group is not None:
+                    # A missing group is a refusal, not a traceback (and the bind is rolled back).
+                    gid = grp.getgrnam(self._peer_group).gr_gid
+                    os.chown(self.socket_path, -1, gid)
+            except (OSError, KeyError) as exc:
+                raise ControlServerError(f"cannot secure the control socket: {exc}") from exc
+        except BaseException:
+            await self._teardown()
+            raise
+
+    async def activate(self) -> None:
+        """Start accepting; only valid after a successful prepare (K7)."""
+        if not self._prepared or self._server is None:
+            raise ControlServerError("the control listener must be prepared before it can accept")
+        if self._activated:
+            raise ControlServerError("the control listener is already accepting")
+        await self._server.start_serving()
+        self._activated = True
 
     async def stop(self) -> None:
-        """C08 shutdown order: stop accepting, drain/cancel connections, then remove the socket."""
+        """C08 shutdown order: stop accepting, drain/cancel connections, then remove this server's own socket (K7)."""
         self._refusing = True
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+            await server.wait_closed()
         for task in list(self._connections):
             task.cancel()
         if self._connections:
             await asyncio.gather(*self._connections, return_exceptions=True)
-        with suppress(FileNotFoundError):
-            self.socket_path.unlink()
+        self._discard_own_socket()
+        self._prepared = self._activated = False
+
+    def _discard_own_socket(self) -> None:
+        """Remove the socket only while the path still holds the inode this server bound (K7).
+
+        Synchronous on purpose: it must also run while a cancellation unwinds.
+        """
+        identity, self._socket_identity = self._socket_identity, None
+        if identity is None:
+            return
+        try:
+            current = os.stat(self.socket_path)
+        except OSError:
+            return
+        if (current.st_dev, current.st_ino) == identity:
+            with suppress(OSError):
+                self.socket_path.unlink()
+
+    async def _teardown(self) -> None:
+        """Roll one failed prepare back without ever touching a foreign socket."""
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+            with suppress(Exception):
+                await server.wait_closed()
+        if self._socket_identity is not None:
+            self._discard_own_socket()
+        elif server is None and self.socket_path.exists():
+            # The bind phase was interrupted before its server object came back: the
+            # half-created socket is the only socket-shaped thing this server may
+            # remove, and only while nothing answers on it.
+            try:
+                mode = os.stat(self.socket_path).st_mode
+            except OSError:
+                return
+            if stat.S_ISSOCK(mode) and not _socket_is_live(self.socket_path):
+                with suppress(OSError):
+                    self.socket_path.unlink()
+        self._prepared = self._activated = False
 
     @property
     def in_flight(self) -> int:

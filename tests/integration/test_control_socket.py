@@ -34,9 +34,11 @@ from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecov
 from model_scheduler.control_server import (
     CONTROL_APP_NAME,
     ControlServer,
+    ControlServerError,
     build_control_app,
     build_tcp_skeleton_app,
     peer_uid_of,
+    send_json,
 )
 from model_scheduler.idempotency import IdempotencyStore
 
@@ -133,6 +135,138 @@ async def test_socket_is_group_readable_zero_six_six_zero_under_a_private_parent
     finally:
         await server.stop()
     assert not server.socket_path.exists()  # stop() removes the listener socket, not someone else's
+
+
+# -- K7/RP13: bind and permissions first, accepting second, and only our own socket -----------------
+
+def _private_control_dir(sdir: Path) -> Path:
+    root = sdir / "run" / "self-model-switch"
+    root.mkdir(parents=True)
+    os.chmod(root, 0o750)
+    return root / "control.sock"
+
+
+@pytest.mark.asyncio
+async def test_prepare_binds_without_accepting_and_activate_opens_the_listener(sdir) -> None:
+    calls = {"count": 0}
+
+    async def counting_app(scope, receive, send):
+        calls["count"] += 1
+        await send_json(send, 200, {"ok": True})
+
+    server = ControlServer(counting_app, socket_path=_private_control_dir(sdir), allowed_uids=(os.getuid(),))
+    await server.prepare()
+
+    assert server.socket_path.exists() and _stat_mode(server.socket_path) == 0o660
+    with pytest.raises(OSError):  # bound but not yet listening: the kernel refuses the connection
+        await asyncio.open_unix_connection(str(server.socket_path))
+    assert calls["count"] == 0  # not one handler call before activate
+
+    await server.activate()
+    response = await _request(str(server.socket_path), path="/internal/peer")
+    assert response.status_code == 200 and calls["count"] == 1
+    await server.stop()
+    assert not server.socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_activate_refuses_before_prepare_and_when_repeated(sdir) -> None:
+    server = ControlServer(build_control_app(boot_id="b"), socket_path=_private_control_dir(sdir),
+                           allowed_uids=(os.getuid(),))
+
+    with pytest.raises(ControlServerError):  # nothing is bound yet
+        await server.activate()
+    await server.prepare()
+    with pytest.raises(ControlServerError):  # a second bind would leak a listener
+        await server.prepare()
+    await server.activate()
+    with pytest.raises(ControlServerError):  # already accepting
+        await server.activate()
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_group_or_a_permission_failure_leaves_no_socket(sdir, monkeypatch) -> None:
+    path = _private_control_dir(sdir)
+    missing_group = ControlServer(build_control_app(boot_id="b"), socket_path=path,
+                                  allowed_uids=(os.getuid(),), peer_group="sms-no-such-group-ever")
+
+    with pytest.raises(ControlServerError):  # grp.getgrnam raises KeyError, and the bind is rolled back
+        await missing_group.prepare()
+    assert not path.exists()
+
+    failing = ControlServer(build_control_app(boot_id="b"), socket_path=path, allowed_uids=(os.getuid(),))
+    real_chmod = os.chmod
+
+    def broken_chmod(target, mode):
+        if str(target).endswith("control.sock"):
+            raise PermissionError("injected chmod failure")
+        return real_chmod(target, mode)
+
+    monkeypatch.setattr(os, "chmod", broken_chmod)
+    with pytest.raises(ControlServerError):
+        await failing.prepare()
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_prepare_leaves_no_socket_behind(sdir, monkeypatch) -> None:
+    server = ControlServer(build_control_app(boot_id="b"), socket_path=_private_control_dir(sdir),
+                           allowed_uids=(os.getuid(),))
+    original = asyncio.start_unix_server
+
+    async def interrupted_bind(*args, **kwargs):
+        bound = await original(*args, **kwargs)
+        await asyncio.sleep(5)  # held open after the bind, before prepare can return
+        return bound
+
+    monkeypatch.setattr(asyncio, "start_unix_server", interrupted_bind)
+    preparing = asyncio.create_task(server.prepare())
+    assert await _eventually(lambda: server.socket_path.exists())  # the socket was really bound
+    preparing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await preparing
+
+    assert not server.socket_path.exists()  # the interrupted bind left nothing behind
+
+
+async def _eventually(predicate, *, attempts: int = 100) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.asyncio
+async def test_a_live_listener_is_refused_and_never_removed(sdir) -> None:
+    path = _private_control_dir(sdir)
+    first = ControlServer(build_control_app(boot_id="first"), socket_path=path, allowed_uids=(os.getuid(),))
+    await first.start()
+    second = ControlServer(build_control_app(boot_id="second"), socket_path=path, allowed_uids=(os.getuid(),))
+    try:
+        with pytest.raises(ControlServerError):
+            await second.prepare()
+        # the live listener still owns its socket and still answers
+        assert (await _request(str(path))).status_code == 200
+    finally:
+        await second.stop()  # idempotent: it owns nothing, so it removes nothing
+        assert path.exists()
+        await first.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_never_removes_a_socket_that_was_replaced(sdir) -> None:
+    server = ControlServer(build_control_app(boot_id="b"), socket_path=_private_control_dir(sdir),
+                           allowed_uids=(os.getuid(),))
+    await server.start()
+    path = server.socket_path
+    path.unlink()  # the file this server bound is gone; a different inode now sits at the path
+    path.write_text("replacement", encoding="utf-8")
+
+    await server.stop()
+
+    assert path.read_text(encoding="utf-8") == "replacement"  # stop() must not delete a foreign inode
 
 
 @pytest.mark.asyncio

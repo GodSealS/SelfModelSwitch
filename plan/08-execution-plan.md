@@ -414,12 +414,16 @@ control listener 适配器必须从 accepted Unix socket 读取 Linux SO_PEERCRE
 
 #### C08 增量：准备/开放分离与唯一 lifespan（K7，RP00 同步）
 
-真源是执行契约 K7；下面接口当前均不存在，由 RP13/RP14 交付。现有 `ControlServer`（`control_server.py:149`）
-只有 `start()`/`stop()`。增量：
+真源是执行契约 K7；下面接口由 RP13/RP14 交付，其中 RP13 交付 `ControlServer` 的准备/开放/清理生命周期。
+现有 `ControlServer`（`control_server.py:149`）原只有 `start()`/`stop()`。增量：
 
-- 准备与开放分离：`prepare()` 只 bind 不 accept，并在 chmod/chown 成功后返回；`activate()` 仅能在 prepare
-  成功后调用；`stop()` 幂等且只清理本次启动拥有的资源。`start()` 保留为 `prepare(); activate()` 的兼容便利入口，
-  **正式双入口装配不得调用**。
+- 准备与开放分离（**RP13 已交付**）：`prepare()` 只 bind 不 accept（`start_serving=False`），并在 chmod/chown
+  成功后返回；`activate()` 仅能在 prepare 成功后调用，重复 prepare 与错序/重复 activate 都是受控
+  `ControlServerError`；`stop()` 幂等且只清理本次启动拥有的资源——bind 成功后记录 socket 的 `(st_dev, st_ino)`，
+  清理时复核该 inode，被替换的路径或别的 live listener 的 socket 永不删除。`start()` 保留为
+  `prepare(); activate()` 的兼容便利入口，**正式双入口装配不得调用**。失败回滚覆盖 bind 失败、`grp.getgrnam`
+  的 KeyError、chmod/chown 失败与 prepare 期间的取消：都不留本次的 socket；bind 阶段被中断且 server 对象未返回
+  时，只删除"仍是 socket 且无人监听"的残留。
 - 新增进程内共享 `ServingGate`：`ready` 是进程内对象，不能由客户端 header/body 控制。两个业务入口的 ASGI
   包装都在 **dispatch 前**检查 gate；未 open 时业务请求返回现有 503 格式，不读 body、不创建 Blob、不排队/加载；
   TCP `/live` 可作存活诊断，`/health` 必须 503 且不触发业务。

@@ -512,10 +512,27 @@ S 层回归。
 **Files likely touched:** `model_scheduler/control_server.py`、`tests/integration/test_control_socket.py`。
 **Documentation impact:** C08说明准备/开放区别、0660与UID白名单为不同层；非白名单连接层关闭不改成403。
 **Acceptance criteria:**
-- [ ] prepare后零handler调用，chmod/chown成功后才activate；重复/错序activate受控拒绝。
-- [ ] group KeyError、权限失败、启动取消均无本次遗留；已有live socket及被替换inode不被误删。
-- [ ] 原allowed UID/伪造header/非白名单、HTTP1.1限制测试保持通过。
+- [x] prepare后零handler调用，chmod/chown成功后才activate；重复/错序activate受控拒绝。
+- [x] group KeyError、权限失败、启动取消均无本次遗留；已有live socket及被替换inode不被误删。
+- [x] 原allowed UID/伪造header/非白名单、HTTP1.1限制测试保持通过。
 **Verification:** `"$PY" -m pytest tests/integration/test_control_socket.py -q`；RP17再跑Linux真实双UID场景。
+
+**执行结果（2026-09-22）**：`ControlServer` 增加 K7 生命周期：`prepare()`（`start_serving=False`）只 bind 并完成
+chmod/chown，`activate()` 才开始 accept，`start()` 保留为两者的兼容便利入口。重复 `prepare()`、错序
+`activate()` 与重复 `activate()` 都抛 `ControlServerError`。bind 成功后记录 socket 的 `(st_dev, st_ino)`；
+`stop()` 幂等，且只在路径仍持有该 inode 时才 unlink——被替换的文件与别的 live listener 的 socket 都不会被删除。
+失败回滚覆盖 bind 失败、`grp.getgrnam` 的 KeyError（原实现只捕 `OSError`，会遗留 socket）、chmod/chown 失败与
+prepare 期间的取消；bind 阶段被中断（server 对象未返回）时只删除“仍是 socket 且无人监听”的残留。内核 peer
+凭据检查、UID 白名单与非白名单连接层关闭语义未改（0660/组是文件权限层，白名单是连接层）。
+
+新增 6 个用例（`tests/integration/test_control_socket.py`）：prepare 后 0660 且零 handler 调用、未 activate 时
+连接被内核拒绝、activate 后可服务；错序/重复激活受控拒绝；缺组与权限失败都不留 socket；prepare 被取消不留
+socket；第二个 server 对 live socket 拒绝且不删除它；stop 不删被替换的 inode。RED 阶段 6 failed（无
+prepare/activate；被替换的 inode 被删）。
+
+验证：新用例 + 验收指定的既有身份/协议用例 12 passed；全量 `pytest tests -m 'not thor' -q` **1003 passed、
+1 skipped、1 deselected**（15m37s，较 RP10 的 997 增加 6）、`ruff check .` 通过、`run.py --check-config` 通过。
+Linux 真实双 UID 场景留待 RP17；macOS 未冒充。
 
 ## Task RP14：双入口统一就绪与唯一lifespan
 
