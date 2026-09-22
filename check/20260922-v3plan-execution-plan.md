@@ -494,6 +494,9 @@ S 层回归。
 - [ ] 缺/多模型、重复键/模型、错identity、symlink/路径逃逸拒绝；局部measurement_ref可独立复算。
 **Verification:** `"$PY" -m pytest tests/test_candidate.py -q`及全量；直接解析生成CandidateV3并重算digest。
 
+**状态（2026-09-22）**：**N/A**——RP15/ADR-05 把最终生产范围冻结为单模型 `qwen25vl-7b`，未触发本任务
+“最终发布范围 > 1”的条件。若将来发布范围改为多模型（含 35B 新方法分支），本任务恢复为必需。
+
 ## Task RP12：多模型材料进入证据包并被离线复核（条件任务）
 
 **Primary owner:** backend。**Collaborators:** arch。**Dependencies:** RP11。**Estimated scope:** M，5文件。
@@ -504,6 +507,10 @@ S 层回归。
 - [ ] 两模型candidate→run fixture→merge→verify→production render测试链消费到对应材料；移动整个包不依赖原绝对路径。
 - [ ] 缺一文件/改bytes/hash/错namespace退出2；完整但测量语义失败退出3；不把手填passed当最终证据。
 **Verification:** `"$PY" -m pytest tests/test_acceptance_runner.py tests/test_verify.py tests/test_candidate.py tests/test_deploy_render.py -q`及全量；RP12不通过，多模型发布保持阻塞。
+
+**状态（2026-09-22）**：**N/A**——与 RP11 同因：RP15/ADR-05 冻结单模型生产范围，多模型材料链未触发；
+单模型的材料链已由既有 S/B/O 路径覆盖（RP17 复验）。发布范围若改为多模型，本任务与其“不通过则多模型发布
+保持阻塞”的规则同时生效。
 
 ## Task RP13：Unix socket先准备权限，再开始accept
 
@@ -579,9 +586,32 @@ owner 取消后共享清理恰一次且两入口资源回收）。RED 阶段 3 f
 **Files likely touched:** `plan/adr/decisions.md`、`plan/08-execution-plan.md`、`plan/validation.md`。
 **Documentation impact:** C02/ADR的已决策状态唯一；validation保留原记录并加勘误，不擦失败。
 **Acceptance criteria:**
-- [ ] 明列Accepted/Proposed、选定method版本、生产model_id集合及排除依据，没有把实验ready当生产准入。
-- [ ] 若要求35B生产，先形成新method验证任务和证据要求；新方法未证前RP17生产验收阻塞。
+- [x] 明列Accepted/Proposed、选定method版本、生产model_id集合及排除依据，没有把实验ready当生产准入。
+- [x] 若要求35B生产，先形成新method验证任务和证据要求；新方法未证前RP17生产验收阻塞。
 **Verification:** 整数公式复算、文档交叉引用和`git diff --check`；本任务不重跑模型，也不代用户接受产品取舍。
+
+**执行结果（2026-09-22）**：用户选择**保留现有方法并冻结当前生产候选范围**，已记录为
+[ADR-05](../plan/adr/decisions.md)（**Accepted**）：method 版本 `system_nonfree_upper_bound_v1`，15% 余量、整数公式与
+`model_budget_bytes = 36,000,000,000 B` 不变；**生产 model_id 集合 = {`qwen25vl-7b`}**
+（`physical_resident_peak_bytes = 29,675,012,096`，预留 `34,126,263,911 B ≤ 36e9`）；排除 `qwen36-35b`
+（预留 75,029,940,839 B > MemTotal 65,893,224,448 B，现方法下本机不可准入）、`qwen36-27b`（仅 lab：预留为估算、
+未做三轮测量）与 `embedding`/`rerank`（无真实 fixture/测量）；明确排除只是**当前候选范围**、不是永久不可用，
+并保留“必须生产支持 35B”分支的前置条件（新 method 版本/字段/collector/evaluator/候选绑定 + 重新校准，不得临时扣
+page cache）。`qwen-small` 时代的已冻结候选结论**不得沿用**到改名后的 `qwen25vl-7b`。第二条验收按条件不成立而
+满足：用户未选择 35B 分支，故 RP17 生产验收**不阻塞**；若将来改选该分支，ADR-05 已写明其必须先完成新 method
+验证任务，届时 RP17 的生产结论随之阻塞。
+
+同步位置：`plan/08-execution-plan.md` C02 段落新增决策增量（含排除依据与 RP11/RP12 → N/A）；`plan/validation.md`
+**保留原始记录不擦失败**，新增文末「勘误与决策更新」并把 35B 的预留整数由 `75,029,940,838` 更正为
+`75,029,940,839`（另在 35B 一节 §3 后加指向该勘误的一行指针），同时把历史材料（35B 校准、27B lab 实验、
+`qwen-small` 冻结候选）与当前候选范围分开。
+
+验证：用现行整数公式 `physical_reserved_bytes_from_peak`（`contracts_v2.py`）实际复算——
+35B `(65,243,426,816×115+99)//100 = 75,029,940,839`、7B `= 34,126,263,911`，且 `35B > MemTotal`、
+`7B ≤ 36e9` 两个判定与文档一致；文档交叉引用（ADR-05 ↔ plan/08 C02 ↔ validation 勘误 ↔ 本记录）经本地链接
+检查通过；`git diff --check` exit 0。本任务**不重跑模型**、未做目标同步、未代用户接受取舍；源码树未改动
+（`git diff --stat` 仅 4 份文档），故未重跑全量测试——最近一次全量 1017 passed 对应同一源码树（RP16 记录）。
+解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP16：导航、规范与本地总检查
 
@@ -613,6 +643,8 @@ test-N01）记为**明确不改**（保留 O01 门槛、不扩能力闭集、不
 C03/C08/C09 与实现一致性的探针复核通过：`LifecyclePolicy` 值 = 10/0.5/2/2/60、`Book.load_stopped` 存在、
 `ControlServer.prepare/activate/stop` 存在、`ServingGate`/`TcpServerAdapter`/`DeploymentRecoveryPort` 存在。
 **未测结论仍未测**：README 与 08 头部均写明设备与生产未验收，本任务不重跑模型、不做目标同步。
+
+依赖说明：本任务依赖项中的“多模型时加RP12”按 RP15/ADR-05 的单模型生产范围记为 **N/A**（RP11 同因）。
 
 验证：全量 `pytest tests -m 'not thor' -q` **1017 passed、1 skipped、1 deselected**（15m45s，与 RP14 同数——
 本任务无源码改动，回归未增未减）、`ruff check .` 通过、`run.py --check-config`

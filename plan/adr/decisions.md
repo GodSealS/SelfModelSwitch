@@ -29,6 +29,36 @@ L<=25分钟不切；L>25分钟时N=floor(L/25分钟)+1，平均分N块，恰好�
 保留分块声线ID，在管线末尾分析跨块一致性；不足以确认则保持独立并列待确认，人工确认后合并。
 自动高置信度规则/模型/阈值待V00冻结；原始ID和证据始终保留，人工修订可撤销。
 
+## ADR-05：C02 生产模型范围（已接受，2026-09-22）
+
+背景：35B（`qwen36-35b-aggr`，待登记为 `qwen36-35b`）已完成一轮真实校准（`…/cal-qwen36-noswap/`：
+`verified_runs=3/3`、`stops_proven=true`、`reserved_bytes=18,290,511,463`、`physical_resident_peak_bytes=65,243,426,816`），
+但按首版方法 `system_nonfree_upper_bound_v1` 的静态门槛，其预留 `ceil(bound×1.15)=75,029,940,839 B` **大于整机内存**
+（MemTotal `65,893,224,448 B`）——该口径把 mmap 进 page cache 的权重也算作占用，模型越大越退化成“文件大小 + OS”。
+27B（`qwen36-27b`）目前只有估算 `reserved_bytes=29,000,000,000`，lab 配置（`sms-orin-lab2`）主动标 `measured: false`
+关闭物理门槛，未按 C02/P21 做三轮测量。产品范围未闭合会阻塞最终候选
+（[K8](../../check/20260922-v3plan-execution-contracts.md)）。
+
+**决定（Accepted，2026-09-22，用户选择）：保留现有方法并冻结当前生产候选范围。**
+
+- 选定 method 版本：`system_nonfree_upper_bound_v1`；15% 余量与整数公式 `physical_reserved_bytes_from_peak` 均不变，
+  现行预算 `resources.model_budget_bytes = 36,000,000,000 B` 不变。
+- **生产 model_id 集合 = {`qwen25vl-7b`}**（盘上的 Qwen2.5-VL-7B，chat/vision；
+  `physical_resident_peak_bytes = 29,675,012,096`，预留 `ceil(×1.15) = 34,126,263,911 ≤ 36e9`）。
+  已冻结候选 `35c4af59…` 用的是改名前的 `qwen-small`；改名改变了部署身份，**下次重建候选须在 `qwen25vl-7b`
+  下重做全部 S/B/O 证据**，不得沿用旧材料的通过结论。
+- **排除（当前候选范围，非永久不可用）**：`qwen36-35b`（预留 75,029,940,839 B > MemTotal 65,893,224,448 B，
+  本机在现方法下不可准入）；`qwen36-27b`（仅 lab：预留是估算值、未做三轮测量）；`embedding`/`rerank`
+  （无真实 fixture/测量，cap 验收延后）。
+- **未采纳的另一分支（保留入口）**：若将来必须生产支持 35B，须先定义新的物理占用上界语义、归属与保守性论证，
+  新增 method 版本、原始采集字段、collector/evaluator 与候选绑定，并重新校准所有受影响模型；
+  **不得**临时扣减 page cache 或把 `MemAvailable` 增量当作物理上界。
+- 现行 O01 门槛、能力闭集、同 UID 边界不随本决策改变；本决策不重跑模型，也不把实验 `ready` 当生产准入。
+
+代价：本机生产候选为单模型，多模型（含 35B）发布不在当前范围，多模型材料链任务（RP11/RP12）记为 N/A。
+缓解：35B 两轮校准材料（6 个 run 的原始采样 + `measurements.json`）与失败记录完整保留，未来重评估走上面的未采纳分支；
+27B 若要进生产，先按 C02/P21 补三轮测量与预算复核。**设备与生产验收仍未完成**（RP17）。
+
 ## Grill Review
 
 已覆盖假设、风险/证据、取舍和实施时序；用户已选择现在修正文档。

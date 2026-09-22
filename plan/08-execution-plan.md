@@ -142,6 +142,15 @@ admit = (
 - UNKNOWN/ERROR/BLOCKED 保留两套预留；请求结束只还执行槽，实例 STOPPED 才还模型预留。
   内存低于 F 关闭新执行并启动受管计算清理；停止后重新采样，最多等 10s，仍不足保持不可准入。
 
+**生产候选范围决策（RP15 已交付，2026-09-22；Accepted 见 [ADR-05](adr/decisions.md)）**：产品选择**保留首版方法并冻结
+当前生产候选范围**。method 仍为 `system_nonfree_upper_bound_v1`，15% 余量、整数公式与 `model_budget_bytes =
+36,000,000,000 B` 均不变。生产 model_id 集合 = **{`qwen25vl-7b`}**（`physical_resident_peak_bytes = 29,675,012,096`，
+预留 `ceil(×1.15) = 34,126,263,911 B ≤ 36e9` 通过）；排除 `qwen36-35b`（预留 `ceil(65,243,426,816×1.15) =
+75,029,940,839 B > MemTotal 65,893,224,448 B，现方法下本机不可准入）、`qwen36-27b`（仅 lab：预留为估算、无三轮
+测量）与 `embedding`/`rerank`（无真实 fixture/测量）。排除只是**当前候选范围**，不是模型永久不可用；若将来必须
+生产支持 35B，须先新增 method 版本、字段、collector/evaluator 与候选绑定并重新校准，不得临时扣减 page cache。
+多模型材料链任务（RP11/RP12）随本决策记为 N/A。该决策不重跑模型，不把实验 `ready` 当生产准入。
+
 ### C03：身份、端口与异步回写
 
 InstanceIdentity = `(container_id, started_at, deployment_id, model_id, runtime_id,
