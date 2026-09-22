@@ -83,7 +83,7 @@ def startup_plan(config) -> StartupPlan:
     return StartupPlan(1, True, _V1_LOCK_PATH)
 
 
-def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None) -> RunContextV2:
+def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports: dict | None = None) -> RunContextV2:
     """Join one v2 registration to the managed composition with fail-closed site inputs.
 
     `ports` injects the external boundaries (resources/blobs/recovery/control/
@@ -107,7 +107,23 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
     deployment_id = env.get(_V2_DEPLOYMENT_ENV)
     if not isinstance(deployment_id, str) or not deployment_id:
         raise RuntimeCompositionError(f"v2 startup needs the site deployment identity in {_V2_DEPLOYMENT_ENV}")
+    if not isinstance(config_sha256, str) or len(config_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in config_sha256):
+        raise RuntimeCompositionError("v2 startup needs the SHA-256 of the raw configuration bytes")
+    from model_scheduler.ports_v3 import ExpectedInstance
+
     registration = DeploymentSpec(runtimes=tuple(config.runtimes.values()), models=tuple(config.models.values()))
+    # K4: one expectation per registered model, assembled here from the raw bytes.
+    # `identity_digest` is therefore the *configuration* digest, not a candidate one.
+    runtimes_by_id = {runtime.runtime_id: runtime for runtime in config.runtimes.values()}
+    expected_instances: dict[str, ExpectedInstance] = {}
+    for model_id, model in config.models.items():
+        runtime = runtimes_by_id.get(model.runtime_id)
+        if runtime is None:
+            raise RuntimeCompositionError(f"model {model_id!r} is registered without its runtime")
+        expected_instances[model_id] = ExpectedInstance(
+            deployment_id=deployment_id, model_id=model_id, runtime_id=model.runtime_id,
+            image_digest=runtime.image_digest, identity_digest=config_sha256,
+        )
     specs = ledger_specs_from(registration=registration)
     book = ports.get("book") or Book(
         specs, model_budget=config.resources.model_budget_bytes,
@@ -137,7 +153,8 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
         from model_scheduler.llama_swap_client import LlamaSwapClient
         control = LlamaSwapClient(base_url, contract=CONTROL_CONTRACT)
     observers = ports.get("observers") or {
-        model_id: DockerProcessObserver(deployment_id, model_id, model.port)
+        model_id: DockerProcessObserver(deployment_id, model_id, model.port,
+                                        expected=expected_instances[model_id])
         for model_id, model in config.models.items()
     }
     inference_base_urls = {model_id: f"http://127.0.0.1:{model.port}" for model_id, model in config.models.items()}
@@ -169,6 +186,7 @@ def build_v2_context(config: AppConfigV2, *, env=None, ports: dict | None = None
             "max_evictions": config.scheduler.max_evictions_per_request,
         },
         execution_kwargs={"queue_capacity": policy.queue_capacity, "wait_seconds": policy.queue_timeout_seconds},
+        expected_instances=expected_instances,
     )
     return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
                          lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
@@ -313,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(path)
         if path.read_bytes() != config_bytes:
             raise ConfigError("configuration changed while loading")
+        # K4: the digest is taken from the exact bytes the process will run on, before
+        # any early return, so v1 and v2 can never disagree about what was configured.
+        config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     except (ConfigError, OSError) as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 78
@@ -323,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     if plan.schema_version == 2:
         try:
             with acquire(plan.lock_path):
-                serve_v2(build_v2_context(config))
+                serve_v2(build_v2_context(config, config_sha256=config_sha256))
         except RuntimeCompositionError as exc:
             print(f"configuration error: {exc}", file=sys.stderr)
             return 78
@@ -337,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print("configuration error: fixed llama-swap control contract is not installed", file=sys.stderr)
             return 78
-        config_digest = hashlib.sha256(config_bytes).hexdigest()
+        config_digest = config_sha256
         manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
         backend = build_backend(config, manifest, config_digest, CONTROL_CONTRACT)
         with acquire(plan.lock_path):

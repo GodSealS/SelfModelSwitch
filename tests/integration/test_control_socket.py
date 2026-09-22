@@ -255,7 +255,7 @@ def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) 
     fake_ports = {"control": object(), "resources": None, "recovery": object(),
                   "observers": {mid: object() for mid in config.models},
                   "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
-    context = run_module.build_v2_context(config, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+    context = run_module.build_v2_context(config, config_sha256="a" * 64, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
     assert context.boot_id and context.tokens.boot_id == context.boot_id
     assert sorted(context.book.specs) == ["embedding", "qwen-small"]
     # one scheduler behind one service behind one lifecycle: the context is the single join
@@ -272,7 +272,7 @@ def test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes(sdir)
     fake_ports = {"control": object(), "resources": None, "recovery": object(),
                   "observers": {mid: object() for mid in config.models},
                   "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
-    context = run_module.build_v2_context(config, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+    context = run_module.build_v2_context(config, config_sha256="a" * 64, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
     app = run_module.build_v2_tcp_app(context)
 
     with _TestClient(app) as client:
@@ -296,11 +296,11 @@ def test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes(sdir)
 def test_v2_refuses_to_guess_site_inputs(sdir) -> None:
     config = _v2_config(sdir)
     with pytest.raises(Exception) as missing_identity:
-        run_module.build_v2_context(config, env={}, ports={})
+        run_module.build_v2_context(config, config_sha256="a" * 64, env={}, ports={})
     assert "SELFMODEL_SWITCH_DEPLOYMENT_ID" in str(missing_identity.value)
     env = {run_module._V2_DEPLOYMENT_ENV: "orin-lab"}
     with pytest.raises(Exception) as missing_swap:
-        run_module.build_v2_context(config, env=env, ports={})
+        run_module.build_v2_context(config, config_sha256="a" * 64, env=env, ports={})
     assert "SELFMODEL_SWITCH_SWAP_CONTROL_URL" in str(missing_swap.value)
 
 
@@ -318,6 +318,17 @@ def test_swap_contract_is_imported_only_for_profiles_that_need_it(sdir, monkeypa
     assert "model_scheduler.llama_swap_contract" not in sys.modules
 
 
+def test_v2_startup_refuses_a_missing_or_malformed_configuration_digest(sdir) -> None:
+    config = _v2_config(sdir)
+    env = {run_module._V2_DEPLOYMENT_ENV: "orin-lab"}
+    for bad in ("", "not-a-digest", "A" * 64, "f" * 63):
+        with pytest.raises(Exception) as refused:
+            run_module.build_v2_context(config, config_sha256=bad, env=env,
+                                        ports={"control": object(), "resources": None,
+                                               "recovery": object(), "observers": {}, "clients": {}})
+        assert "configuration bytes" in str(refused.value), bad
+
+
 def test_main_orders_lock_before_context_and_serves_the_v2_plan(sdir, monkeypatch) -> None:
     from contextlib import nullcontext
 
@@ -328,7 +339,10 @@ def test_main_orders_lock_before_context_and_serves_the_v2_plan(sdir, monkeypatc
         seen["lock"] = path
         return nullcontext()
 
-    def fake_build(cfg):
+    captured: dict = {}
+
+    def fake_build(cfg, *, config_sha256, env=None, ports=None):
+        captured["sha"] = config_sha256
         seen["context"] = object()
         return run_module.RunContextV2(boot_id="b", scheduler=None, service=None, lifecycle=None, book=None,
                                        blobs=None, tokens=None, recovery=None, observers={}, config=None)
@@ -340,6 +354,8 @@ def test_main_orders_lock_before_context_and_serves_the_v2_plan(sdir, monkeypatc
     assert run_module.main(["--config", str(sdir / "config.yaml")]) == 0
     assert seen["lock"] == sdir / "run" / "self-model-switch" / "scheduler.lock"
     assert list(seen) == ["lock", "context", "served"]  # lock first, one context, then serve
+    # K4: main hands the composition the digest of the exact bytes it read
+    assert len(captured["sha"]) == 64 and all(ch in "0123456789abcdef" for ch in captured["sha"])
 
 
 @pytest.mark.asyncio

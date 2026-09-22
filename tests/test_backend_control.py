@@ -394,6 +394,47 @@ async def test_a_proven_stop_during_a_load_is_reported_not_silently_failed() -> 
     assert result.detail_code == "load_proven_stopped"
 
 
+def _expected(identity_digest: str) -> dict:
+    return {"chat": pv.ExpectedInstance(deployment_id="orin-lab", model_id="chat", runtime_id="llama-cpp",
+                                        image_digest="repo/llama@sha256:" + "c" * 64,
+                                        identity_digest=identity_digest)}
+
+
+@pytest.mark.asyncio
+async def test_the_bridge_rechecks_the_identity_against_the_composition_expectation() -> None:
+    """K4: the labels layer is not the only gate; a mismatched fact still cannot land."""
+    adapter = ManagedFakeAdapter()
+    observer = ScriptedObserver([v3_observation(pv.RUNNING, INSTANCE)])
+    bridge = ManagedLifecycle(
+        boot_id="boot-1", deployment_id="orin-lab", specs={"chat": object()},
+        adapter_for=lambda model_id: adapter, observers={"chat": observer},
+        instance_lookup=make_book().instance, policy=TEST_POLICY, now=Clock(),
+        sleep=lambda _: asyncio.sleep(0), expected=_expected("e" * 64),  # another configuration
+    )
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.UNKNOWN
+    assert result.detail_code == "observation_identity_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_the_expected_configuration_digest_accepts_the_matching_container() -> None:
+    adapter = ManagedFakeAdapter()
+    observer = ScriptedObserver([v3_observation(pv.RUNNING, INSTANCE)])
+    bridge = ManagedLifecycle(
+        boot_id="boot-1", deployment_id="orin-lab", specs={"chat": object()},
+        adapter_for=lambda model_id: adapter, observers={"chat": observer},
+        instance_lookup=make_book().instance, policy=TEST_POLICY, now=Clock(),
+        sleep=lambda _: asyncio.sleep(0), expected=_expected("b" * 64),
+    )
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.RUNNING
+    assert result.instance == INSTANCE
+
+
 @pytest.mark.asyncio
 async def test_the_orphan_release_receives_the_caller_deadline() -> None:
     adapter = ManagedFakeAdapter(load_state=pv.UNKNOWN)

@@ -229,11 +229,41 @@ stop 用调用方 deadline 且超时返回 non-accepted；无身份孤儿可显�
 **Files likely touched:** `model_scheduler/backend_control.py`、`model_scheduler/scheduler.py`、`model_scheduler/runtime.py`、`tests/test_backend_control.py`、`tests/integration/test_managed_execution.py`。
 **Documentation impact:** 补齐C03加载见证与stop终态的区别；详细错误保留内部不扩公共错误枚举。
 **Acceptance criteria:**
-- [ ] UNKNOWN→RUNNING恰2次观察；截止后零次新观察；慢观察的迟到RUNNING不可接受；无observer立即失败。
-- [ ] 冷启动identity=None可发现合格实例；wrong model/deployment/runtime/digest/StartedAt、未来/陈旧样本拒绝；观测没有权力自己定义期望身份。
-- [ ] load/stop不修改身份；过期或旧op成功/停止不污染新一代；旧load finally不能pop新task。
-- [ ] managed要求完整RUNNING身份和valid_until，legacy原结果不被误拒；stop四事实和无身份release回归通过。
+- [x] UNKNOWN→RUNNING恰2次观察；截止后零次新观察；慢观察的迟到RUNNING不可接受；无observer立即失败。
+- [x] 冷启动identity=None可发现合格实例；wrong model/deployment/runtime/digest/StartedAt、未来/陈旧样本拒绝；观测没有权力自己定义期望身份。
+- [x] load/stop不修改身份；过期或旧op成功/停止不污染新一代；旧load finally不能pop新task。
+- [x] managed要求完整RUNNING身份和valid_until，legacy原结果不被误拒；stop四事实和无身份release回归通过。
 **Verification:** `"$PY" -m pytest tests/test_backend_control.py tests/integration/test_managed_execution.py -q`，再全量；使用可控时钟和有界脚本，禁止用宽泛`>=2`作为终态证据。
+
+**执行结果（2026-09-22，提交 `3d2755f` + `c`）**：bridge 删除 `_instances`，`instance()` 改为注入的只读
+`instance_lookup`；`load` 用 `verify_deadline = min(caller_deadline, now + verify_window)` 做有界见证，
+`valid_until = min(deadline, sampled_at + max_age)` 由 bridge 推导（K2 明确不由观测侧给出）；
+拒绝原因码落齐 `observer_missing / verify_deadline_exhausted / observer_failed / observation_stale /
+observation_identity_mismatch / launch_unresolved / load_proven_stopped`；`launch_resolved=False` 的 STOPPED 一律降级
+为 UNKNOWN。孤儿释放改为显式 `adapter.release(model_id, deadline)`，去掉 `getattr` 猜测。
+scheduler：`book.loaded(operation, now, instance=observation.instance)`，新增 `require_instance_identity`
+（显式模式，不用反射猜）与 `lifecycle_policy`；`_finish_load` 的 finally 只在仍持有该槽时 pop。
+runtime：managed 装配固定 `require_instance_identity=True`，bridge 取 `book.instance`。
+
+新增 11 个测试（`tests/test_backend_control.py`）：恰 2 次观察、窗口耗尽零观察、迟到样本、缺完整身份、
+错模型、冷启动可发现、未解 launch 不证停止、已证停止上报、孤儿 release 收到 deadline、
+bridge 按期望值复核身份（正反例）。集成 9 项（真实 llama.cpp adapter + 真实 docker observer）全通。
+测试约定：注入 `now` 后必须让注入的 `sleep` 同步推进假时钟，否则 UNKNOWN 轮询会死循环。
+
+**RP04a 执行结果**：`build_managed_execution` 新增必需 `expected_instances`（模型集合必须完全相等、
+每项必须属于本 deployment/model 且 `digest_kind == "config"`，否则 `RuntimeCompositionError`），并把 mapping
+交给 bridge；`run.py` 的 `main` 在 `--check-config` 早退之前对**原始字节**求 SHA-256，
+`build_v2_context(config, *, config_sha256, ...)` 校验 64hex 后按 `deployment_id + 每模型 runtime_id +
+runtime.image_digest + config_sha256` 构造唯一期望 mapping，**同一份 mapping 同时传给 observer 与 bridge**；
+bridge 在 labels 层之外再按期望值核对 runtime/image/digest。v1 分支复用同一 `config_sha256`。
+
+新增：启动拒绝缺/错摘要（4 组非法值）、bridge 期望值正反例、main 确把 64hex 摘要交给装配
+（在 `test_main_orders_lock_before_context_and_serves_the_v2_plan` 内断言）。
+`test_managed_execution.start_lab` 的真实 observer 与 `build_managed_execution` 现在共用同一 `ExpectedInstance`。
+
+验证：全量 `pytest tests -m 'not thor' -q` **957 passed、1 skipped、1 deselected**（15m37s）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
+所有 `build_v2_context` / `build_managed_execution` 调用点已迁移，无不可运行的中间提交。
 
 ## Task RP04a：从配置原始字节闭合生产身份输入
 
@@ -242,10 +272,10 @@ stop 用调用方 deadline 且超时返回 non-accepted；无身份孤儿可显�
 **Files likely touched:** `run.py`、`model_scheduler/runtime.py`、`tests/integration/test_control_socket.py`、`tests/integration/test_managed_execution.py`、`tests/integration/test_process_lifecycle.py`。
 **Documentation impact:** C03明确当前identity_digest实际绑定config、与candidate摘要不同；无需新增配置字段/环境变量。
 **Acceptance criteria:**
-- [ ] main传入原始字节SHA-256；build_v2_context缺/错摘要、期望模型集合不完整时启动拒绝。
-- [ ] 实际observer和bridge使用相同mapping；managed scheduler显式require_instance_identity=True；无弱校验fallback。
-- [ ] 原样配置可接受对应label，修改配置但复用旧容器拒绝；两标签同时出现拒绝。
-- [ ] RP04/RP04a全部调用点迁移后共同跑全量，不产生不可运行的中间提交。
+- [x] main传入原始字节SHA-256；build_v2_context缺/错摘要、期望模型集合不完整时启动拒绝。
+- [x] 实际observer和bridge使用相同mapping；managed scheduler显式require_instance_identity=True；无弱校验fallback。
+- [x] 原样配置可接受对应label，修改配置但复用旧容器拒绝；两标签同时出现拒绝。
+- [x] RP04/RP04a全部调用点迁移后共同跑全量，不产生不可运行的中间提交。
 **Verification:** `"$PY" -m pytest tests/integration/test_control_socket.py tests/integration/test_managed_execution.py tests/integration/test_process_lifecycle.py tests/test_process_observer.py -q`及通用全量；Linux专属运行证据留到RP17。
 
 ## Task RP05：加载STOPPED释放预算且保留失败/重试边界

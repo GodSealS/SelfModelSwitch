@@ -20,7 +20,7 @@ from .execution_service import ExecutionService
 from .idempotency import IdempotencyStore
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
 from .model_registry import Book
-from .ports_v3 import STOPPED, LifecyclePolicy, ObservationTarget
+from .ports_v3 import STOPPED, ExpectedInstance, LifecyclePolicy, ObservationTarget
 from .process_observer import ProcessObserver
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
@@ -244,6 +244,7 @@ def build_managed_execution(
     scheduler_kwargs: Mapping[str, Any] | None = None,
     execution_kwargs: Mapping[str, Any] | None = None,
     lifecycle_policy: LifecyclePolicy | None = None,
+    expected_instances: Mapping[str, ExpectedInstance],
 ) -> ManagedExecutionRuntime:
     """Join one v2 registration, llama-swap control, C03 observers and the queue.
 
@@ -259,11 +260,21 @@ def build_managed_execution(
     missing = set(models) - set(clients) - set(observers) - set(inference_base_urls)
     if missing:
         raise RuntimeCompositionError(f"managed composition lacks ports for: {sorted(missing)}")
+    # K4: the expectation is assembled by the composition root from the raw config
+    # bytes. There is no weak fallback — a missing or mismatched expectation is a
+    # refused startup, because an observation can never be the source of the rule
+    # that judges it.
+    if not isinstance(expected_instances, Mapping) or set(expected_instances) != set(models):
+        raise RuntimeCompositionError("managed composition needs exactly one expected instance per registered model")
+    for model_id, expected in expected_instances.items():
+        if (not isinstance(expected, ExpectedInstance) or expected.deployment_id != deployment_id
+                or expected.model_id != model_id or expected.digest_kind != "config"):
+            raise RuntimeCompositionError(f"the expected instance for {model_id!r} does not belong to this deployment")
     adapters: dict[str, Any] = {}
     lifecycle = ManagedLifecycle(
         boot_id=boot_id, deployment_id=deployment_id, specs=models,
         adapter_for=adapters.__getitem__, observers=observers,
-        instance_lookup=book.instance, policy=lifecycle_policy,
+        instance_lookup=book.instance, policy=lifecycle_policy, expected=expected_instances,
     )
     for model_id, model in models.items():
         adapters[model_id] = LlamaCppAdapter(

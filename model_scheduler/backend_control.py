@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from .contracts import Observation, Operation, Presence
 from .control_protocol_v1 import Fence, InstanceIdentity
-from .ports_v3 import STOPPED, RUNNING, LifecyclePolicy, ObservationTarget
+from .ports_v3 import STOPPED, RUNNING, ExpectedInstance, LifecyclePolicy, ObservationTarget
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,7 @@ class ManagedLifecycle:
         policy: LifecyclePolicy | None = None,
         now: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        expected: Mapping[str, ExpectedInstance] | None = None,
     ) -> None:
         if not boot_id or not deployment_id:
             raise ValueError("a managed lifecycle needs a boot and a deployment")
@@ -119,6 +120,7 @@ class ManagedLifecycle:
         self._policy = policy or LifecyclePolicy()
         self._now = now or monotonic
         self._sleep = sleep or asyncio.sleep
+        self._expected = dict(expected) if expected is not None else None
 
     def instance(self, model_id: str) -> InstanceIdentity | None:
         """Read-only: the book is the single owner of the accepted identity."""
@@ -195,6 +197,15 @@ class ManagedLifecycle:
             return "observation_identity_mismatch"
         if identity is not None and (instance.container_id != identity.container_id
                                      or instance.started_at != identity.started_at):
+            return "observation_identity_mismatch"
+        expected = None if self._expected is None else self._expected.get(model_id)
+        if expected is not None and (
+            instance.runtime_id != expected.runtime_id
+            or instance.image_digest != expected.image_digest
+            or instance.candidate_digest != expected.identity_digest
+        ):
+            # K4: the bridge re-checks the fields against the composition's own
+            # expectation, so a fact that slipped past the labels still cannot land.
             return "observation_identity_mismatch"
         return None
 

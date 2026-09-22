@@ -574,9 +574,12 @@ async def start_lab(tmp_path, *, hang: asyncio.Event | None = None):
     def port_state(_port: int) -> str:
         return "listening" if any(f["State"]["Running"] for f in docker.facts.values()) else "closed"
 
+    expected = pv.ExpectedInstance(deployment_id=LAB_DEPLOYMENT, model_id=LAB_MODEL, runtime_id=LAB_RUNTIME,
+                                   image_digest=LAB_IMAGE, identity_digest=LAB_CONFIG_SHA)
     observer = DockerProcessObserver(
         LAB_DEPLOYMENT, LAB_MODEL, 18099, docker=docker, port_state=port_state,
         launch_lookup=lambda target: None, process_state=lambda pid: "absent", clock=SystemClock(),
+        expected=expected,
     )
     sessions = SessionManager(wait_seconds=100.0, hard_deadline_seconds=3600.0, heartbeat_seconds=10.0,
                               ttl_seconds=120.0, prepare_seconds=100.0, drain_seconds=30.0, retry_seconds=30.0,
@@ -590,6 +593,7 @@ async def start_lab(tmp_path, *, hang: asyncio.Event | None = None):
         scheduler_kwargs={"poll_interval_seconds": 0.01},
         execution_kwargs={"poll_seconds": 0.01, "wait_seconds": 600.0},
         lifecycle_policy=FAST_POLICY,
+        expected_instances={LAB_MODEL: expected},
     )
     await asyncio.wait_for(runtime.scheduler.open_session(LAB_MODEL, "client-a", "session-lab"), 5)
     return runtime, docker, swap, calls, book, blobs, None
