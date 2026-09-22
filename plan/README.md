@@ -1,7 +1,8 @@
 # SelfModelSwitch：模型挂载与切换方案 v3
 
-日期：2026-09-16。源码基线：`c32dd1a8ecdfa9b7f8f9a964886b794a943e16ca`。
-状态：设计修订，未实施生产代码，未完成真机验收。
+日期：2026-09-16。源码基线：`c32dd1a8ecdfa9b7f8f9a964886b794a943e16ca`（**历史快照**：09-16 设计阶段的核对）。
+状态（**历史**）：设计修订，未实施生产代码，未完成真机验收——该行只描述 09-16 的设计阶段；
+v3 实施与修复的当前状态见下方「文档角色」与「当前进度」，设备与生产结论文档仍未验收。
 
 ## 项目范围
 
@@ -21,16 +22,39 @@ SelfModelSwitch 只提供模型挂载、加载、卸载、切换及其必要的�
 | [02-scheduler.md](02-scheduler.md) | 资源、租约、切换、停止证据与恢复 |
 | [03-api.md](03-api.md) | 兼容接口与通用模型控制协议设计 |
 | [04-deployment.md](04-deployment.md) | 模型配置、资产、设备、迁移与部署 |
-| [05-tasks-and-acceptance.md](05-tasks-and-acceptance.md) | 仅模型服务的实施任务 |
-| [06-acceptance.md](06-acceptance.md) | 模型服务独立验收与发布门禁 |
+| [05-tasks-and-acceptance.md](05-tasks-and-acceptance.md) | 仅模型服务的实施任务（范围定义；进度见 08） |
+| [06-acceptance.md](06-acceptance.md) | 模型服务独立验收与发布门禁（**规范性真源**） |
+| [08-execution-plan.md](08-execution-plan.md) | v3 执行计划：C01—C09 接口/行为约束、有序任务与验证模板 |
 | [adr/decisions.md](adr/decisions.md) | 本次 Grill Review 与边界决策 |
 | [m00-envelope.md](m00-envelope.md) | M00 首轮最大输入与并发探测规格 |
-| [validation.md](validation.md) | 本次文档验证记录 |
+| [validation.md](validation.md) | 证据与验证记录（不是规范），含历史快照段落 |
+| [../check/20260922-v3plan-execution-contracts.md](../check/20260922-v3plan-execution-contracts.md) | 本轮修复冻结的接口/状态契约 K1—K8（**规范性真源**，由 08 引用） |
+| [../check/20260922-v3plan-execution-plan.md](../check/20260922-v3plan-execution-plan.md) | 本轮修复的 19 项任务（RP00—RP18）与逐项实际验证记录 |
 
 [07-pipeline.md](07-pipeline.md) 仅保留迁移导航，不再定义本项目功能。
 [legacy-v1](legacy-v1/README.md) 和 [legacy-v2](legacy-v2/ARCHIVE.md) 均为历史资料，不参与当前规范解释。
-旧 reference Python 契约随 v2 归档，不能作为新方案的字段真源；新 DTO/schema 在实施任务 M01 中建立。
-本方案与生产代码有明确版本差异；新增接口和命令均为待实现设计，当前可用功能以根 README 为准。
+旧 reference Python 契约随 v2 归档，不能作为新方案的字段真源；新 DTO/schema 在 M01/`contracts_v2.py` 中建立。
+[../check/20260922-v3plan-review-verification.md](../check/20260922-v3plan-review-verification.md) 与
+[../check/20260922-v3plan-fix-plan.md](../check/20260922-v3plan-fix-plan.md) 分别是原团队审查 23 个 ID 的逐项
+事实复核与修复思路来源——两者都是记录，不是规范。
+
+## 文档角色：当前规范 / 基线快照 / 记录
+
+- **当前规范**：`01`—`06` 与 `08` 的 C01—C09 约束；`06` 始终是必测集合与发布门槛的规范来源，
+  K1—K8 契约在 `check/20260922-v3plan-execution-contracts.md`，08 的 Cxx 节引用它们。
+- **基线快照（历史）**：`legacy-v1`、`legacy-v2`、`video-analysis`、`05` 的 M00—M07 任务表、
+  `08` §1 的实施前核对（含 3.13.5 解释器、226 passed、当时“模块不存在”等判断）、`validation.md` 的旧段落。
+  它们记录实施前的事实，不再代表当前状态。
+- **记录（不是规范）**：`validation.md` 的证据段落与 `check/` 下的复核/方案/执行计划。记录只回答
+  “做过什么、证据是什么”，不能覆盖 `06` 的门禁或 `08` 的约束，也不能把未执行的验收写成通过。
+
+## 当前进度（2026-09-22）
+
+v3 实施按 `08` 与 [执行Plan](../check/20260922-v3plan-execution-plan.md) 推进：**RP00—RP14 已交付并原子提交**
+（含 C03 的 K1—K5、C08 的 K7 准备/开放分离与双入口共同就绪、C09 的 K6 第一阶段），**RP16**（本页导航与总检查）
+同批完成；剩余 **RP15**（C02 产品决策，待用户选择）与依赖本页的 **RP17**（同 SHA 目标复验），以及**仅当**最终
+生产模型数 > 1 时必需的 **RP11/RP12**。逐项实际验证记录写在 `check/` 执行计划内；**设备与生产结论仍未验收**，
+本页不宣称任何模型可用。
 
 ## 已确认决策
 

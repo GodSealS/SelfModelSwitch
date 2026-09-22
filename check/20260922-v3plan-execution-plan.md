@@ -590,10 +590,35 @@ owner 取消后共享清理恰一次且两入口资源回收）。RED 阶段 3 f
 **Files likely touched:** `plan/README.md`、`plan/05-tasks-and-acceptance.md`、`plan/08-execution-plan.md`、本执行Plan。
 **Documentation impact:** R5完成，指向同一规范/状态入口；不初始化SysDocs。
 **Acceptance criteria:**
-- [ ] 入口含08，旧SHA与旧“未实施”标为历史；C03/C08/C09与实现一致，未测结论仍未测。
-- [ ] 原用户改动完整保留，diff仅相关变更；不提交模型/凭据或原审查未跟踪目录。
-- [ ] Python3.12全量测试、ruff、check-config、diff检查通过；各提交可审阅且无未解释的缺测。
+- [x] 入口含08，旧SHA与旧“未实施”标为历史；C03/C08/C09与实现一致，未测结论仍未测。
+- [x] 原用户改动完整保留，diff仅相关变更；不提交模型/凭据或原审查未跟踪目录。
+- [x] Python3.12全量测试、ruff、check-config、diff检查通过；各提交可审阅且无未解释的缺测。
 **Verification:** 通用全量检查、23-ID映射、链接检查和逐片diff审阅；结果写入实际验证记录，不能预填通过。
+
+**执行结果（2026-09-22）**：导航与历史分层落地，**只改4份文档**，无源码改动。`plan/README.md`：入口表新增
+`08`、K1—K8 契约与本次执行Plan，新增「文档角色（当前规范/基线快照/记录）」与「当前进度」两节，头部
+09-16 基线 `c32dd1a` 与“未实施生产代码”标为**历史**；明确 `06` 始终是必测集合与发布门槛的**规范来源**，
+`legacy-*`/`video-analysis`/`05`任务表/`08`§1 为基线快照，`validation.md`与`check/`为记录且不能覆盖门禁。
+`plan/05`：顶部加当前进度指引并标明 M00—M07“全部为待办”只对 09-16 成立。`plan/08`：头部加当前交付状态
+（RP00—RP14 已交付，RP15—RP17 未完，功能与设备验收均未通过）；§1.1 加历史横幅并就地更正两条已过时断言
+（控制协议模块与测试**现均在库**；用户补丁已由 RP04/RP04a 整合提交）；§1.2 标为历史（3.13.5 与 226 passed 的
+实施前核对，发布要求 3.12）；§2 前言改为“除节内「RPxx 已交付」标注外不声称已实现”。`06-acceptance.md`
+未改动，保持门禁真源。
+
+**23-ID 复核（唯一覆盖 + 处置）**：原审查 23 个 ID（design-F01—F09、code-F01—F10、security-N01、backend-N01、
+test-N01/N02）在复核报告与 §4 覆盖表中的 ID 集合经脚本核对为 **23/23 唯一且完全一致**（差集为空）；判定分布
+**7 成立 / 12 部分成立 / 4 不成立**，与复核报告一致。处置：4 个不成立项（design-F03、design-F04、design-F08、
+test-N01）记为**明确不改**（保留 O01 门槛、不扩能力闭集、不安排 Blob 重构、保留已有 UNKNOWN 负例）；其余按
+§4 表落到 RP01—RP17（成立的 core 缺陷集中在 RP01—RP09，权限/导航在 RP13/RP16，候选完整性在 RP10—RP12/RP15）。
+C03/C08/C09 与实现一致性的探针复核通过：`LifecyclePolicy` 值 = 10/0.5/2/2/60、`Book.load_stopped` 存在、
+`ControlServer.prepare/activate/stop` 存在、`ServingGate`/`TcpServerAdapter`/`DeploymentRecoveryPort` 存在。
+**未测结论仍未测**：README 与 08 头部均写明设备与生产未验收，本任务不重跑模型、不做目标同步。
+
+验证：全量 `pytest tests -m 'not thor' -q` **1017 passed、1 skipped、1 deselected**（15m45s，与 RP14 同数——
+本任务无源码改动，回归未增未减）、`ruff check .` 通过、`run.py --check-config`
+（schema_version=1、四 ID）通过、`git diff --check` exit 0；4 份文档本地链接检查 **40 条 / 0 失效**。
+逐片提交审阅：RP00—RP14 各自原子提交且带实际验证记录，无未解释的缺测；`tasks/`、`plan/video-analysis/`、
+`graphify-out/` 保持未跟踪、未提交（原审查未跟踪目录与用户改动完整保留）。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP17：同SHA目标复验与最终候选
 
