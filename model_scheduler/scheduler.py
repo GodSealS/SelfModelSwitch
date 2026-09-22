@@ -19,6 +19,7 @@ from typing import Callable, Mapping
 from .contracts import ControlRecoveryPort, Lease, MemorySample, Observation, Outcome, Presence
 from .eviction_policy import EvictionPolicy
 from .model_registry import Book, Conflict, StaleOperation
+from .ports_v3 import LifecyclePolicy
 from .request_queue import RequestQueue, WaitKind, WaitState
 from .session_manager import ACTIVE, BLOCKED, CLOSED, DRAINING, PREPARING, SessionConflict, SessionManager, SessionNotFound
 
@@ -42,7 +43,7 @@ class SwitchIntent:
 class ModelScheduler:
     """Coordinates shared loads and leases without ever awaiting under its lock."""
 
-    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, load_retry_limit: int = 3, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic, event_sink: Callable[[str, Mapping[str, object]], None] | None = None):
+    def __init__(self, book: Book, resources, backend, *, queue_capacity: int = 128, priority_aging_seconds: float = 30, poll_interval_seconds: float = 1, max_evictions: int = 8, switch_drain_timeout_seconds: float = 30, switch_retry_seconds: float = 30, switch_window_seconds: float = 10, max_switches_in_window: int = 3, cooldown_seconds: float = 15, load_retry_limit: int = 3, recovery: ControlRecoveryPort | None = None, admission_guard=None, sessions: SessionManager | None = None, clock: Callable[[], float] = monotonic, event_sink: Callable[[str, Mapping[str, object]], None] | None = None, require_instance_identity: bool = False, lifecycle_policy: LifecyclePolicy | None = None):
         if min(poll_interval_seconds, switch_drain_timeout_seconds, switch_retry_seconds, switch_window_seconds, cooldown_seconds) <= 0 or max_switches_in_window < 1:
             raise ValueError("scheduler intervals must be positive")
         if load_retry_limit < 0:
@@ -76,6 +77,10 @@ class ModelScheduler:
         self.sessions = sessions if sessions is not None else SessionManager()
         self._clock = clock
         self.event_sink = event_sink
+        # K2: an explicit mode, never guessed from whether a result happens to carry
+        # an identity. The managed composition passes True; the legacy one stays False.
+        self.require_instance_identity = require_instance_identity
+        self.lifecycle_policy = lifecycle_policy or LifecyclePolicy()
         self._session_worker: asyncio.Task[None] | None = None
         self._session_leases: dict[str, set[str]] = {}
         self._session_freeze: str | None = None
@@ -249,10 +254,12 @@ class ModelScheduler:
         try:
             observation: Observation = await self.backend.load(operation, deadline)
             async with self._condition:
-                if observation.presence is Presence.RUNNING and observation.healthy:
-                    now = self._clock()
+                now = self._clock()
+                if self._acceptable_load(observation, now):
                     try:
-                        self.book.loaded(operation, now)
+                        # K2: the book is the single owner, so the identity is written here
+                        # and only here — the bridge never wrote one of its own.
+                        self.book.loaded(operation, now, instance=observation.instance)
                     except StaleOperation:
                         # A late success for a superseded operation must not move the books.
                         self._emit_writeback_rejection("load", operation, "stale_operation")
@@ -274,10 +281,23 @@ class ModelScheduler:
                 raise
         finally:
             async with self._condition:
-                self._loads.pop(operation.model_id, None)
+                # Only the task that still owns the slot may release it: a superseded
+                # load finishing late must not delete its successor's entry.
+                if self._loads.get(operation.model_id) is asyncio.current_task():
+                    self._loads.pop(operation.model_id, None)
                 self._condition.notify_all()
             if recover:
                 self._start_recovery(deadline)
+
+    def _acceptable_load(self, observation: Observation, now: float) -> bool:
+        """Is this load fact something the books may commit?"""
+        if observation.presence is not Presence.RUNNING or not observation.healthy:
+            return False
+        if not self.require_instance_identity:
+            return True  # the legacy composition never carried a full identity
+        # Managed: RUNNING must name the complete instance and still be inside its window.
+        return (observation.instance is not None and observation.valid_until is not None
+                and now < observation.valid_until)
 
     def _record_cold_load(self, now: float) -> None:
         self._switch_successes.append(now)

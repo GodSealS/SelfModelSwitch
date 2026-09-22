@@ -56,6 +56,20 @@ IDENTITY = InstanceIdentity(
     image_digest="repo/llama@sha256:" + "c" * 64,
 )
 
+FAST_POLICY = pv.LifecyclePolicy(verify_window_seconds=5.0, poll_seconds=0.01,
+                                 observation_timeout_seconds=1.0, observation_max_age_seconds=1.0,
+                                 recovery_seconds=5.0)
+
+
+def advancing_sleep(clock: "ManualClock"):
+    """Fake time: a poll that never moved the clock would spin forever."""
+
+    async def _sleep(seconds: float) -> None:
+        clock.now += seconds
+        await asyncio.sleep(0)
+
+    return _sleep
+
 
 class ManualClock:
     def __init__(self, now: float = 0.0) -> None:
@@ -204,7 +218,8 @@ async def start_managed(tmp_path, *, claims: bool = False, result: bytes | None 
     control = SwapControl(world, stop_kills_container=stop_kills_container)
     lifecycle = ManagedLifecycle(
         boot_id="boot-1", deployment_id="orin-lab", specs={"chat": object()},
-        adapter_for=lambda model_id: control, observers={"chat": WorldObserver(world, IDENTITY)}, poll_seconds=0.01,
+        adapter_for=lambda model_id: control, observers={"chat": WorldObserver(world, IDENTITY)},
+        instance_lookup=book.instance, policy=FAST_POLICY, now=clock, sleep=advancing_sleep(clock),
     )
     scheduler = ModelScheduler(book, ClockedResources(clock), lifecycle, sessions=sessions, clock=clock,
                                poll_interval_seconds=0.01)
@@ -574,6 +589,7 @@ async def start_lab(tmp_path, *, hang: asyncio.Event | None = None):
         blobs=blobs, sessions=sessions, fixture_path=LAB_FIXTURE,
         scheduler_kwargs={"poll_interval_seconds": 0.01},
         execution_kwargs={"poll_seconds": 0.01, "wait_seconds": 600.0},
+        lifecycle_policy=FAST_POLICY,
     )
     await asyncio.wait_for(runtime.scheduler.open_session(LAB_MODEL, "client-a", "session-lab"), 5)
     return runtime, docker, swap, calls, book, blobs, None

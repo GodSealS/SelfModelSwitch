@@ -20,7 +20,7 @@ from .execution_service import ExecutionService
 from .idempotency import IdempotencyStore
 from .llama_swap_client import LlamaSwapClient, LlamaSwapControlContract
 from .model_registry import Book
-from .ports_v3 import ObservationTarget, STOPPED
+from .ports_v3 import STOPPED, LifecyclePolicy, ObservationTarget
 from .process_observer import ProcessObserver
 from .resource_monitor import ResourceMonitor
 from .scheduler import ModelScheduler
@@ -243,12 +243,13 @@ def build_managed_execution(
     fixture_path: Path | None = None,
     scheduler_kwargs: Mapping[str, Any] | None = None,
     execution_kwargs: Mapping[str, Any] | None = None,
+    lifecycle_policy: LifecyclePolicy | None = None,
 ) -> ManagedExecutionRuntime:
     """Join one v2 registration, llama-swap control, C03 observers and the queue.
 
     Every model gets its own adapter whose identity is RESOLVED THROUGH THE
-    BRIDGE: load writes back the docker-verified instance and execute/stop use
-    that same identity until a proven stop clears it (P16 AC1). The execution
+    BOOK: the bridge only looks the accepted identity up, so execute/stop always
+    carry the one the books committed at READY (P16 AC1, K2). The execution
     service is built in managed-termination mode: dispatched requests settle
     via the adapter's trusted protocol when it claims one, otherwise via a
     proven independent STOPPED of the shared instance (P16 AC2/AC3).
@@ -262,6 +263,7 @@ def build_managed_execution(
     lifecycle = ManagedLifecycle(
         boot_id=boot_id, deployment_id=deployment_id, specs=models,
         adapter_for=adapters.__getitem__, observers=observers,
+        instance_lookup=book.instance, policy=lifecycle_policy,
     )
     for model_id, model in models.items():
         adapters[model_id] = LlamaCppAdapter(
@@ -272,6 +274,7 @@ def build_managed_execution(
         )
     clock_kwargs = {} if clock is None else {"clock": clock}
     scheduler = ModelScheduler(book, resources, lifecycle, sessions=sessions,
+                               require_instance_identity=True,
                                **clock_kwargs, **(scheduler_kwargs or {}))
     service = ExecutionService(
         scheduler, blobs=blobs, backend_for=adapters.__getitem__, boot_id=boot_id,
