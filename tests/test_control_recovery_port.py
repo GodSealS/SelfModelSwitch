@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import inspect
 import json
+import threading
 import time
 
 import pytest
 
+from model_scheduler import ports_v3 as pv
 from model_scheduler.control_protocol_v1 import InstanceIdentity
-from model_scheduler.control_recovery import ControlRecoveryClient, DeploymentRecovery
+from model_scheduler.control_recovery import ControlRecoveryClient, DeploymentRecovery, DeploymentRecoveryPort
 from model_scheduler.process_observer import CONFIG_LABEL, DEPLOYMENT_LABEL, MODEL_LABEL, RUNTIME_LABEL
 
 
@@ -320,3 +324,299 @@ def test_stop_instance_does_not_treat_a_docker_failure_as_a_stop() -> None:
     assert outcome.accepted is False
     assert outcome.stopped is False
     assert outcome.error_code == "docker_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# K5: the asynchronous recovery port the scheduler calls once admission has
+# been closed and the old actions have drained. It proves, or refuses; it never
+# writes to a book and it never removes a container.
+# ---------------------------------------------------------------------------
+
+K5_MODELS = ("embedding", "qwen-small")
+RECOVERY_DEADLINE = 1060.0
+OTHER_MODEL = "reranker"
+
+
+class FakeObserver:
+    """An ObserverPort whose facts are scripted by the test."""
+
+    def __init__(self, *, observation: pv.Observation | None = None, error: Exception | None = None) -> None:
+        self._observation = observation
+        self._error = error
+        self.calls: list[tuple[pv.ObservationTarget, float]] = []
+
+    async def observe(self, target: pv.ObservationTarget, deadline: float) -> pv.Observation:
+        self.calls.append((target, deadline))
+        if self._error is not None:
+            raise self._error
+        return self._observation
+
+
+class LateObserver(FakeObserver):
+    """A sample that only lands after the caller's deadline has already passed."""
+
+    def __init__(self, clock: Clock, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._test_clock = clock
+
+    async def observe(self, target: pv.ObservationTarget, deadline: float) -> pv.Observation:
+        observation = await super().observe(target, deadline)
+        self._test_clock.now = deadline + 1.0
+        return observation
+
+
+def stopped_observation(
+    clock: Clock,
+    *,
+    launch_resolved: bool = True,
+    age: float = 0.0,
+    instance: InstanceIdentity | None = None,
+) -> pv.Observation:
+    """A STOPPED sample stamped with the test clock's *now*, never a zero timestamp."""
+    return pv.Observation(
+        state=pv.STOPPED,
+        sampled_at_monotonic=clock.now - age,
+        sampled_at_utc=datetime.now(timezone.utc),
+        port_state="closed",
+        subprocess_state="exited",
+        instance=instance,
+        launch_operation=None,
+        launch_resolved=launch_resolved,
+    )
+
+
+def unknown_observation(clock: Clock) -> pv.Observation:
+    return pv.Observation(
+        state=pv.UNKNOWN,
+        sampled_at_monotonic=clock.now,
+        sampled_at_utc=datetime.now(timezone.utc),
+        port_state="unknown",
+        subprocess_state="unknown",
+    )
+
+
+def build_recovery_port(
+    observers: dict[str, FakeObserver],
+    *,
+    clock: Clock | None = None,
+    recovery: DeploymentRecovery | None = None,
+    models: tuple[str, ...] = K5_MODELS,
+) -> DeploymentRecoveryPort:
+    """The helper and the port share one clock domain, as they do in production."""
+    clock = clock or Clock(1000.0)
+    if recovery is None:
+        recovery = DeploymentRecovery(DEPLOYMENT, docker=FakeDocker(), monotonic=clock)
+    return DeploymentRecoveryPort(
+        deployment_id=DEPLOYMENT,
+        recovery=recovery,
+        observers=observers,
+        models=models,
+        clock=clock,
+        policy=pv.LifecyclePolicy(),
+    )
+
+
+def test_the_recovery_port_requires_exactly_one_observer_for_every_registered_model() -> None:
+    observers = {model: FakeObserver(observation=stopped_observation(Clock())) for model in K5_MODELS}
+
+    with pytest.raises(ValueError):  # a registered model without its observer
+        build_recovery_port({K5_MODELS[0]: observers[K5_MODELS[0]]})
+    with pytest.raises(ValueError):  # an observer for a model that is not registered
+        build_recovery_port({**observers, "ghost": FakeObserver()})
+    with pytest.raises(ValueError):  # the same model registered twice
+        build_recovery_port(observers, models=(K5_MODELS[0], K5_MODELS[0]))
+    with pytest.raises(ValueError):  # nothing registered at all
+        build_recovery_port({}, models=())
+
+
+def test_the_recovery_port_refuses_a_helper_that_reconciles_another_deployment() -> None:
+    observers = {model: FakeObserver() for model in K5_MODELS}
+
+    with pytest.raises(ValueError):
+        build_recovery_port(observers, recovery=DeploymentRecovery(OTHER_DEPLOYMENT, docker=FakeDocker()))
+
+
+def test_the_recovery_port_is_the_existing_recovery_port_without_a_book_or_a_callback() -> None:
+    parameters = set(inspect.signature(DeploymentRecoveryPort).parameters)
+
+    assert inspect.iscoroutinefunction(DeploymentRecoveryPort.recover)
+    assert list(inspect.signature(DeploymentRecoveryPort.recover).parameters) == ["self", "deadline"]
+    assert not {"book", "scheduler", "close_admission", "callback", "on_stop", "write_back"} & parameters
+
+
+async def test_the_recovery_port_proves_success_only_when_every_registered_model_is_stopped() -> None:
+    clock = Clock(1000.0)
+    observers = {model: FakeObserver(observation=stopped_observation(clock)) for model in K5_MODELS}
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is True
+    assert result.phase == "complete"
+    assert result.error_code is None
+    assert result.stopped_models == K5_MODELS
+    assert all(target.deployment_id == DEPLOYMENT for observer in observers.values() for target, _ in observer.calls)
+    assert [deadline for observer in observers.values() for _, deadline in observer.calls] == [RECOVERY_DEADLINE] * len(K5_MODELS)
+
+
+async def test_one_unknown_observation_fails_the_recovery_before_later_models_are_asked() -> None:
+    clock = Clock(1000.0)
+    models = ("embedding", OTHER_MODEL, "qwen-small")
+    observers = {
+        "embedding": FakeObserver(observation=stopped_observation(clock)),
+        OTHER_MODEL: FakeObserver(observation=unknown_observation(clock)),
+        "qwen-small": FakeObserver(observation=stopped_observation(clock)),
+    }
+
+    result = await build_recovery_port(observers, clock=clock, models=models).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.phase == "failed"
+    assert result.error_code == "observation_unknown"
+    assert result.stopped_models == ("embedding",)
+    assert observers["qwen-small"].calls == []  # a refusal is not a partial success
+
+
+async def test_an_unresolved_launch_is_never_a_proven_stop() -> None:
+    clock = Clock(1000.0)
+    observers = {
+        model: FakeObserver(observation=stopped_observation(clock, launch_resolved=False)) for model in K5_MODELS
+    }
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.phase == "failed"
+    assert result.error_code == "launch_unresolved"
+    assert result.stopped_models == ()
+
+
+@pytest.mark.parametrize("age", [3.0, -1.0])
+async def test_a_sample_from_outside_the_freshness_window_cannot_prove_a_stop(age: float) -> None:
+    clock = Clock(1000.0)
+    observers = {model: FakeObserver(observation=stopped_observation(clock, age=age)) for model in K5_MODELS}
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.error_code == "observation_stale"
+
+
+async def test_an_observer_that_raises_is_a_conservative_failure() -> None:
+    clock = Clock(1000.0)
+    observers = {
+        "embedding": FakeObserver(error=RuntimeError("the observer connection dropped")),
+        "qwen-small": FakeObserver(observation=stopped_observation(clock)),
+    }
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.error_code == "observer_failed"
+    assert observers["qwen-small"].calls == []
+
+
+async def test_a_stop_belonging_to_another_model_is_not_this_models_stop() -> None:
+    clock = Clock(1000.0)
+    foreign = InstanceIdentity(
+        container_id=CONTAINER_ID,
+        started_at=STARTED_AT,
+        deployment_id=DEPLOYMENT,
+        model_id=OTHER_MODEL,
+        runtime_id="llama-cpp-gguf-v1",
+        candidate_digest=CONFIG_SHA256,
+        image_digest="sha256:" + "d" * 64,
+    )
+    observers = {
+        "embedding": FakeObserver(observation=stopped_observation(clock, instance=foreign)),
+        "qwen-small": FakeObserver(observation=stopped_observation(clock)),
+    }
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.error_code == "observation_identity_mismatch"
+
+
+async def test_a_helper_that_cannot_verify_a_stop_is_reported_without_asking_the_observers() -> None:
+    clock = Clock(1000.0)
+    docker = FakeDocker((container_fact(running=True),), stop_exit=1)
+    observers = {model: FakeObserver(observation=stopped_observation(clock)) for model in K5_MODELS}
+
+    result = await build_recovery_port(
+        observers, clock=clock, recovery=DeploymentRecovery(DEPLOYMENT, docker=docker, monotonic=clock)
+    ).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.error_code == "stop_failed"
+    assert all(observer.calls == [] for observer in observers.values())
+
+
+async def test_an_expired_deadline_dispatches_neither_the_helper_nor_a_sample() -> None:
+    clock = Clock(1000.0)
+    docker = FakeDocker((container_fact(running=True),))
+    observers = {model: FakeObserver(observation=stopped_observation(clock)) for model in K5_MODELS}
+
+    result = await build_recovery_port(
+        observers, clock=clock, recovery=DeploymentRecovery(DEPLOYMENT, docker=docker, monotonic=clock)
+    ).recover(999.0)
+
+    assert result.ok is False
+    assert result.error_code == "recovery_timeout"
+    assert docker.calls == []
+    assert all(observer.calls == [] for observer in observers.values())
+
+
+async def test_a_sample_that_only_lands_after_the_deadline_cannot_prove_a_stop() -> None:
+    clock = Clock(1000.0)
+    observers = {model: LateObserver(clock, observation=stopped_observation(clock)) for model in K5_MODELS}
+
+    result = await build_recovery_port(observers, clock=clock).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is False
+    assert result.error_code == "recovery_timeout"
+    assert observers["qwen-small"].calls == []
+
+
+async def test_a_stopped_container_that_was_not_removed_is_a_valid_result() -> None:
+    clock = Clock(1000.0)
+    docker = FakeDocker((container_fact(running=False),))
+    observers = {model: FakeObserver(observation=stopped_observation(clock)) for model in K5_MODELS}
+
+    result = await build_recovery_port(
+        observers, clock=clock, recovery=DeploymentRecovery(DEPLOYMENT, docker=docker, monotonic=clock)
+    ).recover(RECOVERY_DEADLINE)
+
+    assert result.ok is True
+    assert result.stopped_models == K5_MODELS
+    assert "rm" not in docker.verbs()
+
+
+async def test_a_cancelled_recovery_keeps_the_running_helper_worker_tracked() -> None:
+    clock = Clock(1000.0)
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_docker(argv: list[str]) -> tuple[int, str, str]:
+        entered.set()
+        assert release.wait(timeout=5)
+        return 0, "", ""
+
+    observers = {model: FakeObserver(observation=stopped_observation(clock)) for model in K5_MODELS}
+    port = build_recovery_port(
+        observers, clock=clock, recovery=DeploymentRecovery(DEPLOYMENT, docker=blocking_docker, monotonic=clock)
+    )
+    task = asyncio.create_task(port.recover(RECOVERY_DEADLINE))
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(port.pending_workers()) == 1  # the helper thread is still running and still tracked
+
+    release.set()
+    for _ in range(1000):
+        if not port.pending_workers():
+            break
+        await asyncio.sleep(0.01)
+    assert port.pending_workers() == ()
+    assert all(observer.calls == [] for observer in observers.values())  # a cancelled attempt proves nothing

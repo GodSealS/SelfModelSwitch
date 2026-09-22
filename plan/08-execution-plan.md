@@ -229,6 +229,20 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 复查做不出来时按未知结果保守失败，绝不因为命令已发出就记为已停止。helper 只操作本 deployment 的容器，
 旧 identity 不得重定向到新容器。
 
+**异步恢复端口的输入与信任边界（RP07 已交付）**：`DeploymentRecoveryPort`（`control_recovery.py`）是调度器在
+准入已关闭、旧动作排空之后唯一可调用的运行时恢复入口，满足**既有** `ControlRecoveryPort` 形状——只有
+`async def recover(self, deadline: float) -> RecoveryResult`。输入只有调用方的绝对 deadline，加上构造时注入的
+`DeploymentRecovery`、逐模型 `ObserverPort` 映射与 `LifecyclePolicy`；它**不持有** `Book`、不接收写回回调，也不自行
+关闭准入（`reconcile` 的 `close_admission` 在端口内是 no-op——关闭准入是调度器先做的事）。输出是**事实报告**而非
+裁决：`ok=True` 要求 helper 证明本 deployment 每个容器都已停止，且每个登记模型都被独立见证为 STOPPED、launch 维度
+已解析、身份属于被问的模型、样本在接受时仍在 `observation_max_age_seconds` 内且未越过总 deadline；`stopped_models`
+是模型 ID 的**全集**（不是 container id 集合），缺一项即 `ok=False`。端口从不下令 `docker rm`：已停止但未删除的
+容器是合格结果。失败一律 `phase="failed"` 加有限内部码（`recovery_timeout`、helper 的 `stop_failed` /
+`container_listing_failed` 等、`observation_unknown`、`launch_unresolved`、`observation_identity_mismatch`、
+`observation_stale`、`observer_failed`、`recovery_failed`）；helper 或 observer 抛出的未知异常保守折算为失败，
+不向上传播、也不虚报成功。同步 helper 在**受跟踪**的 worker 线程中执行：取消端口调用不会丢弃仍在运行的线程句柄
+（`pending_workers()` 可查，完成后清理），且一个总 deadline 贯穿 helper 与全部模型观察。
+
 **控制阶段的边界（RP03 已交付）**：`ManagedAdapterPort`（`ports_v3.py`）显式声明 `load/stop/release`，
 `release` 是声明的能力而不是靠 `getattr` 猜出来的。三条控制调用都取调用方的绝对 deadline：已过期一次 HTTP 都不发；
 执行中用剩余时间收敛，超时/未回执一律返回**不可证**——load 返回 UNKNOWN 且 `launch_resolved=False`（**不是** STOPPED，

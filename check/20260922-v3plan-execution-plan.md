@@ -341,9 +341,32 @@ listing / inspect / stop / 复查四个阶段共用同一 deadline，且每段�
 **Files likely touched:** `model_scheduler/control_recovery.py`、`tests/test_control_recovery_port.py`。
 **Documentation impact:** 更新C03恢复端口的输入/输出与信任边界。
 **Acceptance criteria:**
-- [ ] helper成功但一个observer UNKNOWN/launch未终结时ok=False；错/缺model拒绝，只有准确模型全集返回成功。
-- [ ] port无Book引用/回调；取消不丢失尚未退出worker句柄；一个总deadline贯穿全部阶段。
+- [x] helper成功但一个observer UNKNOWN/launch未终结时ok=False；错/缺model拒绝，只有准确模型全集返回成功。
+- [x] port无Book引用/回调；取消不丢失尚未退出worker句柄；一个总deadline贯穿全部阶段。
 **Verification:** `"$PY" -m pytest tests/test_control_recovery_port.py -q`及全量；控制样本按K1带真实测试时钟，不再用时间戳0掩盖新鲜度要求。
+
+**执行结果（2026-09-22）**：`DeploymentRecoveryPort` 在 `control_recovery.py` 落地。构造拒绝：非本 deployment 的
+helper、空/重复/与 observer 键集不一致的模型登记（`models` 显式给出时必须与 observers 精确相等，缺一个即拒绝）。
+`recover(deadline)`：总 deadline 已过即零派发；在**受跟踪 worker 线程**中调用
+`DeploymentRecovery.reconcile(close_admission=no-op)`——准入由调度器先关，端口不持 Book、不收回调、不引入新的
+HTTP 服务或权限模型；helper 不 ok 或仍有未证容器时失败且**不询问任何 observer**；之后逐模型独立观察，要求
+STOPPED、`launch_resolved=True`、身份归属本 deployment/model、`0<=now-sampled_at<=max_age` 且 `now<deadline`，
+全部满足才 `RecoveryResult(True, "complete", None, 全部模型ID)`。失败一律 `phase="failed"` 加有限码：
+`recovery_timeout` / `recovery_failed` / 透传 helper 的 `stop_failed`、`container_listing_failed` 等 /
+`observation_unknown` / `launch_unresolved` / `observation_identity_mismatch` / `observation_stale` /
+`observer_failed`；helper 与 observer 的未知异常都保守折算为失败，不向上抛。`pending_workers()` 保留未退出的
+worker 句柄（`asyncio.shield` + 完成后清理）。端口从不下令 `docker rm`，已停止未删除的容器是合格结果。
+
+新增 15 个用例（`tests/test_control_recovery_port.py`，该文件现 35 个）：登记集合四项拒绝、异 deployment helper
+拒绝、端口形状（协程签名 + 无 book/callback 参数）、全模型见证成功（并断言两个 observer 收到同一 deadline）、
+第二模型 UNKNOWN 即整轮失败且后续不再被问、launch 未解析、陈旧与未来样本、observer 抛异常、异模型身份、
+helper 无法证停时不询问 observer、过期 deadline 零派发、样本晚于 deadline、已停止未删除容器、取消后 worker 仍被
+跟踪。RED 阶段 5 failed / 30 passed（失败点：`recovery_unproven_stop` 码、`observe` phase、异常外泄、缺身份归属、
+超时与陈旧码混淆）。测试按 K1 使用注入的可控时钟（样本时间戳取 `clock.now`，不以时间戳 0 掩盖新鲜度）。
+
+验证：定向 `test_control_recovery_port.py` 35 passed；全量 `pytest tests -m 'not thor' -q` **983 passed、1 skipped、
+1 deselected**（15m36s，较 RP06 的 968 增加 15）、`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv
+提供的 CPython 3.12.11。
 
 ## Task RP08：新恢复预算与lease/control排空屏障
 

@@ -16,10 +16,11 @@ from dataclasses import dataclass
 import json
 import time
 from time import monotonic
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 
 from .contracts import RecoveryResult
 from .control_protocol_v1 import InstanceIdentity
+from .ports_v3 import STOPPED, LifecyclePolicy, ObservationTarget, ObserverPort
 from .process_observer import (
     DEPLOYMENT_LABEL,
     MODEL_LABEL,
@@ -324,3 +325,126 @@ class DeploymentRecovery:
         if len(facts) != 1 or facts[0].container_id != container_id:
             return None
         return facts[0]
+
+
+# ---------------------------------------------------------------------------
+# K5: the async recovery port the scheduler is allowed to call.
+# ---------------------------------------------------------------------------
+
+
+class DeploymentRecoveryPort:
+    """One bounded reconcile, then one independent STOPPED witness per model (K5).
+
+    It is deliberately blind to the books: no `Book`, no scheduler, no write
+    callback. Admission was already closed by the scheduler that called it, so
+    the helper's own admission hook is inert here. The port only reports what was
+    proven, and the scheduler decides what that report may change.
+
+    `ok=True` therefore requires *all* of: the helper proved every container of
+    this deployment stopped, every registered model was independently witnessed
+    STOPPED with its launch dimension resolved and its identity belonging to the
+    model that was asked about, and every sample still described the world when it
+    was accepted. A container that stopped but was not removed is fine — this port
+    never removes one.
+
+    The synchronous helper runs in a worker thread that stays tracked, so a
+    cancellation can never drop a thread that is still running: it remains in
+    `pending_workers()` until it finishes.
+    """
+
+    def __init__(
+        self,
+        *,
+        deployment_id: str,
+        recovery: DeploymentRecovery,
+        observers: Mapping[str, ObserverPort],
+        models: Sequence[str] | None = None,
+        clock: Callable[[], float] | None = None,
+        policy: LifecyclePolicy | None = None,
+    ) -> None:
+        if not isinstance(deployment_id, str) or not deployment_id:
+            raise ValueError("the recovery port needs a deployment id")
+        if not isinstance(recovery, DeploymentRecovery):
+            raise ValueError("the recovery port needs the deployment recovery helper")
+        if recovery.deployment_id != deployment_id:
+            raise ValueError("the helper reconciles another deployment")
+        self._observers = dict(observers)
+        if any(not isinstance(model_id, str) or not model_id for model_id in self._observers):
+            raise ValueError("the recovery port needs a model id for every observer")
+        self._deployment_id = deployment_id
+        self._recovery = recovery
+        # The exact registered set, never a subset: a missing model is a refusal.
+        self._models = tuple(self._observers if models is None else models)
+        if (
+            not self._models
+            or len(set(self._models)) != len(self._models)
+            or set(self._models) != set(self._observers)
+        ):
+            raise ValueError("the recovery port needs exactly one observer per registered model")
+        self._clock = clock or time.monotonic
+        self._policy = policy or LifecyclePolicy()
+        self._workers: set[asyncio.Task[ReconcileOutcome]] = set()
+
+    @property
+    def deployment_id(self) -> str:
+        return self._deployment_id
+
+    def pending_workers(self) -> tuple[asyncio.Task[ReconcileOutcome], ...]:
+        """Workers that are still running; a cancelled recover must not drop them."""
+        for task in tuple(self._workers):
+            if task.done():
+                self._workers.discard(task)  # finished workers are no longer pending
+        return tuple(self._workers)
+
+    async def recover(self, deadline: float) -> RecoveryResult:
+        """Prove this deployment stopped; every shortfall is a refusal, not a guess."""
+        if self._clock() >= deadline:
+            return RecoveryResult(False, "failed", "recovery_timeout", ())
+        try:
+            # Admission belongs to the caller (K5), so the helper's hook is inert.
+            outcome = await self._in_worker(
+                lambda: self._recovery.reconcile(close_admission=lambda: None, deadline=deadline))
+        except Exception:
+            # An unknown helper failure proves nothing: fail closed, never raise on.
+            return RecoveryResult(False, "failed", "recovery_failed", ())
+        if not outcome.ok or outcome.remaining_container_ids:
+            return RecoveryResult(False, "failed", outcome.error_code or "recovery_incomplete", ())
+        confirmed: list[str] = []
+        for model_id in self._models:
+            if self._clock() >= deadline:
+                return RecoveryResult(False, "failed", "recovery_timeout", tuple(confirmed))
+            try:
+                observation = await self._observers[model_id].observe(
+                    ObservationTarget(deployment_id=self._deployment_id), deadline)
+            except Exception:
+                return RecoveryResult(False, "failed", "observer_failed", tuple(confirmed))
+            if observation is None or observation.state != STOPPED:
+                # UNKNOWN, or still running: "docker returned 0" is not a stop proof.
+                return RecoveryResult(False, "failed", "observation_unknown", tuple(confirmed))
+            if not observation.launch_resolved:
+                return RecoveryResult(False, "failed", "launch_unresolved", tuple(confirmed))
+            if observation.instance is not None and (
+                observation.instance.deployment_id != self._deployment_id
+                or observation.instance.model_id != model_id
+            ):
+                return RecoveryResult(False, "failed", "observation_identity_mismatch", tuple(confirmed))
+            now = self._clock()
+            if now >= deadline:
+                return RecoveryResult(False, "failed", "recovery_timeout", tuple(confirmed))
+            if not 0 <= now - observation.sampled_at_monotonic <= self._policy.observation_max_age_seconds:
+                # The sample described an earlier world: it cannot carry a verdict.
+                return RecoveryResult(False, "failed", "observation_stale", tuple(confirmed))
+            confirmed.append(model_id)
+        if tuple(confirmed) != self._models:
+            return RecoveryResult(False, "failed", "recovery_incomplete", tuple(confirmed))
+        return RecoveryResult(True, "complete", None, tuple(confirmed))
+
+    async def _in_worker(self, work: Callable[[], ReconcileOutcome]) -> ReconcileOutcome:
+        task = asyncio.create_task(asyncio.to_thread(work))
+        self._workers.add(task)
+        try:
+            # Shielded: an outer cancel must not silently abandon a running thread.
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._workers.discard(task)
