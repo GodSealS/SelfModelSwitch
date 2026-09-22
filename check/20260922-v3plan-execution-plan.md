@@ -659,10 +659,41 @@ C03/C08/C09 与实现一致性的探针复核通过：`LifecyclePolicy` 值 = 10
 **Files likely touched:** `plan/validation.md`、本执行Plan状态；目标原始证据位于`/home/jtzn/self-model-switch-evidence/<唯一run>/`，不写tracked源码。
 **Documentation impact:** 记录实际提交和目标证据索引，逐任务填写真实结果；保留失败记录，明确lab与production结论。
 **Acceptance criteria:**
-- [ ] 双端remote/branch/完整SHA与target干净状态匹配；目标确为预期硬件，模型只读且SHA-256匹配。
-- [ ] 真机冷启动→见证→READY→stop→reload；控制/观测故障→有界UNKNOWN→恢复；记录采样次数、耗时、lease/预算和静默证据。
-- [ ] Linux双UID/入口启动失败/退出无遗留；失败注入限制在本deployment，保留失败材料。
-- [ ] 最终候选模型清单符合决策；S/B/O全集与06性能策略真实通过才宣称device_backend_ready。只完成lab则明确“lab复验完成，生产未验收”。
+- [x] 双端remote/branch/完整SHA与target干净状态匹配；目标确为预期硬件，模型只读且SHA-256匹配。
+- [ ] 真机冷启动→见证→READY→stop→reload；控制/观测故障→有界UNKNOWN→恢复；记录采样次数、耗时、lease/预算和静默证据。**BLOCKED：真机冷启动被真实缺陷拒绝（见执行状态）。**
+- [ ] Linux双UID/入口启动失败/退出无遗留；失败注入限制在本deployment，保留失败材料。（部分：同SHA目标机全量套件在 Linux 通过，含 K7 socket/gate/owner 用例；唯一 skip 是仅 root 可跑的双 UID 用例；v2 入口失败注入因服务无法启动而未执行。）
+- [ ] 最终候选模型清单符合决策；S/B/O全集与06性能策略真实通过才宣称device_backend_ready。只完成lab则明确“lab复验完成，生产未验收”。（**未宣称**：模型清单符合决策已记录，但 S/B/O 未运行，lab 功能复验本身被阻塞。）
+
+**执行状态（2026-09-22）：BLOCKED——真机冷启动发现真实缺陷，未做任何伪造修复。**
+
+已完成并通过的部分：开发机 `47cb747` push 到 GitHub（`git ls-remote` = 本地 SHA）与目标裸仓库；目标 checkout
+守卫式 ff-only 到同一 SHA（`verified_target_sha=47cb7473a205aa32d10fb50ad3af15bb53296686`，前后工作区为空）。
+目标硬件核验为 Jetson AGX Orin（`jtzn-desktop`、R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。候选模型资产只读
+SHA-256 已记录（`Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` = `3f451333…d069`、mmproj = `d1c7588c…aea3`）。
+目标机同 SHA 全量套件（python 3.12.14 / venv312）：**1017 passed、1 skipped、1 deselected（49.65s）**，唯一 skip
+是仅 root 可跑的 Linux 双 UID 用例，K7 的 socket/gate/owner 用例在 Linux 上实际运行。
+
+**阻塞事实**：用 lab 配置（`qwen36-27b-lab/deploy2/scheduler-v2.json`，deployment `sms-orin-lab2`）冷启动新 SHA 时，
+进程立即以 `configuration error: startup reconciliation failed: unproven_stop` 退出，8090 未监听。目标机上的只读
+探针（`probe_launch_source.py`）给出因果：生产装配（`run.py`）构造 `DockerProcessObserver` 时**从未传
+`launch_lookup`**，因此每次观察都是 `launch_resolved=False`；而 `stopped_is_proven()` 要求
+`launch_operation_terminal`，于是任何模型都不可能被观察为 STOPPED，`reconcile_startup` 恒拒绝、`Book.recovering`
+永不清除。对照观测：无 launch 源 → `state=unknown launch_resolved=False`（端口 closed、子进程 absent）；注入
+"本 boot 从未派发"的**正向**来源 → `state=stopped launch_resolved=True`。历史核实（`git log -S launch_lookup`）：
+该语义由本轮 **RP02**（`05dab9c`）引入（"没有来源"从"视为终结"改为"未解析"），而 `run.py` 的 observer 装配自
+M04/P16 起只有三个位置参数、RP04a 仅补 `expected=` —— 即本轮严格化后**生产装配缺少 launch 事实源**，v2 服务在
+真机上无法启动（早前 lab2 服务能运行，是因为它跑的是本轮之前的 `main@142746c` 检出）。
+
+**后续（独立缺陷任务，不属 RP17 的可自行修复范围）**：为 v2 装配提供 **boot 级 launch 来源**——按 K4，只有
+"本 boot 从未对该 target 派发 + 观察侧正面确认"才可解析 launch 维度；一旦派发，记录必须保持非终结直到停止被证明。
+仅接一个“永远无 launch”的桩是**不安全**的（会在真实派发后允许假的 STOPPED 证明），已被明确否决。修复需配套
+TDD（含真实派发后仍 UNKNOWN 的负例）并重跑全量，然后重做 RP17 的 lab 复验。
+
+目标机状态：未在目标机做任何修复；已恢复到 RP17 之前的状态（`main@142746c` + 原工作区改动，blob
+`203c6aa48e15d0fefb6a7a6f2dffce2798e9e51d`），lab2 调度器已重启并在 8090 正常服务。原始证据在
+`/home/jtzn/self-model-switch-evidence/rp17-20260922T145856Z/`（`FINDINGS.md`、`target-pytest.log`、
+`probe-launch-source.txt`、`model-sha256.txt`、`pre-run-facts.txt`、`pre-sync-*`）。**生产验收未宣称**，
+`device_backend_ready` 未生成。
 **Verification:** 使用既有acceptance CLI及06/P29—P31；命令先以本次源版本`--help`确认，记录实际命令、exit、耗时、峰值内存、CUDA/runtime、模型hash、停止/静默及运行前后Git状态。不同设备/配置/source archive不得复用旧通过报告。
 
 ## 4. 原问题到任务的覆盖关系

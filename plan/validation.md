@@ -1819,3 +1819,32 @@ P01 的起点为同一 `source_commit`，本任务结束不改变任何 tracked 
    以及 `qwen-small` 时代的已冻结候选都是**历史材料**——前者不是生产准入证据，后者的通过结论不得沿用到改名后的
    `qwen25vl-7b`。当前生产范围只有在 `qwen25vl-7b` 下重建 S/B/O 证据后才成立（RP17）。
 4. 本勘误不重跑模型、不改任何门槛/余量/预算，也不宣称设备或生产验收通过。
+
+## RP17 同 SHA 目标复验（2026-09-22）：BLOCKED —— 冷启动发现真实缺陷
+
+范围：把开发分支 `chore/verify-v3-review-20260922` 的 `47cb7473a205aa32d10fb50ad3af15bb53296686` 推到 GitHub 与目标
+裸仓库，目标 checkout 守卫式 ff-only 到同一 SHA，然后在目标机运行。硬件核验：Jetson AGX Orin（`jtzn-desktop`、
+R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选模型 `qwen25vl-7b`）：
+`Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf` = `3f4513330aa7f109922bd701d773575484ae2b4a4090d6511260a2a4f8e3d069`
+（4,683,072,320 B）、`mmproj-…-bf16.gguf` = `d1c7588c0bdf6e7889737c01cfd54309240d54042e102275880a514ae979aea3`（1,354,162,912 B）。
+
+通过项：三处 SHA 一致（开发机 / GitHub / 目标裸仓库与 checkout），目标树同步前后为空；目标机同 SHA 全量套件
+（python 3.12.14 / venv312）**1017 passed、1 skipped、1 deselected（49.65s）**——唯一 skip 是仅 root 可跑的 Linux
+双 UID 用例，K7 的 socket/gate/owner 用例在 Linux 上实际运行。
+
+**阻塞（真实缺陷，未做伪造修复）**：用 lab 配置（`…/qwen36-27b-lab/deploy2/scheduler-v2.json`，deployment
+`sms-orin-lab2`）冷启动该 SHA 时进程立即以 `configuration error: startup reconciliation failed: unproven_stop` 退出，
+8090 未监听。目标机只读探针复现了因果：`run.py` 构造 v2 observer 时**从未传 `launch_lookup`**，于是每次观察都是
+`launch_resolved=False`；`stopped_is_proven()` 要求 `launch_operation_terminal`，因此没有任何模型能被观察为 STOPPED，
+`reconcile_startup` 恒拒绝且 `Book.recovering` 永不清除。对照：无 launch 源 → `unknown/launch_resolved=False`
+（端口 closed、子进程 absent）；注入"本 boot 从未派发"的**正向**来源 → `stopped/launch_resolved=True`。
+`git log -S launch_lookup` 核实该语义由本轮 RP02（`05dab9c`）引入，而生产装配自 M04/P16 起就没有来源；早前 lab2
+服务能运行是因为它跑的是本轮之前的 `main@142746c` 检出。
+
+结论与后续：**RP17 的 lab 功能复验（冷启动→见证→READY→stop→reload）在该 SHA 上阻塞，生产验收未宣称，
+`device_backend_ready` 未生成**。修复方向（独立任务）：为 v2 装配提供 boot 级 launch 来源——按 K4 只有"本 boot
+从未对该 target 派发 + 观察侧正面确认"才可解析 launch 维度，派发后记录必须保持非终结直到停止被证明；仅接
+"永远无 launch"的桩不安全（真实派发后会允许假的 STOPPED 证明），已被否决。目标机未做任何修复并已恢复到复验前
+状态（`main@142746c` + 原工作区改动 blob `203c6aa4…`），lab2 调度器已重启。原始证据：
+`/home/jtzn/self-model-switch-evidence/rp17-20260922T145856Z/`（`FINDINGS.md`、`target-pytest.log`、
+`probe-launch-source.txt`、`model-sha256.txt`、`pre-run-facts.txt`、`pre-sync-*`）。
