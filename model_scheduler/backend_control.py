@@ -132,7 +132,7 @@ class ManagedLifecycle:
         if verified.state != RUNNING:
             return Observation(Presence.UNKNOWN, None, False, monotonic(), "load_unverified")
         # A healthy adapter answer is still a control response: re-verify via the observer.
-        observation = await self._observe(model_id, verified.instance, deadline)
+        observation = await self._verify_running(model_id, verified.instance, deadline)
         if observation is None or observation.state != RUNNING or observation.instance is None:
             return Observation(Presence.UNKNOWN, None, False, monotonic(), "instance_unverified")
         self._instances[model_id] = observation.instance
@@ -166,6 +166,29 @@ class ManagedLifecycle:
         if observation is not None and observation.state == RUNNING:
             return Observation(Presence.RUNNING, None, True, observation.sampled_at_monotonic, "stop_unverified")
         return Observation(Presence.UNKNOWN, None, False, monotonic(), "stop_unverified")
+
+    async def _verify_running(self, model_id: str, identity: InstanceIdentity, deadline: float):
+        """Poll the independent observation until it agrees the instance is running (C03).
+
+        One sample is not a verdict. A control plane answers as soon as it accepted the
+        load, while the container still has to bind its port and pass its own health
+        handshake, so sampling once made a load that was still starting look
+        unverifiable — and an unverifiable load can only be refused, which costs a whole
+        stop and reload to recover. The stop path already polls for its four facts until
+        the caller's deadline; the load path now does the same, and a proven STOPPED
+        still ends the wait immediately because it is a verdict rather than a sample.
+        """
+        loop = asyncio.get_event_loop()
+        last = None
+        while True:
+            last = await self._observe(model_id, identity, deadline)
+            if last is not None and last.state == RUNNING and last.instance is not None:
+                return last
+            if last is not None and last.state == STOPPED:
+                return last
+            if loop.time() >= deadline:
+                return last
+            await asyncio.sleep(self._poll_seconds)
 
     async def _observe(self, model_id: str, identity: InstanceIdentity | None, deadline: float):
         observer = self._observers.get(model_id)

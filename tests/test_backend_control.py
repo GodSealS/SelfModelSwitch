@@ -162,6 +162,21 @@ async def test_managed_load_stays_unknown_when_the_observation_cannot_verify_the
 
 
 @pytest.mark.asyncio
+async def test_managed_load_keeps_sampling_until_the_instance_is_witnessed() -> None:
+    """A control plane answers before the container serves, so one sample is not a verdict."""
+    adapter = ManagedFakeAdapter()
+    observer = ScriptedObserver([v3_observation(pv.UNKNOWN),            # accepted, not serving yet
+                                 v3_observation(pv.RUNNING, INSTANCE)])  # the facts arrive
+    bridge = lifecycle(adapter, observer)
+
+    result = await bridge.load(Operation("op-1", "chat", 1, 0), deadline())
+
+    assert result.presence is Presence.RUNNING and result.healthy is True
+    assert bridge.instance("chat") == INSTANCE
+    assert len(observer.targets) >= 2
+
+
+@pytest.mark.asyncio
 async def test_managed_stop_polls_the_four_facts_and_only_then_clears_the_instance() -> None:
     adapter = ManagedFakeAdapter()
     observer = ScriptedObserver([v3_observation(pv.RUNNING, INSTANCE),  # the load verification
