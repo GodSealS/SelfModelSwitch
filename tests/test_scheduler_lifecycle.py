@@ -8,6 +8,7 @@ import pytest
 
 from model_scheduler.contracts import Capability, MemorySample, ModelSpec, Observation, Outcome, Presence, RecoveryResult, State
 from model_scheduler.model_registry import Book, Conflict
+from model_scheduler.ports_v3 import LifecyclePolicy
 from model_scheduler.request_queue import WaitKind, WaitState
 from model_scheduler.scheduler import ModelScheduler, ModelUnavailable, QueueFull
 from model_scheduler.session_manager import SessionConflict, SessionManager, SessionNotFound
@@ -1190,7 +1191,9 @@ async def test_a_late_load_write_back_is_rejected_and_keeps_the_raw_fence() -> N
     acquiring = asyncio.create_task(scheduler.acquire("chat", "req-1", asyncio.get_running_loop().time() + 30))
     await backend.started.wait()
     recovering = asyncio.create_task(scheduler.recover(asyncio.get_running_loop().time() + 30))
-    await recovery.called.wait()  # begin_recovery already bumped the epoch
+    # K5: begin_recovery freezes the epoch before the drain, so the port is not
+    # asked yet; the epoch itself is the fence this test needs to observe.
+    assert await eventually(lambda: registry.epoch >= 1)
 
     backend.gate.set()  # the load "succeeds" for an operation that is now stale
 
@@ -1422,3 +1425,251 @@ async def test_a_v2_registration_acquires_through_the_ledger() -> None:
             break
         await asyncio.sleep(0.02)
     assert scheduler.book.runtime["chat"].state.value == "unloaded"
+
+
+# ---------------------------------------------------------------------------
+# K5 (RP08): the automatic attempt buys its own bounded budget, closes admission
+# at once, drains the old actions before it asks the port, and never releases a
+# lease or a reservation on its own. Manual retries are explicit and finite.
+# ---------------------------------------------------------------------------
+
+
+class ScriptedLoadBackend(Backend):
+    """A backend whose loads fail for exactly the named models."""
+
+    def __init__(self, failing: tuple[str, ...] = ()) -> None:
+        super().__init__()
+        self.failing = frozenset(failing)
+        self.stops: list[str] = []
+
+    async def load(self, operation, deadline):
+        self.loads += 1
+        if operation.model_id in self.failing:
+            return Observation(Presence.UNKNOWN, None, False, 0, "load_unverified")
+        return Observation(Presence.RUNNING, f"instance-{operation.model_id}", True, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
+class RecordingRecovery:
+    """A recovery port that records every deadline it was asked with."""
+
+    def __init__(self, *, result: RecoveryResult | None = None) -> None:
+        self.deadlines: list[float] = []
+        self.result = result if result is not None else RecoveryResult(True, "complete", None, ("first", "second"))
+
+    @property
+    def calls(self) -> int:
+        return len(self.deadlines)
+
+    async def recover(self, deadline):
+        self.deadlines.append(deadline)
+        return self.result
+
+
+def recovery_scheduler(registry: Book, backend, recovery, clock: ManualClock) -> ModelScheduler:
+    return ModelScheduler(
+        registry, ClockedResources(clock), backend,
+        recovery=recovery, clock=clock, poll_interval_seconds=0.001,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_expired_caller_deadline_still_buys_one_fresh_bounded_recovery_budget() -> None:
+    clock = ManualClock(1_000.0)
+
+    class ExpiringBackend(Backend):
+        async def load(self, operation, deadline):
+            self.loads += 1
+            clock.advance(10.0)  # the caller's own deadline is already gone
+            return Observation(Presence.UNKNOWN, None, False, 0, "load_unverified")
+
+    recovery = RecordingRecovery()
+    scheduler = recovery_scheduler(two_model_book(), ExpiringBackend(), recovery, clock)
+
+    with pytest.raises(TimeoutError):
+        await scheduler.acquire("first", "req-1", clock() + 1)
+
+    assert await eventually(lambda: recovery.calls == 1)
+    policy = LifecyclePolicy()
+    assert recovery.deadlines == [clock() + policy.recovery_seconds]
+    assert recovery.deadlines[0] > clock()  # a fresh budget, not the expired caller one
+
+
+@pytest.mark.asyncio
+async def test_a_second_failure_neither_duplicates_nor_extends_the_running_recovery() -> None:
+    clock = ManualClock(1_000.0)
+
+    class RendezvousBackend(Backend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arrived = 0
+            self.ready = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def load(self, operation, deadline):
+            self.loads += 1
+            self.arrived += 1
+            if self.arrived >= 2:
+                self.ready.set()
+            await self.gate.wait()
+            return Observation(Presence.UNKNOWN, None, False, 0, "load_unverified")
+
+    class BlockingRecovery:
+        def __init__(self) -> None:
+            self.deadlines: list[float] = []
+            self.called = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def recover(self, deadline):
+            self.deadlines.append(deadline)
+            self.called.set()
+            await self.gate.wait()
+            return RecoveryResult(True, "complete", None, ("first", "second"))
+
+    backend, recovery = RendezvousBackend(), BlockingRecovery()
+    registry = two_model_book()
+    scheduler = recovery_scheduler(registry, backend, recovery, clock)
+
+    first = asyncio.create_task(scheduler.acquire("first", "req-1", clock() + 30))
+    second = asyncio.create_task(scheduler.acquire("second", "req-2", clock() + 30))
+    assert await asyncio.wait_for(backend.ready.wait(), 5)
+    backend.gate.set()  # both unverified loads land together
+
+    assert await eventually(lambda: len(recovery.deadlines) == 1)
+    await asyncio.sleep(0.05)  # give the second failure every chance to start an attempt
+    assert len(recovery.deadlines) == 1  # merged: one attempt with one fixed deadline
+    assert recovery.deadlines == [clock() + LifecyclePolicy().recovery_seconds]
+
+    recovery.gate.set()
+    assert await eventually(lambda: not registry.recovering)
+    await asyncio.gather(first, second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_never_stops_anything_before_the_old_actions_drain() -> None:
+    clock = ManualClock(1_000.0)
+    recovery = RecordingRecovery()
+    registry = two_model_book()
+    scheduler = recovery_scheduler(registry, ScriptedLoadBackend(failing=("first",)), recovery, clock)
+
+    lease = await scheduler.acquire("second", "holder", clock() + 30)  # a lease that never returns
+
+    with pytest.raises(ModelUnavailable, match="load_unverified|control_recovering"):
+        await scheduler.acquire("first", "req-1", clock() + 0.05)  # a short caller budget on purpose
+
+    assert await eventually(lambda: registry.recovering)
+    clock.advance(61.0)  # the drain budget runs out with the lease still held
+
+    assert await eventually(lambda: scheduler._recovery_task is None)
+    assert recovery.deadlines == []                                        # the port was never asked
+    assert registry.runtime["second"].leases.get(lease.lease_id) == lease  # the lease survived
+    assert registry.runtime["second"].reservation > 0                      # and so did its budget
+    assert registry.runtime["second"].state is State.ERROR
+    assert registry.recovering is True                                     # only an explicit retry remains
+    await scheduler.release(lease, Outcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_waits_for_the_running_eviction_batch() -> None:
+    clock = ManualClock(1_000.0)
+
+    class BlockingStopBackend(ScriptedLoadBackend):
+        def __init__(self) -> None:
+            super().__init__(failing=("first",))
+            self.stopping = asyncio.Event()
+            self.stop_gate = asyncio.Event()
+
+        async def stop(self, operation, deadline):
+            self.stopping.set()
+            await self.stop_gate.wait()
+            return Observation(Presence.STOPPED, None, False, 0)
+
+    recovery = RecordingRecovery()
+    backend = BlockingStopBackend()
+    registry = two_model_book()
+    scheduler = recovery_scheduler(registry, backend, recovery, clock)
+
+    lease = await asyncio.wait_for(scheduler.acquire("second", "holder", clock() + 30), 3)
+    await asyncio.wait_for(scheduler.release(lease, Outcome.SUCCESS), 3)
+    unloading = asyncio.create_task(scheduler.unload("second", clock() + 30))
+    try:
+        assert await asyncio.wait_for(backend.stopping.wait(), 3)
+
+        recovering = asyncio.create_task(scheduler.recover(clock() + 30))
+        assert await eventually(lambda: registry.recovering)
+        await asyncio.sleep(0.05)
+        assert recovery.deadlines == []  # the stop batch is still unresolved, so nothing global runs
+    finally:
+        backend.stop_gate.set()  # never leave the stop batch blocking across the test
+        await asyncio.wait_for(asyncio.gather(unloading, return_exceptions=True), 3)
+    await recovering
+    assert recovery.calls == 1
+    assert registry.recovering is False
+
+
+@pytest.mark.asyncio
+async def test_a_running_recovery_closes_admission_immediately() -> None:
+    clock = ManualClock(1_000.0)
+
+    class BlockingRecovery:
+        def __init__(self) -> None:
+            self.called = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def recover(self, deadline):
+            self.called.set()
+            await self.gate.wait()
+            return RecoveryResult(True, "complete", None, ("first", "second"))
+
+    recovery = BlockingRecovery()
+    registry = two_model_book()
+    scheduler = recovery_scheduler(registry, ScriptedLoadBackend(failing=("first",)), recovery, clock)
+
+    lease = await scheduler.acquire("second", "holder", clock() + 30)
+    await scheduler.release(lease, Outcome.SUCCESS)
+
+    with pytest.raises(ModelUnavailable, match="load_unverified|control_recovering"):
+        await scheduler.acquire("first", "req-1", clock() + 30)
+    assert await eventually(lambda: registry.recovering)
+
+    with pytest.raises(ModelUnavailable, match="control_recovering"):
+        await scheduler.acquire("second", "req-2", clock() + 30)
+
+    recovery.gate.set()
+    assert await eventually(lambda: not registry.recovering)
+
+
+@pytest.mark.asyncio
+async def test_a_manual_retry_finishes_what_a_failed_attempt_left_recovering() -> None:
+    clock = ManualClock(1_000.0)
+
+    class FlakyRecovery:
+        def __init__(self) -> None:
+            self.deadlines: list[float] = []
+
+        async def recover(self, deadline):
+            self.deadlines.append(deadline)
+            if len(self.deadlines) == 1:
+                return RecoveryResult(False, "failed", "stop_failed", ())
+            return RecoveryResult(True, "complete", None, ("first", "second"))
+
+    recovery = FlakyRecovery()
+    registry = two_model_book()
+    scheduler = recovery_scheduler(registry, ScriptedLoadBackend(failing=("first",)), recovery, clock)
+
+    with pytest.raises(ModelUnavailable, match="load_unverified|control_recovering"):
+        await scheduler.acquire("first", "req-1", clock() + 30)
+
+    assert await eventually(lambda: len(recovery.deadlines) == 1 and scheduler._recovery_task is None)
+    assert registry.recovering is True  # the failed attempt stays closed, keeping every reservation
+    assert registry.runtime["first"].state is State.ERROR
+
+    await scheduler.recover(clock() + 30)  # the explicit, bounded retry
+
+    assert registry.recovering is False
+    assert registry.runtime["first"].state is State.UNLOADED
+    assert registry.runtime["first"].reservation == 0
+    assert recovery.deadlines == [clock() + LifecyclePolicy().recovery_seconds, clock() + 30]

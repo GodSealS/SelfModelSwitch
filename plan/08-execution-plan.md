@@ -229,6 +229,21 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 复查做不出来时按未知结果保守失败，绝不因为命令已发出就记为已停止。helper 只操作本 deployment 的容器，
 旧 identity 不得重定向到新容器。
 
+**恢复状态机的执行（RP08 已交付）**：K5 的状态机从设计文字变为可执行代码。自动触发在 scheduler 的锁内完成：
+`_start_recovery` 只在没有未完成的恢复任务时创建唯一 task，并以 `now + LifecyclePolicy.recovery_seconds`（默认
+60s）固定本次预算——触发者自己的 caller deadline 即使已经过期，也照样得到这一份 fresh 有界预算；后续失败只会
+并入这次尝试，**不延长**它的 deadline。恢复 task 的第一段锁内 `begin_recovery`（Book 幂等：已 recovering 时返回
+当前 epoch），因此新 load/lease/session dispatch 立即关闭，旧 epoch 的所有 operation token 同时失效——迟到的
+load/eviction 写回只会得到 `stale_operation`，既不能把模型改回 READY，也不能启动新容器。随后
+`_drain_for_recovery` 在同一 deadline 内等待三件事同时成立：没有任何 lease、没有已派发的 load、没有正在进行的
+eviction/cleanup 批。**排空期间不释放、不取消、不停止任何东西**：计算状态未知的 lease 保留它的 slot、预留和身份；
+到期仍未排空则该次尝试以 `recovery_drain_timeout` 失败并保持 `recovering`，不调用全局 stop、不删 lease、不释放
+预算（原“drain 超时直接 `book.release(ABORTED)`”已删除）。只有排空之后才调用异步恢复端口（同一个 deadline）；
+端口返回后锁内校验 epoch 与完整 `stopped_models` 集合（含 `StaleOperation` 分支）才 `finish_recovery` 并清身份，
+任何失败都保持关闭状态。人工 `recover(deadline)` 是显式重试入口：只在无活动恢复任务时接受，取
+`min(caller deadline, now + recovery_seconds)` 作为有界预算，复用失败尝试留下的 epoch 与账本；它不会自动循环，
+也不会重放推理。触发者自身先把自己的 load task 从 `_loads` 摘除，再创建恢复任务，恢复因此永远不会等待自己。
+
 **异步恢复端口的输入与信任边界（RP07 已交付）**：`DeploymentRecoveryPort`（`control_recovery.py`）是调度器在
 准入已关闭、旧动作排空之后唯一可调用的运行时恢复入口，满足**既有** `ControlRecoveryPort` 形状——只有
 `async def recover(self, deadline: float) -> RecoveryResult`。输入只有调用方的绝对 deadline，加上构造时注入的

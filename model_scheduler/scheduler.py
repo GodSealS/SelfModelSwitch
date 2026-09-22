@@ -292,9 +292,11 @@ class ModelScheduler:
                 # load finishing late must not delete its successor's entry.
                 if self._loads.get(operation.model_id) is asyncio.current_task():
                     self._loads.pop(operation.model_id, None)
+                # K5: the one automatic attempt is created under the lock, with the
+                # fresh bounded budget it will keep for its whole life.
+                if recover:
+                    self._start_recovery()
                 self._condition.notify_all()
-            if recover:
-                self._start_recovery(deadline)
 
     def _acceptable_load(self, observation: Observation, now: float) -> bool:
         """Is this load fact something the books may commit?"""
@@ -317,33 +319,76 @@ class ModelScheduler:
                 self._switch_successes[0] + self._switch_window_seconds,
             )
 
-    def _start_recovery(self, deadline: float) -> None:
-        if self._recovery_task is None or self._recovery_task.done():
-            self._recovery_task = asyncio.create_task(self._recover_after_unverified_load(deadline))
+    def _start_recovery(self) -> None:
+        """Create the one automatic attempt with its own bounded budget (K5).
+
+        Called under the condition: the deadline is fixed exactly once and an
+        already running attempt is never replaced or extended, so further
+        failures of the same kind merge into it instead of reissuing it.
+        """
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return
+        self._recovery_task = asyncio.create_task(
+            self._recover_after_unverified_load(self._clock() + self.lifecycle_policy.recovery_seconds))
 
     async def _recover_after_unverified_load(self, deadline: float) -> None:
-        """Use the narrow recovery port after a control action has uncertain state."""
+        """K5 automatic entry: one attempt inside one fresh bounded budget."""
         try:
-            async with self._condition:
-                while any(runtime.leases for runtime in self.book.runtime.values()):
-                    remaining = deadline - self._clock()
-                    if remaining <= 0:
-                        for runtime in self.book.runtime.values():
-                            for lease in tuple(runtime.leases.values()):
-                                self.book.release(lease, Outcome.ABORTED, self._clock())
-                        break
-                    try:
-                        await asyncio.wait_for(self._condition.wait(), remaining)
-                    except asyncio.TimeoutError:
-                        continue
-            await self.recover(deadline)
+            await self._execute_recovery(deadline)
         except (Conflict, ModelUnavailable):
-            # The failed model remains ERROR and admissions stay conservative.
+            # The attempt failed; the books keep `recovering`, every reservation,
+            # identity and lease, and only an explicit retry may try again.
             pass
         finally:
             async with self._condition:
-                self._recovery_task = None
+                if self._recovery_task is asyncio.current_task():
+                    self._recovery_task = None
                 self._condition.notify_all()
+
+    async def _execute_recovery(self, deadline: float) -> None:
+        """Close admission, drain the old actions, then ask the port (K5).
+
+        Nothing is released, cancelled or stopped on the way in: a lease whose
+        computation is still unknown keeps its slot, its reservation and its
+        identity, and `recovering` stays set for a later explicit retry.
+        """
+        async with self._condition:
+            # Idempotent: an explicit retry reuses the epoch a failed attempt
+            # already froze, so a late result of the old epoch is never accepted.
+            epoch = self.book.begin_recovery()
+            self._condition.notify_all()
+        if not await self._drain_for_recovery(deadline):
+            raise ModelUnavailable("recovery_drain_timeout")
+        result = await self.recovery.recover(deadline)
+        async with self._condition:
+            if not result.ok:
+                self._condition.notify_all()
+                raise ModelUnavailable(result.error_code or "control_recovery_failed")
+            try:
+                self.book.finish_recovery(epoch, frozenset(result.stopped_models))
+            except (Conflict, StaleOperation) as exc:
+                self._condition.notify_all()
+                raise ModelUnavailable("control_recovery_incomplete") from exc
+            self._condition.notify_all()
+
+    async def _drain_for_recovery(self, deadline: float) -> bool:
+        """Wait for leases, dispatched loads and the eviction batch to end (K5)."""
+        while True:
+            async with self._condition:
+                drained = (
+                    not any(runtime.leases for runtime in self.book.runtime.values())
+                    and not self._loads
+                    and self._eviction is None
+                )
+                if drained:
+                    return True
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(self._condition.wait(), min(remaining, self.poll_interval_seconds))
+                except asyncio.TimeoutError:
+                    continue
 
     async def _admission_allowed(self) -> bool:
         if self.admission_guard is None:
@@ -629,27 +674,28 @@ class ModelScheduler:
         return True
 
     async def recover(self, deadline: float) -> None:
-        """Reconcile all model accounting through the injected root-owned helper."""
+        """The explicit recovery entry: one bounded attempt, never a loop (K5).
+
+        It is also the manual retry after a failed automatic attempt. It waits
+        for the old actions to drain instead of releasing them, it reuses the
+        epoch a failed attempt already froze, and the policy caps the deadline
+        exactly as it does on the automatic path.
+        """
         if self.recovery is None:
             raise ModelUnavailable("control_recovery_unavailable")
+        budget = min(deadline, self._clock() + self.lifecycle_policy.recovery_seconds)
         async with self._condition:
-            if self.book.recovering:
+            if self._recovery_task is not None and not self._recovery_task.done():
                 raise Conflict("recovery_in_progress")
-            if any(runtime.leases for runtime in self.book.runtime.values()):
-                raise Conflict("recovery_has_leases")
-            epoch = self.book.begin_recovery()
-            self._condition.notify_all()
-        result = await self.recovery.recover(deadline)
-        async with self._condition:
-            if not result.ok:
+            task = asyncio.create_task(self._execute_recovery(budget))
+            self._recovery_task = task
+        try:
+            await task
+        finally:
+            async with self._condition:
+                if self._recovery_task is task:
+                    self._recovery_task = None
                 self._condition.notify_all()
-                raise ModelUnavailable(result.error_code or "control_recovery_failed")
-            try:
-                self.book.finish_recovery(epoch, frozenset(result.stopped_models))
-            except Conflict as exc:
-                self._condition.notify_all()
-                raise ModelUnavailable("control_recovery_incomplete") from exc
-            self._condition.notify_all()
 
     async def shutdown(self, deadline: float) -> tuple[str, ...]:
         """Close admission, drain leases to deadline, then stop managed models."""

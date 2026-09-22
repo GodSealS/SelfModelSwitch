@@ -375,11 +375,37 @@ helper 无法证停时不询问 observer、过期 deadline 零派发、样本晚
 **Files likely touched:** `model_scheduler/scheduler.py`、`tests/test_scheduler_lifecycle.py`、`tests/test_control_recovery_port.py`。
 **Documentation impact:** C03恢复状态图、60s总期限、超时保持关闭及人工重试规则。
 **Acceptance criteria:**
-- [ ] caller已过期仍创建一次fresh恢复预算，重复触发不续期；当前操作的失败才可触发。
-- [ ] 新准入立即关闭；lease未可信释放/control事务未终结时到期不调用全局stop，不删lease，不释放预算。
-- [ ] 旧load/eviction在恢复完成后不能再次写回或launch；触发任务不会被恢复等待自身死锁。
-- [ ] exact STOPPED集合且epoch当前才清身份/预算；失败保持recovering；人工有限重试可达，不自动无限循环。
+- [x] caller已过期仍创建一次fresh恢复预算，重复触发不续期；当前操作的失败才可触发。
+- [x] 新准入立即关闭；lease未可信释放/control事务未终结时到期不调用全局stop，不删lease，不释放预算。
+- [x] 旧load/eviction在恢复完成后不能再次写回或launch；触发任务不会被恢复等待自身死锁。
+- [x] exact STOPPED集合且epoch当前才清身份/预算；失败保持recovering；人工有限重试可达，不自动无限循环。
 **Verification:** `"$PY" -m pytest tests/test_scheduler_lifecycle.py tests/test_control_recovery_port.py -q`及全量；可控Barrier验证“排空前helper调用数=0”。
+
+**执行结果（2026-09-22）**：`scheduler.py` 的恢复路径按 K5 重写。`_start_recovery()`（锁内调用）只在没有未完成
+恢复任务时创建唯一 task，并用 `now + LifecyclePolicy.recovery_seconds` 固定 60s 预算——caller deadline 过期也
+照样得到 fresh 预算，重复失败只并入现有尝试、不续期。`_execute_recovery(deadline)` 先锁内 `begin_recovery`
+（幂等，复用失败尝试的 epoch）关闭准入，再 `_drain_for_recovery` 在同一 deadline 内等 lease / 已派发 load /
+eviction 批全部结束；**删除**“drain 超时直接 `book.release(lease, ABORTED)`”的强杀路径：未排空即
+`recovery_drain_timeout` 失败，保持 recovering、预留、身份与 lease，不调用全局 stop。排空后才调用端口，
+锁内按 epoch + 完整 `stopped_models`（含 `StaleOperation` 分支）完成 `finish_recovery`；任何失败保持关闭。
+人工 `recover(deadline)` 改为显式、有界（`min(caller, now+60)`）的重试入口：只在无活动恢复任务时接受、
+复用当前 epoch、不自动循环。触发者仍在 `_loads` 摘除后才创建恢复任务，不自锁。
+
+新增 6 个用例（`tests/test_scheduler_lifecycle.py`，该文件现 71 个）：过期 caller 仍得到 fresh 60s 预算、
+两个失败合并为一次尝试且 deadline 不延长、lease 未归还时到期不调用端口且 lease/预算/身份保留、eviction 批
+未终结前端口调用数为 0、恢复运行中新准入立即得到 `control_recovering`、失败尝试后人工有界重试可完成。
+另修正 `test_a_late_load_write_back_is_rejected_and_keeps_the_raw_fence` 的同步点（K5 下 begin_recovery 先于
+端口调用，改为等 epoch）。RED 阶段 5 failed / 2 passed（fresh 预算缺失、重复触发、强杀 lease、不等 eviction、
+人工重试被拒）。
+
+偏差说明：任务列出的 `tests/test_control_recovery_port.py` 本轮未改——RP07 已把端口本身的拒绝/新鲜度语义测完，
+RP08 的排空屏障需要真实调度器夹具（可控 lease/eviction/时钟），放在 `test_scheduler_lifecycle.py` 更直接。
+
+验证：定向 `test_scheduler_lifecycle.py + test_registry.py` 99 passed；关联
+`test_managed_execution.py + test_admin_api.py + test_control_api.py` 51 passed；
+`test_process_lifecycle.py + test_control_socket.py + test_operational_cases.py + test_runtime.py + test_blob_recovery.py`
+53 passed、1 skipped；全量 `pytest tests -m 'not thor' -q` **989 passed、1 skipped、1 deselected**（15m39s，
+较 RP07 的 983 增加 6）、`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP09：把恢复端口真正接入v2及启动流程
 
