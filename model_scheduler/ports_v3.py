@@ -26,9 +26,10 @@ container or computation stopped.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 from .contracts_v2 import ContractError, ModelSpec
 from .control_protocol_v1 import Fence, InstanceIdentity
@@ -45,6 +46,71 @@ DISPATCH_STATES = frozenset({"not_started", "dispatched"})
 
 # C02 sample freshness window.
 SAMPLE_MAX_AGE_SECONDS = 2.0
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_IMAGE_REFERENCE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class LifecyclePolicy:
+    """The one immutable timing policy for witnesses and recovery (K1).
+
+    These are first-version *software* values, not figures derived from the C02
+    hardware evidence; they may only be overridden by an explicit short value in
+    a test. Nothing is clamped: an inconsistent policy is refused at construction.
+    """
+
+    verify_window_seconds: float = 10.0
+    poll_seconds: float = 0.5
+    observation_timeout_seconds: float = 2.0
+    observation_max_age_seconds: float = 2.0
+    recovery_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "verify_window_seconds",
+            "poll_seconds",
+            "observation_timeout_seconds",
+            "observation_max_age_seconds",
+            "recovery_seconds",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ContractError(f"lifecycle_policy.{name}: must be a finite positive number")
+        if self.poll_seconds > self.verify_window_seconds:
+            raise ContractError("lifecycle_policy: poll_seconds must not exceed verify_window_seconds")
+        if not self.observation_timeout_seconds <= self.observation_max_age_seconds <= self.verify_window_seconds:
+            raise ContractError(
+                "lifecycle_policy: observation_timeout_seconds <= observation_max_age_seconds <= verify_window_seconds"
+            )
+
+
+@dataclass(frozen=True)
+class ExpectedInstance:
+    """What this deployment expects one boot to have started (K4).
+
+    The expectation is assembled from the raw configuration bytes by the
+    composition root, never derived from an observation: a fact cannot be the
+    source of the rule that judges it.
+    """
+
+    deployment_id: str
+    model_id: str
+    runtime_id: str
+    image_digest: str
+    identity_digest: str
+    digest_kind: Literal["config"] = "config"
+
+    def __post_init__(self) -> None:
+        _check_identifier(self.deployment_id, "expected_instance.deployment_id")
+        _check_identifier(self.model_id, "expected_instance.model_id")
+        _check_identifier(self.runtime_id, "expected_instance.runtime_id")
+        if not isinstance(self.image_digest, str) or not _IMAGE_REFERENCE.match(self.image_digest):
+            raise ContractError("expected_instance.image_digest: must be `name@sha256:<64 hex>`")
+        if not isinstance(self.identity_digest, str) or not _HEX64.match(self.identity_digest):
+            raise ContractError("expected_instance.identity_digest: must be 64 lowercase hex digits")
+        if self.digest_kind != "config":
+            raise ContractError("expected_instance.digest_kind: only 'config' is rendered this release")
 
 
 def _check_identifier(value: object, where: str) -> None:
@@ -193,6 +259,10 @@ class Observation:
     subprocess_state: str
     instance: InstanceIdentity | None = None
     launch_operation: LaunchOperation | None = None
+    # False when the observer had no launch record source at all, so nothing about
+    # the launch could be proven either way (K4 `launch_unresolved`). A caller must
+    # not turn such an observation into STOPPED even if the other facts line up.
+    launch_resolved: bool = True
 
     def __post_init__(self) -> None:
         _check_enum(self.state, "observation.state", OBSERVATION_STATES)
@@ -339,6 +409,17 @@ class ObserverPort(Protocol):
     """Independent observation port; never reads scheduler memory (C03)."""
 
     async def observe(self, target: ObservationTarget, deadline: float) -> Observation: ...
+
+
+@runtime_checkable
+class DeadlineDocker(Protocol):
+    """A docker CLI whose every call is bounded by one absolute deadline (K4).
+
+    Each invocation re-derives the time that is left from the same deadline, so
+    no stage of one sample ever gets a fresh allowance of its own.
+    """
+
+    def __call__(self, argv: Sequence[str], *, deadline: float) -> tuple[int, str, str]: ...
 
 
 @runtime_checkable

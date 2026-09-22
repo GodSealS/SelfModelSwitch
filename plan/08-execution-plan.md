@@ -178,7 +178,7 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 |---|---|---|---|
 | 身份所有者 | `ManagedLifecycle._instances` 私有字典（`backend_control.py:112`），bridge 自写 | 唯一已接受身份是 `Book.Runtime.instance`；`_instances` 删除，bridge `instance()` 只调用注入的只读 `instance_lookup` | adapter 的 identity 回调仍经同一入口取值；不得新增 prepared/committed 身份缓存或待提交映射 |
 | 结果字段 | `contracts.Observation` 为 `presence/instance_id/healthy/observed_at` + `detail_code=None`（`contracts.py:74`） | 末尾新增 `instance=None`、`valid_until=None` 两个带默认值字段 | 原五个位置参数构造不变；纯 DTO，不新增 HTTP 字段、不改 control-v1 schema |
-| 加载见证 | HEAD 上加载只采样一次（`142746c` 已被 `a6497fd` 回退） | K1 内部 `LifecyclePolicy`（`ports_v3.py`，当前不存在，RP02 新增）固定 10/0.5/2/2/60；UNKNOWN→RUNNING 精确轮询，截止后零次新观察 | 该组是**软件初值**，不是 C02 硬件已验证参数；测试显式注入短值；不新增环境变量/CLI 开关 |
+| 加载见证 | HEAD 上加载只采样一次（`142746c` 已被 `a6497fd` 回退） | K1 内部 `LifecyclePolicy`（`ports_v3.py`，RP02 已交付）固定 10/0.5/2/2/60；UNKNOWN→RUNNING 精确轮询，截止后零次新观察 | 该组是**软件初值**，不是 C02 硬件已验证参数；测试显式注入短值；不新增环境变量/CLI 开关 |
 | 已证停止的加载 | 无此状态 | K3 新增 `Runtime.load_stopped_generation`（本代 marker），转 ERROR 且 `reservation=0`、`admission_blocked=True`、`instance=None`、`last_error=load_proven_stopped` | 普通 `acquire` 在 ERROR 仍抛 `ModelUnavailable`；`warm/preload` 沿用 `load_retry_limit` 消费 marker 后有限重试 |
 | UNKNOWN 策略 | adapter 返回 UNKNOWN 后仍可能进入见证轮询 | 只有 adapter 返回 **RUNNING** 才轮询；UNKNOWN/STOPPED/控制异常直接保守保预算，交恢复或受控 cleanup | 不顺带重新设计 adapter readiness 重试；控制超时/取消/StopAck 都不是 STOPPED |
 | 新鲜度与截止 | `SAMPLE_MAX_AGE_SECONDS=2.0` 只用于内存样本（`ports_v3.py:47`） | `sampled_at_monotonic` 是采集**开始**时间；RUNNING/STOPPED 需 `0<=now-sampled_at<=max_age` 且 `now<valid_until` | 三级绝对截止 `caller_deadline`→`verify_deadline`→`sample_deadline`，各 I/O 阶段共用，不逐阶段重置；UTC 只用于证据 |
@@ -191,12 +191,16 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 `launch_lookup`（`process_observer.py:309`），结果进入 `stopped_is_proven(launch_operation_terminal=...)`
 （`process_observer.py:350`）。已核实两处缺口：
 
-1. `launch_lookup` 默认是 `None`，且 `process_observer.py:348` 在 `launch is None` 时取
+1. `launch_lookup` 默认是 `None`，原 `process_observer.py:348` 在 `launch is None` 时取
    `launcher_terminal = True`——即“没有启动记录”被等同于“启动已终结”。生产装配 `run.py:139-142` 只传
    `deployment_id, model_id, port` 三个位置参数，因此恒为 `launch is None`。
+   **RP02 已修**：区分“没有来源”与“来源说没有”——未注入 `launch_lookup` 时 `Observation.launch_resolved=False`
+   且永不能证 STOPPED；注入后返回 `None` 才是“本 boot 未派发”的正面证据。未注入来源的生产装配因此按设计失败封闭，
+   RP04a 的 managed 装配必须显式提供。
 2. v2 managed 加载路径 `LlamaCppAdapter.load`（`llama_cpp.py:299-317`）经 HTTP 派发给控制面，不创建
    `SupervisedLaunch`，返回的 `launch_operation` 恒为 `None`（`llama_cpp.py:316`）。
    `SupervisedLaunch` 当前只被 `deploy/model-runner.py:106` 与 `scripts/capture_control_fixture.py:251` 使用。
+   **未修**，属另立的控制协议能力任务。
 
 结论：**当前固定控制协议（control-v1 的 load/unload HTTP）不能提供 launch 终结证明**。该分支因此固定为
 **失败封闭**，并规定可测试的失败行为：
@@ -209,6 +213,14 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 
 让控制面暴露逐 load 的启动操作状态（或让 managed 加载改走 `SupervisedLaunch` 监督路径）是**新的控制协议
 能力**，另立任务；本轮不得伪造接口实现，也不得默认 `terminal=True`。
+
+**采样时刻与取消边界（RP02 已交付）**：一次观察是一个有界工作单元。`ps`、`inspect`、进程探测与端口探测共用同一个
+`sample_deadline = min(caller_deadline, sampled_at + observation_timeout_seconds)`，在同一 worker 线程内串行执行；
+任一段耗尽窗口即返回不完整事实，**不以其他事实补猜**。返回后在消费前复核：`now >= deadline` 或
+`now - sampled_at > observation_max_age_seconds` 的结果一律不得携带终态。`sampled_at_monotonic` 是本次采集
+**开始**时刻，不是结束时刻。`probe_loopback` 的连接超时取 `min(0.5s, 剩余时间)`，截止已过时一次不连。
+截止限制的是**新工作派发与结果接受**：超时后的子进程回收仍须完成并记录，不得在未回收完成时声称资源静默；
+`task.cancel()` 不等于子进程退出，也不能当作 launch 终结事实。
 
 ### C04：会话与执行状态机
 

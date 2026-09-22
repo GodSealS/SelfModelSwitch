@@ -163,11 +163,34 @@ bridge 私有缓存 `_instances` 的移除仍属 RP04，本片只提供 Book 侧
 **Files likely touched:** `model_scheduler/process_observer.py`、`model_scheduler/ports_v3.py`、`tests/test_process_observer.py`。
 **Documentation impact:** C03采样时刻、启动事务未知时STOPPED拒绝规则与取消边界。
 **Acceptance criteria:**
-- [ ] 截止已到零次I/O；ps超时不再inspect；空列表不调用inspect；端口超时使用剩余时间。
-- [ ] 慢观察返回后不能给出有效终态；同一次底层工作未退出时不派发下一轮。
-- [ ] launch仍starting/派发结果未知时，即使容器暂缺且端口关闭也不能证STOPPED。
-- [ ] expected存在时错配置摘要/镜像/runtime或额外candidate标签拒绝；不在丢失原始labels后才判断其来源。
+- [x] 截止已到零次I/O；ps超时不再inspect；空列表不调用inspect；端口超时使用剩余时间。
+- [x] 慢观察返回后不能给出有效终态；同一次底层工作未退出时不派发下一轮。
+- [x] launch仍starting/派发结果未知时，即使容器暂缺且端口关闭也不能证STOPPED。
+- [x] expected存在时错配置摘要/镜像/runtime或额外candidate标签拒绝；不在丢失原始labels后才判断其来源。
 **Verification:** `"$PY" -m pytest tests/test_process_observer.py tests/test_ports_v3.py -q`；新可控runner记录每次argv、timeout、退出，不依赖真实Docker。
+
+**执行结果（2026-09-22）**：`ports_v3` 新增 `LifecyclePolicy`（构造拒绝非有限/非正/bool 及三条不等式，用
+`ContractError`）、`ExpectedInstance`（ID、`name@sha256:<64hex>` 与 64hex 摘要、`digest_kind` 校验）与
+`DeadlineDocker` Protocol；`ports_v3.Observation` 新增 `launch_resolved: bool = True`。`process_observer` 新增
+`probe_loopback(port, *, deadline, now)`、`DeadlineDockerRunner`，`run_docker` 增加可选 `timeout` 以保持旧调用兼容；
+`DockerProcessObserver` 新增 `expected` 与 `policy`，并把四个事实源收进单一 worker 的 `_collect`，共用
+`sample_deadline`，返回后复核 deadline 与 max_age；`_expected_digest` 在原始 labels 层判定，有 `expected` 时不再有
+`candidate or config` 回退。
+
+关键语义决定：区分“**没有** launch 来源”与“来源**答称没有**”——前者 `launch_resolved=False` 且永不能证 STOPPED，
+后者才是“本 boot 未派发”的正面证据。现有单测/集成两类夹具都显式注入了该 callable，因此未被此改动打破；
+`run.py:139-142` 的生产装配未注入，按 RP00 的决定保持失败封闭，由 RP04a 显式提供。
+
+新增 22 个测试（`tests/test_process_observer.py`）：策略默认值与 7 组非法值、期望值 8 组非法 ID/摘要、
+过期 deadline 零 I/O、耗尽窗口后不再 inspect、空列表不 inspect、超出 max_age 的样本不给终态、
+无 launch 来源不证 STOPPED、来源存在时解析成功、expected 接受 canonical 事实并拒绝错配置摘要/多 candidate 标签/
+错 runtime/错镜像、无 expected 时 legacy 摘要回退仍可用、`DeadlineDockerRunner` 每次只给剩余时间且到期拒绝、
+`probe_loopback` 截止已过不连且超时取剩余。全部不依赖真实 Docker。
+
+验证：定向 `test_process_observer.py + test_ports_v3.py` 55 passed；受影响的集成
+`test_process_lifecycle.py + test_managed_execution.py` 15 passed；全量
+`pytest tests -m 'not thor' -q` **938 passed、1 skipped、1 deselected**（15m43s，较 RP01 的 907 增加 31）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP03：给adapter控制调用传递deadline
 

@@ -11,13 +11,16 @@ from model_scheduler.contracts import Presence
 from model_scheduler.control_protocol_v1 import Fence, InstanceIdentity
 from model_scheduler.process_observer import (
     CONFIG_LABEL,
+    CANDIDATE_LABEL,
     DEPLOYMENT_LABEL,
     MODEL_LABEL,
     RUNTIME_LABEL,
+    DeadlineDockerRunner,
     DockerProcessObserver,
     ObservationError,
     ProcessObserver,
     parse_inspect_payload,
+    probe_loopback,
 )
 
 DEPLOYMENT = "orin-lab"
@@ -304,3 +307,265 @@ def test_parse_inspect_payload_rejects_truncated_or_unstructured_facts() -> None
         parse_inspect_payload(json.dumps([{"Id": CONTAINER_ID, "Config": {}, "State": {}, "Image": ""}]))
     with pytest.raises(ObservationError):
         parse_inspect_payload(json.dumps([{**container_fact(running=True), "State": {"Running": True}}]))
+
+
+# ---------------------------------------------------------------------------
+# RP02/K1/K4: bounded collection, expected identity and the launch proof.
+# ---------------------------------------------------------------------------
+
+RUNTIME_ID = "llama-cpp-gguf-v1"
+
+
+def expected(**overrides) -> pv.ExpectedInstance:
+    fields = {
+        "deployment_id": DEPLOYMENT,
+        "model_id": MODEL_ID,
+        "runtime_id": RUNTIME_ID,
+        "image_digest": IMAGE_DIGEST,
+        "identity_digest": CONFIG_SHA256,
+    }
+    fields.update(overrides)
+    return pv.ExpectedInstance(**fields)
+
+
+class SlowDocker:
+    """A listing that consumes the whole sampling window, then records what follows."""
+
+    def __init__(self, facts: tuple[dict, ...], *, clock: ManualClock, cost: float) -> None:
+        self.facts = {fact["Id"]: json.loads(json.dumps(fact)) for fact in facts}
+        self.calls: list[list[str]] = []
+        self.clock = clock
+        self.cost = cost
+
+    def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+        self.calls.append(list(argv))
+        verb = argv[1] if len(argv) > 1 else ""
+        if verb == "ps":
+            self.clock.now += self.cost
+            return 0, "".join(f"{container_id}\n" for container_id in self.facts), ""
+        if verb == "inspect":
+            wanted = argv[2:]
+            if any(container_id not in self.facts for container_id in wanted):
+                return 1, "", f"Error: No such object: {wanted[0]}"
+            return 0, json.dumps([self.facts[container_id] for container_id in wanted]), ""
+        raise AssertionError(f"unexpected docker command: {argv}")
+
+
+def stopped_target() -> pv.ObservationTarget:
+    return pv.ObservationTarget(deployment_id=DEPLOYMENT, container_id=CONTAINER_ID, process_group_id=4321)
+
+
+def test_the_policy_defaults_are_the_documented_software_values() -> None:
+    policy = pv.LifecyclePolicy()
+
+    assert (policy.verify_window_seconds, policy.poll_seconds, policy.observation_timeout_seconds,
+            policy.observation_max_age_seconds, policy.recovery_seconds) == (10.0, 0.5, 2.0, 2.0, 60.0)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"poll_seconds": 0},
+    {"poll_seconds": -1.0},
+    {"observation_timeout_seconds": float("inf")},
+    {"observation_timeout_seconds": True},
+    {"poll_seconds": 20.0},                       # wider than the verify window
+    {"observation_max_age_seconds": 1.0},         # narrower than the observation timeout
+    {"observation_max_age_seconds": 20.0},        # wider than the verify window
+])
+def test_the_policy_rejects_unbounded_or_inconsistent_values(overrides: dict) -> None:
+    with pytest.raises(pv.ContractError):
+        pv.LifecyclePolicy(**overrides)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"deployment_id": ""},
+    {"model_id": ""},
+    {"runtime_id": ""},
+    {"image_digest": "not-a-digest"},
+    {"image_digest": "sha256:" + "d" * 63},
+    {"identity_digest": "not-hex"},
+    {"identity_digest": "f" * 63},
+    {"digest_kind": "candidate"},
+])
+def test_an_expected_instance_rejects_unusable_ids_and_digests(overrides: dict) -> None:
+    with pytest.raises(pv.ContractError):
+        expected(**overrides)
+
+
+def test_an_image_reference_with_a_name_prefix_is_accepted() -> None:
+    assert expected(image_digest=f"registry.example/orin-lab@{IMAGE_DIGEST}").image_digest.endswith(IMAGE_DIGEST)
+
+
+async def test_an_expired_deadline_dispatches_no_io_at_all() -> None:
+    docker = FakeDocker((container_fact(running=False, status="exited"),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed", launch_lookup=lambda _: None,
+                                     process_state=lambda _: "absent", clock=ManualClock())
+
+    observation = await observer.observe(stopped_target(), 100.0)  # clock already at 100.0
+
+    assert observation.state == pv.UNKNOWN
+    assert docker.calls == []
+
+
+async def test_a_listing_that_consumes_the_window_prevents_the_inspect() -> None:
+    clock = ManualClock()
+    docker = SlowDocker((container_fact(running=False, status="exited"),), clock=clock, cost=5.0)
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed", launch_lookup=lambda _: None,
+                                     process_state=lambda _: "absent", clock=clock)
+
+    observation = await observer.observe(stopped_target(), 102.0)
+
+    assert observation.state == pv.UNKNOWN
+    assert [call[1] for call in docker.calls] == ["ps"]
+
+
+async def test_an_empty_listing_does_not_call_inspect() -> None:
+    docker = FakeDocker(())
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed", launch_lookup=lambda _: None,
+                                     process_state=lambda _: "absent", clock=ManualClock())
+
+    observation = await observer.observe(stopped_target(), 200.0)
+
+    assert observation.state == pv.STOPPED
+    assert [call[1] for call in docker.calls] == ["ps"]
+
+
+async def test_a_sample_that_outlives_its_max_age_never_returns_a_terminal_state() -> None:
+    clock = ManualClock()
+    docker = SlowDocker((container_fact(running=False, status="exited"),), clock=clock, cost=3.0)
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed",
+                                     launch_lookup=lambda _: launch_operation("completed"),
+                                     process_state=lambda _: "absent", clock=clock)
+
+    observation = await observer.observe(stopped_target(), 200.0)
+
+    assert observation.state == pv.UNKNOWN  # 3s of collection exceeds the 2s max age
+
+
+async def test_without_a_launch_source_a_stop_is_never_proven() -> None:
+    docker = FakeDocker((container_fact(running=False, status="exited"),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed",
+                                     process_state=lambda _: "absent", clock=ManualClock())
+
+    observation = await observer.observe(stopped_target(), 200.0)
+
+    assert observation.state == pv.UNKNOWN
+    assert observation.launch_resolved is False
+
+
+async def test_a_recorded_launch_source_marks_the_stop_resolved() -> None:
+    docker = FakeDocker((container_fact(running=False, status="exited"),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker,
+                                     port_state=lambda _: "closed", launch_lookup=lambda _: None,
+                                     process_state=lambda _: "absent", clock=ManualClock())
+
+    observation = await observer.observe(stopped_target(), 200.0)
+
+    assert observation.state == pv.STOPPED
+    assert observation.launch_resolved is True
+
+
+async def test_the_expected_instance_accepts_the_canonical_rendered_fact() -> None:
+    docker = FakeDocker((container_fact(running=True),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker, port_state=lambda _: "listening",
+                                     launch_lookup=lambda _: None, process_state=lambda _: "absent",
+                                     clock=ManualClock(), expected=expected())
+
+    observation = await observer.observe(pv.ObservationTarget(deployment_id=DEPLOYMENT), 200.0)
+
+    assert observation.state == pv.RUNNING
+    assert observation.instance == InstanceIdentity(
+        container_id=CONTAINER_ID, started_at=CANONICAL_STARTED_AT, deployment_id=DEPLOYMENT,
+        model_id=MODEL_ID, runtime_id=RUNTIME_ID, candidate_digest=CONFIG_SHA256, image_digest=IMAGE_DIGEST,
+    )
+
+
+@pytest.mark.parametrize("labels", [
+    {CONFIG_LABEL: "e" * 64},                       # a config digest from another archive
+    {CANDIDATE_LABEL: CONFIG_SHA256},               # the removed candidate fallback must not return
+    {RUNTIME_LABEL: "some-other-runtime"},
+])
+async def test_an_expected_instance_refuses_a_label_that_does_not_match(labels: dict) -> None:
+    docker = FakeDocker((container_fact(running=True, labels=labels),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker, port_state=lambda _: "listening",
+                                     launch_lookup=lambda _: None, process_state=lambda _: "absent",
+                                     clock=ManualClock(), expected=expected())
+
+    observation = await observer.observe(pv.ObservationTarget(deployment_id=DEPLOYMENT), 200.0)
+
+    assert observation.state == pv.UNKNOWN
+    assert observation.instance is None
+
+
+async def test_an_expected_instance_refuses_a_container_from_another_image() -> None:
+    docker = FakeDocker((container_fact(running=True, image_digest="sha256:" + "9" * 64),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker, port_state=lambda _: "listening",
+                                     launch_lookup=lambda _: None, process_state=lambda _: "absent",
+                                     clock=ManualClock(), expected=expected())
+
+    observation = await observer.observe(pv.ObservationTarget(deployment_id=DEPLOYMENT), 200.0)
+
+    assert observation.state == pv.UNKNOWN
+
+
+async def test_without_an_expected_instance_the_legacy_digest_lookup_still_works() -> None:
+    docker = FakeDocker((container_fact(running=True),))
+    observer = DockerProcessObserver(DEPLOYMENT, MODEL_ID, PORT, docker=docker, port_state=lambda _: "listening",
+                                     launch_lookup=lambda _: None, process_state=lambda _: "absent",
+                                     clock=ManualClock())
+
+    observation = await observer.observe(pv.ObservationTarget(deployment_id=DEPLOYMENT), 200.0)
+
+    assert observation.state == pv.RUNNING
+    assert observation.instance is not None
+    assert observation.instance.candidate_digest == CONFIG_SHA256
+
+
+def test_the_deadline_runner_hands_each_call_only_the_time_that_is_left() -> None:
+    clock = ManualClock()
+    seen: list[tuple[list[str], float]] = []
+
+    def timed(argv: list[str], *, timeout: float) -> tuple[int, str, str]:
+        seen.append((list(argv), timeout))
+        clock.now += 6.0
+        return 0, "", ""
+
+    runner = DeadlineDockerRunner(now=clock.monotonic, docker=timed)
+
+    runner(["docker", "ps"], deadline=110.0)
+    runner(["docker", "inspect", "c"], deadline=110.0)
+
+    assert seen[0][1] == 10.0  # the whole remaining window
+    assert seen[1][1] == 4.0   # the shared deadline, not a fresh allowance
+    with pytest.raises(ObservationError):
+        runner(["docker", "ps"], deadline=110.0)
+
+
+def test_the_port_probe_skips_io_once_the_deadline_is_gone() -> None:
+    opened: list[float] = []
+
+    class Socket:
+        def __init__(self) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, timeout: float) -> None:
+            opened.append(timeout)
+
+        def connect_ex(self, _address) -> int:
+            return 0
+
+    with patch("model_scheduler.process_observer.socket.socket", return_value=Socket()):
+        assert probe_loopback(PORT, deadline=100.0, now=lambda: 100.0) == "unknown"
+        assert opened == []  # nothing was dispatched
+        assert probe_loopback(PORT, deadline=100.2, now=lambda: 100.0) == "listening"
+        assert opened == pytest.approx([0.2])  # never more than the remaining time

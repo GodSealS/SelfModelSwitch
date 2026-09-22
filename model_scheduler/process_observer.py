@@ -169,15 +169,68 @@ def structured_not_found(exit_code: int, stderr: str) -> bool:
     return exit_code != 0 and _STRUCTURED_NOT_FOUND.search(stderr or "") is not None
 
 
-def run_docker(argv: Sequence[str]) -> tuple[int, str, str]:
-    """The production docker CLI port: exact argv in, exit code and streams out."""
+def run_docker(argv: Sequence[str], *, timeout: float = DOCKER_TIMEOUT_SECONDS) -> tuple[int, str, str]:
+    """The production docker CLI port: exact argv in, exit code and streams out.
+
+    `timeout` is optional so every existing synchronous caller keeps working; the
+    deadline-aware runner below is the one that derives it from the clock.
+    """
     try:
         completed = subprocess.run(
-            list(argv), capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL
+            list(argv), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ObservationError(f"docker command failed: {exc}") from exc
     return completed.returncode, completed.stdout, completed.stderr
+
+
+LOOPBACK_PROBE_TIMEOUT_SECONDS = 0.5
+
+
+def probe_loopback(port: int, *, deadline: float, now: Callable[[], float] = monotonic) -> str:
+    """The deadline-bounded loopback fact: `listening`, `closed` or `unknown`.
+
+    Nothing is connected once the deadline has passed, and the probe never waits
+    longer than the time that is left — never the whole OS budget just because a
+    caller happened to ask late.
+    """
+    remaining = deadline - now()
+    if remaining <= 0:
+        return "unknown"
+    with socket.socket() as sock:
+        sock.settimeout(min(LOOPBACK_PROBE_TIMEOUT_SECONDS, remaining))
+        try:
+            code = sock.connect_ex(("127.0.0.1", port))
+        except OSError:
+            return "unknown"
+    if code == 0:
+        return "listening"
+    if code == errno.ECONNREFUSED:
+        return "closed"
+    return "unknown"
+
+
+class DeadlineDockerRunner:
+    """One absolute deadline shared by every docker stage of one sample (K4).
+
+    Each call re-derives the remaining time from the same deadline, so a slow
+    `docker ps` cannot leave the following `docker inspect` a fresh allowance, and
+    nothing at all is dispatched once the deadline has passed.
+    """
+
+    def __init__(
+        self,
+        now: Callable[[], float],
+        docker: Callable[..., tuple[int, str, str]] | None = None,
+    ) -> None:
+        self._now = now
+        self._docker = run_docker if docker is None else docker
+
+    def __call__(self, argv: Sequence[str], *, deadline: float) -> tuple[int, str, str]:
+        remaining = deadline - self._now()
+        if remaining <= 0:
+            raise ObservationError("the observation deadline expired before a docker call")
+        return self._docker(list(argv), timeout=min(remaining, DOCKER_TIMEOUT_SECONDS))
 
 
 def _reject_json_constant(value: str) -> object:
@@ -294,8 +347,22 @@ class DockerProcessObserver:
     The observer is constructed per model, so its listing can never widen to a
     foreign deployment or a sibling model. Facts come from the docker CLI, the
     loopback port and the OS process table; the verdict is the single
-    `stopped_is_proven` computation. A launcher this boot never recorded leaves
-    the container and port facts as the binding stop evidence.
+    `stopped_is_proven` computation.
+
+    One sample is one bounded unit of work: `ps`, `inspect`, the process probe and
+    the port probe all share one `sample_deadline` derived from the caller's own
+    deadline, they run serially inside a single worker thread, and every returned
+    fact is re-checked against the deadline and the maximum sample age before it
+    can carry a terminal state (K1/K4).
+
+    Two facts the caller must not have to guess at:
+
+    * `launch_resolved` is False when this observer was given no launch record
+      source at all. Then nothing can be said about the launch either way, so no
+      combination of the other three facts may prove STOPPED. A lookup that answers
+      `None` *is* a proof: this boot never launched that target.
+    * when `expected` is supplied, the container's raw labels are judged before
+      anything normalises them away, and there is no fallback to another digest.
     """
 
     def __init__(
@@ -309,6 +376,8 @@ class DockerProcessObserver:
         launch_lookup: Callable[[ports_v3.ObservationTarget], ports_v3.LaunchOperation | None] | None = None,
         process_state: Callable[[int], str] | None = None,
         clock: ports_v3.Clock | None = None,
+        expected: ports_v3.ExpectedInstance | None = None,
+        policy: ports_v3.LifecyclePolicy | None = None,
     ) -> None:
         if not isinstance(deployment_id, str) or not deployment_id:
             raise ValueError("an observer requires a deployment id")
@@ -316,49 +385,99 @@ class DockerProcessObserver:
             raise ValueError("an observer requires a model id")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("an observer requires a loopback port")
+        if expected is not None and (expected.deployment_id != deployment_id or expected.model_id != model_id):
+            raise ValueError("the expected instance belongs to another deployment or model")
         self._deployment_id, self._model_id, self._port = deployment_id, model_id, port
-        self._docker = docker or run_docker
+        self._expected = expected
+        self._policy = policy or ports_v3.LifecyclePolicy()
+        self._clock = clock or SystemClock()
+        self._docker = DeadlineDockerRunner(
+            self._clock.monotonic,
+            None if docker is None else (lambda argv, *, timeout: docker(list(argv))),
+        )
         self._port_state = port_state or docker_port_state
         self._launch_lookup = launch_lookup
         self._process_state = process_state or os_process_state
-        self._clock = clock or SystemClock()
+
+    def _launch_fact(self, target: ports_v3.ObservationTarget) -> tuple[ports_v3.LaunchOperation | None, bool]:
+        """The recorded launch and whether its absence was actually looked up."""
+        if self._launch_lookup is None:
+            return None, False
+        return self._launch_lookup(target), True
 
     async def observe(self, target: ports_v3.ObservationTarget, deadline: float) -> ports_v3.Observation:
         if not isinstance(target, ports_v3.ObservationTarget) or target.deployment_id != self._deployment_id:
             raise ObservationError("the observation target belongs to another deployment")
-        now_monotonic, now_utc = self._clock.monotonic(), self._clock.utc_now()
-        launch = self._launch_lookup(target) if self._launch_lookup is not None else None
-        if now_monotonic >= deadline:
-            return self._observation(UNKNOWN, now_monotonic, now_utc, "unknown", "unknown", None, launch)
-        port_state = await asyncio.to_thread(self._port_state, self._port)
-        try:
-            facts = await asyncio.to_thread(self._facts)
-        except ObservationError:
-            return self._observation(UNKNOWN, now_monotonic, now_utc, "unknown", "unknown", None, launch)
+        sampled_at, now_utc = self._clock.monotonic(), self._clock.utc_now()
+        launch, launch_resolved = self._launch_fact(target)
+        if sampled_at >= deadline:
+            # Nothing is dispatched at all: no port probe, no docker call, no I/O.
+            return self._observation(UNKNOWN, sampled_at, now_utc, "unknown", "unknown", None, launch, launch_resolved)
+        sample_deadline = min(deadline, sampled_at + self._policy.observation_timeout_seconds)
+        collected = await asyncio.to_thread(self._collect, target, launch, sample_deadline)
+        now = self._clock.monotonic()
+        if collected is None or now >= deadline or now - sampled_at > self._policy.observation_max_age_seconds:
+            # Refused after the fact: too slow, too old, or the window ran out part way.
+            return self._observation(UNKNOWN, sampled_at, now_utc, "unknown", "unknown", None, launch, launch_resolved)
+        port_state, facts, subprocess_state = collected
         matched = self._match(target, facts)
-        subprocess_state = await asyncio.to_thread(self._subprocess_state, target, launch)
         if matched is _AMBIGUOUS:
-            return self._observation(UNKNOWN, now_monotonic, now_utc, port_state, subprocess_state, None, launch)
+            return self._observation(UNKNOWN, sampled_at, now_utc, port_state, subprocess_state, None, launch, launch_resolved)
         if matched is not None and matched.running:
             identity = self._identity(matched)
             if identity is not None and port_state == "listening":
-                return self._observation(ports_v3.RUNNING, now_monotonic, now_utc, port_state, subprocess_state, identity, launch)
-            return self._observation(UNKNOWN, now_monotonic, now_utc, port_state, subprocess_state, None, launch)
+                return self._observation(ports_v3.RUNNING, sampled_at, now_utc, port_state, subprocess_state, identity, launch, launch_resolved)
+            return self._observation(UNKNOWN, sampled_at, now_utc, port_state, subprocess_state, None, launch, launch_resolved)
         container_gone = matched is None or not matched.running
-        launcher_terminal = launch.is_terminal if launch is not None else True
         subprocess_exited = subprocess_state in {"exited", "absent"}
         if ports_v3.stopped_is_proven(
             container_absent=container_gone,
-            launch_operation_terminal=launcher_terminal,
+            launch_operation_terminal=self._launch_terminal(launch, launch_resolved),
             subprocess_exited=subprocess_exited,
             port_listening=True if port_state == "listening" else False if port_state == "closed" else None,
         ):
             instance = self._identity(matched) if matched is not None else None
-            return self._observation(STOPPED, now_monotonic, now_utc, port_state, subprocess_state, instance, launch)
-        return self._observation(UNKNOWN, now_monotonic, now_utc, port_state, subprocess_state, None, launch)
+            return self._observation(STOPPED, sampled_at, now_utc, port_state, subprocess_state, instance, launch, launch_resolved)
+        return self._observation(UNKNOWN, sampled_at, now_utc, port_state, subprocess_state, None, launch, launch_resolved)
 
-    def _facts(self) -> tuple[ContainerFact, ...]:
-        return inspect_container_ids(list_container_ids(self._deployment_id, self._model_id, self._docker), self._docker)
+    @staticmethod
+    def _launch_terminal(launch: ports_v3.LaunchOperation | None, launch_resolved: bool) -> bool:
+        """Only a *looked up* launch fact can settle the launch dimension."""
+        if not launch_resolved:
+            return False  # nothing could be observed, so nothing can be proven
+        if launch is None:
+            return True  # the record itself says this boot never launched it
+        return launch.is_terminal
+
+    def _collect(
+        self,
+        target: ports_v3.ObservationTarget,
+        launch: ports_v3.LaunchOperation | None,
+        sample_deadline: float,
+    ) -> tuple[str, tuple[ContainerFact, ...], str] | None:
+        """One serial pass over the four fact sources under one shared deadline.
+
+        Returns None when the window ran out part way through: an incomplete fact
+        set must never be completed by guesswork on the caller's side.
+        """
+        now = self._clock.monotonic
+        if sample_deadline - now() <= 0:
+            return None
+        port_state = self._port_state(self._port)
+
+        def docker(argv: Sequence[str]) -> tuple[int, str, str]:
+            return self._docker(list(argv), deadline=sample_deadline)
+
+        if sample_deadline - now() <= 0:
+            return None
+        try:
+            listed = list_container_ids(self._deployment_id, self._model_id, docker)
+            facts = inspect_container_ids(listed, docker)
+        except ObservationError:
+            return None
+        if sample_deadline - now() <= 0:
+            return None
+        return port_state, facts, self._subprocess_state(target, launch)
 
     def _match(self, target: ports_v3.ObservationTarget, facts: tuple[ContainerFact, ...]) -> ContainerFact | None | object:
         """Bind the target to one container fact.
@@ -388,10 +507,12 @@ class DockerProcessObserver:
     def _identity(self, fact: ContainerFact) -> InstanceIdentity | None:
         labels = fact.labels
         runtime_id = labels.get(RUNTIME_LABEL)
-        digest = labels.get(CANDIDATE_LABEL) or labels.get(CONFIG_LABEL)
         if labels.get(DEPLOYMENT_LABEL) != self._deployment_id or labels.get(MODEL_LABEL) != self._model_id:
             return None
-        if not runtime_id or not digest:
+        if not runtime_id:
+            return None
+        digest = self._expected_digest(fact)
+        if not digest:
             return None
         try:
             started_at = canonical_utc(fact.started_at)
@@ -407,6 +528,26 @@ class DockerProcessObserver:
             image_digest=fact.image_digest,
         )
 
+    def _expected_digest(self, fact: ContainerFact) -> str | None:
+        """Judge the raw labels, before anything could normalise the source away.
+
+        Without an expectation this keeps the shipped `candidate or config`
+        lookup; *with* one there is no fallback: a wrong config digest, a stray
+        candidate label, another runtime or another image reference all refuse.
+        """
+        labels = fact.labels
+        if self._expected is None:
+            return labels.get(CANDIDATE_LABEL) or labels.get(CONFIG_LABEL)
+        if CANDIDATE_LABEL in labels:
+            return None  # nothing renders a candidate label this release
+        if labels.get(CONFIG_LABEL) != self._expected.identity_digest:
+            return None
+        if labels.get(RUNTIME_LABEL) != self._expected.runtime_id:
+            return None
+        if fact.image_digest != self._expected.image_digest:
+            return None
+        return self._expected.identity_digest
+
     def _observation(
         self,
         state: str,
@@ -416,6 +557,7 @@ class DockerProcessObserver:
         subprocess_state: str,
         instance: InstanceIdentity | None,
         launch: ports_v3.LaunchOperation | None,
+        launch_resolved: bool = True,
     ) -> ports_v3.Observation:
         return ports_v3.Observation(
             state=state,
@@ -425,4 +567,5 @@ class DockerProcessObserver:
             subprocess_state=subprocess_state,
             instance=instance,
             launch_operation=launch,
+            launch_resolved=launch_resolved,
         )
