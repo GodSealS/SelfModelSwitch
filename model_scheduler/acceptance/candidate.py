@@ -13,10 +13,11 @@ Two commands live here (plan/08-execution-plan.md §5):
   source archive into `CandidateV3`. Every value is re-derived from the
   supplied material: facts are re-parsed, model assets are re-hashed on disk,
   fixture files and the evaluator are re-hashed, the measurement manifest must
-  equal the registration's `measurement_ref`, and an unmeasured model, an
-  uncovered capability or a blocked measurement all stop the build. The body
-  never contains its own digest (`candidate_sha256` is written back into the
-  config, and `config_digest` excludes it), so the hash chain cannot cycle.
+  equal the registration's `measurement_ref`, and a mixed model set, an
+  unmeasured model, an uncovered capability or a blocked measurement all stop
+  the build. The body never contains its own digest (`candidate_sha256` is
+  written back into the config, and `config_digest` excludes it), so the hash
+  chain cannot cycle.
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ from typing import Any, Mapping
 from .. import config as config_module
 from .. import evidence_contracts as ec
 from ..config import AppConfigV2, load_config, ConfigError
-from ..contracts_v2 import ContractError
+from ..contracts_v2 import ContractError, require_production_openable
 from ..evidence_contracts import ArtifactRef, artifact_manifest_digest, candidate_digest, parse_candidate, parse_policy
 from .collector import COLLECTOR_VERSION
 
@@ -194,7 +195,13 @@ def _measurement_summary(directory: Path) -> Mapping[str, Any]:
 
 def build_candidate(*, config_path: Path, facts_path: Path, measurements_dir: Path, policy_path: Path,
                     fixtures_path: Path, source_path: Path, deployment_id: str, output: Path) -> dict:
-    """Assemble the frozen candidate body and return its recomputable digest."""
+    """Assemble the frozen candidate body and return its recomputable digest.
+
+    The single-directory `measurements_dir` form serves exactly one registered
+    model (K6/RP10). A mixed or incomplete set is refused right after the
+    configuration parses — before any expensive material is read and before
+    anything is written — so it can neither consume inputs nor leave an output.
+    """
     if not isinstance(deployment_id, str) or not _DEPLOYMENT_ID.fullmatch(deployment_id):
         raise CandidateError("--deployment-id must match [a-z0-9][a-z0-9-]{0,63}")
 
@@ -206,6 +213,16 @@ def build_candidate(*, config_path: Path, facts_path: Path, measurements_dir: Pa
     if not isinstance(config, AppConfigV2):
         raise CandidateError("the candidate requires a schema v2 configuration")
     config_sha = config_module.config_digest(raw_config)
+
+    if len(config.models) != 1:
+        raise CandidateError(f"--measurements DIR supports exactly one registered model, but this configuration "
+                             f"registers {len(config.models)}: a mixed set needs per-model measurement material")
+    runtimes_by_id = {runtime.runtime_id: runtime for runtime in config.runtimes.values()}
+    for registered in config.models.values():
+        try:
+            require_production_openable(registered, runtimes_by_id[registered.runtime_id])
+        except ContractError as exc:
+            raise CandidateError(str(exc)) from exc
 
     facts = _read_json(facts_path, "facts")
     try:
@@ -226,9 +243,6 @@ def build_candidate(*, config_path: Path, facts_path: Path, measurements_dir: Pa
                              "no model declares measured=true")
     summary = _measurement_summary(Path(measurements_dir))
     named = summary.get("model_id")
-    if len(measured) != 1:
-        raise CandidateError(f"the measurement names one model but {len(measured)} models claim measured=true: "
-                             "a candidate needs per-model measurement material")
     model = measured[0]
     if named is not None and named != model.model_id:
         raise CandidateError(f"the measurement measured {named!r} but {model.model_id!r} claims measured=true")

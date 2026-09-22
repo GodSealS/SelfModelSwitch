@@ -466,10 +466,12 @@ uid/gid/mtime=0、gzip mtime=0；不嵌入commit时间或归档自身摘要，�
 
 真源是执行契约 K6。本轮**不改**上表字段族与摘要规范，只补充输入范围与分阶段边界：
 
-- 第一阶段（RP10）：`--measurements DIR` 单目录模式只允许**配置中恰好一个模型且已测**。全未测、混测、
+- 第一阶段（RP10 已交付）：`--measurements DIR` 单目录模式只允许**配置中恰好一个模型且已测**。全未测、混测、
   已测但缺物理峰值或材料错配，一律输入错误 exit2，不写 candidate、不覆盖已有输出、不删历史候选。
-  现有 `build_candidate`（`acceptance/candidate.py:195`）的 `measurements_dir` 是必填 `Path`，改为
-  `Path | None = None` 并新增 `measurements_index`，两者互斥且必须恰好一个。
+  实现：`build_candidate` 在配置解析后、任何昂贵读取（模型资产、source archive）与写输出**之前**检查注册模型数
+  恰为一个，并对该模型复用 `require_production_openable`；CLI 的 `--measurements` 帮助文案注明
+  "one directory of measurement material for exactly one registered model"。`measurements_dir` 当前仍为必填
+  `Path`；改为 `Path | None = None` 并新增互斥的 `measurements_index` 属第二阶段。
 - 第二阶段（RP11/RP12）：**仅当最终生产模型数 > 1 时必需**。新增 `--measurements-index` 严格 JSON，
   按 `model_id` 索引材料目录，目录相对 index 父目录且不进入语义摘要；artifact key 统一为
   `measurements/<model_id>/<原相对路径>`。每个模型的 `measurement_ref` 仍按加 namespace **之前**的局部清单

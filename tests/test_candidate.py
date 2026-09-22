@@ -135,7 +135,12 @@ def test_a_source_archive_without_the_collector_member_is_refused(tmp_path) -> N
 
 
 def _site(tmp_path: Path, **overrides) -> dict:
-    """Complete candidate inputs: repo, source archive, config, facts, measurements, policy, fixtures."""
+    """Complete candidate inputs: repo, source archive, config, facts, measurements, policy, fixtures.
+
+    The single-directory form serves exactly one registered model (K6/RP10), so
+    the fixture keeps the measured vision model; `mixed=True` restores its
+    unmeasured sibling for the refusal cases only.
+    """
     root = _repo(tmp_path)
     source = tmp_path / "source.tar.gz"
     ca.build_source_archive(root=root, output=source)
@@ -152,10 +157,11 @@ def _site(tmp_path: Path, **overrides) -> dict:
     document["storage"]["expected_uuid"] = "11111111-2222-3333-4444-555555555555"
 
     assets = {"embedding.gguf": b"embedding-asset", "qwen-small.gguf": b"qwen-asset", "mmproj.gguf": b"projector"}
-    for index, (name, payload) in enumerate(assets.items()):
+    for name, payload in assets.items():
         (model_directory / name).write_bytes(payload)
-    vision = document["registration"]["models"][1]
-    vision["capabilities"] = ["vision"]
+    registered = {model["model_id"]: model for model in document["registration"]["models"]}
+    vision, embedding = registered["qwen-small"], registered["embedding"]
+    vision["capabilities"] = ["chat", "vision"]  # a vision chat model, so S05 can exercise the chat surface
     vision["assets"] = [
         {"role": "model", "path": "qwen-small.gguf", "sha256": hashlib.sha256(assets["qwen-small.gguf"]).hexdigest(),
          "size_bytes": len(assets["qwen-small.gguf"])},
@@ -163,10 +169,17 @@ def _site(tmp_path: Path, **overrides) -> dict:
          "size_bytes": len(assets["mmproj.gguf"])},
     ]
     vision["envelope"].update({"max_image_tokens": 1280, "max_image_edge_pixels": 1024, "max_images": 1})
-    embedding_asset = model_directory / "embedding.gguf"
-    document["registration"]["models"][0]["assets"][0].update(
-        {"sha256": hashlib.sha256(embedding_asset.read_bytes()).hexdigest(),
-         "size_bytes": embedding_asset.stat().st_size})
+    embedding["assets"][0].update(
+        {"sha256": hashlib.sha256(assets["embedding.gguf"]).hexdigest(),
+         "size_bytes": len(assets["embedding.gguf"])})
+
+    # K6/RP10: one directory of material serves exactly one model. `mixed` keeps
+    # the unmeasured sibling registered, which must be refused.
+    kept = ("embedding", "qwen-small") if overrides.pop("mixed", False) else ("qwen-small",)
+    document["registration"]["models"] = [registered[model_id] for model_id in kept]
+    for key in ("pinned_models", "preload_models"):
+        document["scheduler"][key] = [model_id for model_id in document["scheduler"].get(key, [])
+                                      if model_id in kept]
 
     measurements = tmp_path / "measurements"
     (measurements / "raw" / "run1").mkdir(parents=True)
@@ -195,10 +208,12 @@ def _site(tmp_path: Path, **overrides) -> dict:
 
     policy = tmp_path / "policy.json"
     policy.write_text(json.dumps({
-        "performance": [{"model_id": "embedding", "cold_start_seconds_max": 30.0, "infer_milliseconds_p95_max": 50.0,
-                         "infer_milliseconds_p99_max": 80.0, "max_input_milliseconds_max": 200.0},
-                        {"model_id": "qwen-small", "cold_start_seconds_max": 60.0, "infer_milliseconds_p95_max": 900.0,
-                         "infer_milliseconds_p99_max": 1200.0, "max_input_milliseconds_max": 6000.0}],
+        "performance": [entry for entry in [
+            {"model_id": "embedding", "cold_start_seconds_max": 30.0, "infer_milliseconds_p95_max": 50.0,
+             "infer_milliseconds_p99_max": 80.0, "max_input_milliseconds_max": 200.0},
+            {"model_id": "qwen-small", "cold_start_seconds_max": 60.0, "infer_milliseconds_p95_max": 900.0,
+             "infer_milliseconds_p99_max": 1200.0, "max_input_milliseconds_max": 6000.0},
+        ] if entry["model_id"] in kept],
         "operational": {"duration_seconds": 1800, "arrival_requests": 100, "arrival_gap_seconds_max": 15.0,
                         "send_deviation_milliseconds_max": 1000.0, "error_rate_max": 0.1, "queue_full_rate_max": 0.1,
                         "timeout_rate_max": 0.1}}), encoding="utf-8")
@@ -296,10 +311,52 @@ def test_the_config_digest_ignores_the_backfilled_candidate_digest(tmp_path) -> 
 
 
 def test_an_unmeasured_model_is_refused(tmp_path) -> None:
-    with pytest.raises(ca.CandidateError, match="not measured") as refused:
+    with pytest.raises(ca.CandidateError, match="production requires") as refused:
         _build(_site(tmp_path, measured=False))
 
     assert refused.value.input_error is True
+
+
+def test_a_measured_model_without_a_physical_bound_is_refused(tmp_path) -> None:
+    """K6/RP10: `require_production_openable` is the one production gate."""
+    with pytest.raises(ca.CandidateError, match="physical_resident_peak_bytes") as refused:
+        _build(_site(tmp_path, physical_peak=None))
+
+    assert refused.value.input_error is True
+
+
+def test_a_mixed_model_set_is_refused_before_any_material_is_read(tmp_path) -> None:
+    """K6/RP10: one directory of material cannot serve a mixed registration."""
+    site = _site(tmp_path, mixed=True)
+    site["source"].unlink()  # an expensive input the refusal must never open
+
+    with pytest.raises(ca.CandidateError, match="exactly one registered model") as refused:
+        _build(site)
+
+    assert refused.value.input_error is True
+    assert not site["output"].exists()
+
+
+def test_a_measurement_of_another_model_is_refused(tmp_path) -> None:
+    with pytest.raises(ca.CandidateError, match="measured") as refused:
+        _build(_site(tmp_path, summary={"model_id": "embedding"}))
+
+    assert refused.value.input_error is True
+
+
+def test_the_candidate_cli_refuses_a_mixed_set_without_creating_an_output(tmp_path) -> None:
+    from model_scheduler.acceptance.__main__ import main
+
+    site = _site(tmp_path, mixed=True)
+    output = tmp_path / "cli-mixed-candidate.json"
+
+    code = main(["candidate", "--config", str(site["config"]), "--facts", str(site["facts"]),
+                 "--measurements", str(site["measurements"]), "--policy", str(site["policy"]),
+                 "--fixtures", str(site["fixtures"]), "--source", str(site["source"]),
+                 "--deployment-id", "sms-orin-lab", "--output", str(output)])
+
+    assert code == 2
+    assert not output.exists()
 
 
 def test_a_blocked_measurement_cannot_produce_a_candidate(tmp_path) -> None:

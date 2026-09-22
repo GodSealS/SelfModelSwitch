@@ -223,7 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_parser = sub.add_parser("candidate", help="freeze facts/measurements/policy/fixtures/source into one body")
     candidate_parser.add_argument("--config", type=Path, required=True)
     candidate_parser.add_argument("--facts", type=Path, required=True)
-    candidate_parser.add_argument("--measurements", type=Path, required=True)
+    candidate_parser.add_argument("--measurements", type=Path, required=True,
+                                  help="one directory of measurement material for exactly one registered model")
     candidate_parser.add_argument("--policy", type=Path, required=True)
     candidate_parser.add_argument("--fixtures", type=Path, required=True)
     candidate_parser.add_argument("--source", type=Path, required=True)

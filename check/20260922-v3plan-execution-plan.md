@@ -456,9 +456,32 @@ test_scheduler_lifecycle.py + test_control_recovery_port.py` 154 passed；全量
 **Files likely touched:** `model_scheduler/acceptance/candidate.py`、`tests/test_candidate.py`、`tests/test_deploy_render.py`。
 **Documentation impact:** C09/CLI说明明确单目录模式范围；现有生产renderer逐模型拒绝不变。
 **Acceptance criteria:**
-- [ ] 全未测、混测、已测缺物理峰值/错材料均拒绝，exit2且不写candidate。
-- [ ] 完整单模型通过；输出已有内容不覆盖；lab显式预算校准仍可运行。
+- [x] 全未测、混测、已测缺物理峰值/错材料均拒绝，exit2且不写candidate。
+- [x] 完整单模型通过；输出已有内容不覆盖；lab显式预算校准仍可运行。
 **Verification:** `"$PY" -m pytest tests/test_candidate.py tests/test_deploy_render.py -q`及全量。
+
+**执行结果（2026-09-22）**：`build_candidate` 在配置解析后、任何昂贵读取与写输出之前新增两道门槛：注册模型数
+必须恰为一个（`--measurements DIR supports exactly one registered model, but this configuration registers N:
+a mixed set needs per-model measurement material`），随后对唯一模型复用 `require_production_openable`
+（`contracts_v2.py:568`）——未测、缺 `measurement_ref`、缺物理峰值或不可启动 profile 都拒绝。原先
+“已测模型恰好一个”的内联检查被该门槛取代；`measurements_dir` 仍为必填，签名不变（`measurements_index`
+属 RP11）。CLI 的 `--measurements` 帮助文案注明单目录模式范围；lab 校准 CLI 未改。
+
+测试：候选夹具重写为**合法单模型**（保留已测的 vision 模型、清理 pinned/preload 与 policy 条目），并新增 4 个
+用例：混测拒绝且**不读任何昂贵材料**（source 被删除仍是同一个拒绝）、已测缺物理峰值拒绝、材料属于另一个模型
+拒绝、CLI 混测 **exit 2 且不创建输出**；`test_an_unmeasured_model_is_refused` 的断言改为
+`require_production_openable` 的消息。`test_software_cases.py` 的模型能力（vision 模型同时具备 `chat`）与 S05
+断言随之更新；`test_deploy_render.py` 删除因夹具单模型化而冗余的裁剪。RED 阶段 3 failed / 14 passed
+（未测消息不符、混测读到 source、CLI 曾成功产出混测候选）。
+
+deviation：任务列 3 文件，实际改 5 个（增加 `model_scheduler/acceptance/__main__.py` 的 CLI 帮助文案与
+`tests/test_software_cases.py` 的能力/S05 断言）——单模型夹具改变了 S 层看到的能力集合，不改这两处会导致
+S 层回归。
+
+验证：`test_candidate.py + test_deploy_render.py` 48 passed；受夹具影响的
+`test_software_cases.py + test_candidate.py + test_deploy_render.py` 64 passed；全量
+`pytest tests -m 'not thor' -q` **997 passed、1 skipped、1 deselected**（15m37s，较 RP09 的 993 增加 4）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP11：按模型索引输入多份测量材料（条件任务）
 

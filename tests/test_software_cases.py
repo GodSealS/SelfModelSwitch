@@ -129,7 +129,7 @@ def test_s05_reads_the_capability_the_registration_really_has(tmp_path) -> None:
     observations, facts, problems = sc._check_s05(candidate=candidate, material_dir=tmp_path / "S05")
 
     assert all(value is True for value in observations.values()), (observations, problems)
-    assert facts["evidence"]["compat"]["capability"] == "embeddings"
+    assert facts["evidence"]["compat"]["capability"] == "chat"
 
 
 def test_s05_compat_checks_the_chat_path_when_a_chat_model_is_registered() -> None:

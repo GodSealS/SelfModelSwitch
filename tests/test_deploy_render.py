@@ -412,29 +412,20 @@ def _p26_helpers(name: str):
 
 
 def _p26_verified_site(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """A production-renderable candidate (every model measured) plus verified evidence.
+    """A production-renderable candidate (the single model is measured) plus verified evidence.
 
-    A production render requires *every* registration to be measured, so the
-    fixture keeps the measured vision model and drops the unmeasured one — the
-    render logic itself is per model.
+    K6/RP10 makes the candidate fixture a legal single-model site already, so
+    only the vision runtime's argv needs the extra arguments the render asserts.
     """
     import yaml
 
     candidate_helpers = _p26_helpers("test_candidate")
     site = candidate_helpers._site(tmp_path)
     document = yaml.safe_load(site["config"].read_text(encoding="utf-8"))
-    document["registration"]["models"] = [model for model in document["registration"]["models"]
-                                          if model["model_id"] == "qwen-small"]
-    for key in ("pinned_models", "preload_models"):
-        document["scheduler"][key] = [model_id for model_id in document["scheduler"].get(key, [])
-                                      if model_id == "qwen-small"]
     runtime = document["registration"]["runtimes"][0]
     runtime["startup_args"] = [*runtime["startup_args"], "--parallel", "--kv-unified-per-slot",
                                "--image-max-tokens"]
     site["config"].write_text(yaml.safe_dump(document), encoding="utf-8")
-    policy = json.loads(site["policy"].read_text(encoding="utf-8"))
-    policy["performance"] = [entry for entry in policy["performance"] if entry["model_id"] == "qwen-small"]
-    site["policy"].write_text(json.dumps(policy), encoding="utf-8")
     candidate_helpers._build(site)
     candidate_path = site["output"]
     evidence = _p26_helpers("test_verify")._build_evidence(tmp_path, candidate_path)
@@ -467,18 +458,10 @@ def test_a_production_render_refuses_unverified_material_and_writes_nothing(tmp_
     candidate_helpers = _p26_helpers("test_candidate")
     site = candidate_helpers._site(tmp_path)
     document = yaml.safe_load(site["config"].read_text(encoding="utf-8"))
-    document["registration"]["models"] = [model for model in document["registration"]["models"]
-                                          if model["model_id"] == "qwen-small"]
-    for key in ("pinned_models", "preload_models"):
-        document["scheduler"][key] = [model_id for model_id in document["scheduler"].get(key, [])
-                                      if model_id == "qwen-small"]
     runtime = document["registration"]["runtimes"][0]
     runtime["startup_args"] = [*runtime["startup_args"], "--parallel", "--kv-unified-per-slot",
                                "--image-max-tokens"]
     site["config"].write_text(yaml.safe_dump(document), encoding="utf-8")
-    policy = json.loads(site["policy"].read_text(encoding="utf-8"))
-    policy["performance"] = [entry for entry in policy["performance"] if entry["model_id"] == "qwen-small"]
-    site["policy"].write_text(json.dumps(policy), encoding="utf-8")
     candidate_helpers._build(site)
     candidate_path = site["output"]
     broken = _p26_helpers("test_verify")._build_evidence(tmp_path / "broken", candidate_path, drop_final="S04")
