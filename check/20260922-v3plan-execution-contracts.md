@@ -1,7 +1,34 @@
 # 修复执行契约：接口、状态与拒绝条件
 
-日期：2026-09-22。状态：**Proposed，供本轮Plan实施使用，尚未实现**。
+日期：2026-09-22。状态：**K1—K8 已由 RP00 冻结；K1—K5 同步进 `plan/08-execution-plan.md` 的 C03 增量，K7 进 C08 增量，K6 分阶段范围进 C09 增量，K3/K5 同步进 `plan/02-scheduler.md`。实现仍未开始。**
 任务、依赖与验收见[执行Plan](20260922-v3plan-execution-plan.md)。现行规范仍为 `plan/01–06`、08/Cxx；本文件由RP00把选定增量同步进对应规范，不能靠审查记录隐式覆盖规范。
+
+## K0. 基线、来源与归属（RP00 记录）
+
+事实复核基线提交 `79d44d22b225e955e3fb2083c6d2982ec8c83ab7`（短 `79d44d2`）；契约与执行计划冻结基线
+`c1d547aa42d37adb13d58ac02dc3bc86b8a33688`（短 `c1d547a`，只新增 `check/` 文档）。
+
+工作区另有**用户未提交**的两个文件，不属于任何 RP 的交付，由 RP04 整合，本轮不 reset、不覆盖、不混入无关提交：
+
+| 文件 | 工作区 blob（`git hash-object`） | `git diff` 的 SHA-256 |
+|---|---|---|
+| `model_scheduler/backend_control.py` | `a6c0b0744af631cf4cb03d46854cdde3b525f7b5` | `45de54f485d0fe8c98191eb45b18860338f2a353a886b65fdb89bb311d196a30` |
+| `tests/test_backend_control.py` | `05cfb29b50ab02d6dfa6d7e0d9555392fffb24f2` | `1ffaad7d3b189eb6043c8ff8eaf8ff1c9282b0ccc2bb3cdb3e6e1e04072d243e` |
+
+内容是把加载路径的单次观察改为轮询见证（`ManagedLifecycle._verify_running`）及其测试，等价于被 `a6497fd`
+回退的 `142746c`。它与 K1 重合，RP04 以有界策略和注入时钟重写，不直接沿用其 `asyncio.get_event_loop()` 与
+墙钟 sleep。
+
+[事实复核](20260922-v3plan-review-verification.md)**整体不是需求**：只有映射到 RP00—RP17 的条目（执行Plan 第 4 节）
+才是本轮范围。RP00 的签名核实结论：下列符号在当前源码中**不存在**，均为本轮新增——`LifecyclePolicy`、
+`ExpectedInstance`、`DeadlineDocker`、`probe_loopback`、`Book.instance/load_stopped/retry_stopped_load`、
+`Runtime.load_stopped_generation`、`DeploymentRecoveryPort`、`ServingGate`、`TcpServerAdapter`、
+`ControlServer.prepare/activate`、`measurements_index`、`require_instance_identity`、`lifecycle_policy`、
+`build_managed_execution(expected_instances=...)`、`build_v2_context(config_sha256=...)`。
+已存在且被本轮改签名的：`LlamaCppAdapter.release(model_id)` 增加 `deadline`；`build_candidate` 的
+`measurements_dir` 由必填改为可选并新增互斥的 `measurements_index`。
+`build_v2_context` 位于 `run.py:86`（不在 `runtime.py`）；`require_production_openable` 位于
+`contracts_v2.py:568`（不在 `candidate.py`）。
 
 ## K1. 策略和时钟
 
@@ -121,7 +148,35 @@ class ManagedAdapterPort(Protocol):
 ```
 
 该内部能力显式由managed adapter实现；不得依赖`getattr(adapter,"release",None)`静默跳过。legacy的`BackendControl`不新增此要求。
-控制HTTP超时、task取消、StopAck以及“端口此刻关闭”都**不是launch终结证明**。复用已有`LaunchOperation`/model_runner监督事实：派发后未知的启动操作必须保持starting/unknown，直到有可信终结事实；不能因为lookup为None默认terminal=True。若当前控制协议无法提供该事实，返回`launch_unresolved`并保持UNKNOWN，恢复不得报成功。RP00须把可提供证明的来源记录清楚，不能由实现者猜测。
+控制HTTP超时、task取消、StopAck以及“端口此刻关闭”都**不是launch终结证明**。`task.done()`同样不是：它只说明协程结束，不说明启动子进程或容器启动已退出。
+
+**可提供证明的来源（RP00 已核实，实现者不得猜测）**：
+
+| 角色 | 位置 | 现状 |
+|---|---|---|
+| 事实类型 | `ports_v3.LaunchOperation`（`ports_v3.py:78`），`is_terminal` 即 `state != "starting"`，`state ∈ {starting, completed, failed}` | 已存在 |
+| 生产者 | `model_runner.SupervisedLaunch`（`model_runner.py:45`），`operation` 返回 `LaunchOperation`，launcher 子进程退出前保持 `starting` | 已存在；只被 `deploy/model-runner.py:106`、`scripts/capture_control_fixture.py:251` 及测试使用 |
+| 消费方 | `DockerProcessObserver.observe` 的可选 `launch_lookup`（`process_observer.py:309/322/330`），结果进入 `stopped_is_proven(launch_operation_terminal=...)`（`process_observer.py:350`） | 已存在；默认 `None` |
+
+已核实的**两处缺口**：
+
+1. `process_observer.py:348` 在 `launch is None` 时取 `launcher_terminal = True`——把“没有启动记录”等同于
+   “启动已终结”。生产装配 `run.py:139-142` 只传 `deployment_id, model_id, port`，因此恒为 `launch is None`。
+   本轮固定：**不能**因 lookup 为 None 默认 `terminal=True`。
+2. v2 managed 加载路径 `LlamaCppAdapter.load`（`llama_cpp.py:299-317`）经 HTTP 派发给控制面，不创建
+   `SupervisedLaunch`，返回的 `launch_operation` 恒为 `None`（`llama_cpp.py:316`）。即 managed 装配下
+   **根本没有 LaunchOperation 生产者**。
+
+结论：**当前固定控制协议（control-v1 的 load/unload HTTP）不能提供 launch 终结证明**。该分支固定为失败封闭，
+并带可测试的失败行为：
+
+- 未派发——本 boot 从未对该 target 发起启动**且观察者能正面确认**——才可证明“无 launch”；
+- 派发后失联必须保持 `launch_unresolved` → UNKNOWN，禁止用 `task.done()` 或超时代替；
+- 该分支下 bridge 不得返回 STOPPED，`DeploymentRecoveryPort.recover` 必须 `ok=False`；
+- RP04 断言该分支返回 UNKNOWN + `launch_unresolved` 且 STOPPED 次数为 0；RP07 断言该分支 `ok=False`。
+
+让控制面暴露逐 load 的启动操作状态，或让 managed 加载改走 `SupervisedLaunch` 监督路径，是**新的控制协议能力**，
+另立任务；本轮不得伪造接口实现。
 
 ### 观察I/O与轮询
 
@@ -186,6 +241,13 @@ class DeploymentRecoveryPort:
     # 禁止依赖Book、Scheduler或直接修改账本。
     async def recover(self, deadline: float) -> RecoveryResult: ...
 ```
+
+`DeploymentRecoveryPort` 是本轮新增的**适配器类名**；它必须满足**既有** `ControlRecoveryPort` Protocol
+（`contracts.py:106`，同样只有 `async def recover(self, deadline: float) -> RecoveryResult`），因为
+`ModelScheduler.__init__` 的 `recovery` 参数类型就是它（`scheduler.py`），`runtime.py` 也经
+`scheduler_kwargs` 注入。不得再定义第二份同形 Protocol，也不得用同步 `DeploymentRecovery` 冒充该端口。
+现有 `DeploymentRecovery`（`control_recovery.py:173`）是同步对象，只有 `reconcile(*, close_admission, deadline)`
+与 `stop_instance(identity, *, deadline)`，仅在线程边界被适配器调用。
 
 适配器在worker中调用带deadline的reconcile，只清理本deployment容器；之后逐模型独立采样STOPPED，校验K1/K4。`ok=True`必须同时满足helper成功、所有登记模型已证停止、无未知launch/worker、无未证停止的容器；允许已停止但未删除的容器，不新增docker rm。`stopped_models`为模型ID全集而非container_id集合。缺一项返回ok=False，不能用“Docker返回0”填成功。
 

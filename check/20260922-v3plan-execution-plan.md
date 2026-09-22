@@ -100,9 +100,30 @@ git diff --check
 **Files likely touched:** `plan/08-execution-plan.md`、`plan/02-scheduler.md`、本执行契约文档。
 **Documentation impact:** C03中固定K1—K5、C08引用K7、C09注明K6分阶段范围；C02公式不改。
 **Acceptance criteria:**
-- [ ] 已记录唯一身份所有者、ERROR0 marker、UNKNOWN策略、freshness/截止含义、恢复端口与lease规则。
-- [ ] 默认值明确为软件值；launch证明缺口有可测试的失败行为；legacy兼容路径不依赖反射判断。
+- [x] 已记录唯一身份所有者、ERROR0 marker、UNKNOWN策略、freshness/截止含义、恢复端口与lease规则。
+- [x] 默认值明确为软件值；launch证明缺口有可测试的失败行为；legacy兼容路径不依赖反射判断。
 **Verification:** 文档与实际签名对照、代码块语法检查（省略号签名明确为示意）、`git diff --check`；本任务不需要runtime全量。
+
+**执行结果（2026-09-22）**：已把 K1—K5 同步为 `plan/08-execution-plan.md` 的「C03 增量」表（旧/新行为与兼容边界
+8 行）、K7 为「C08 增量」、K6 分阶段范围为「C09 增量」，K3/K5 同步进 `plan/02-scheduler.md`；基线、patch 摘要与
+归属写入 08 §1.2.1 与契约 K0。
+
+签名对照结果：新增符号 15 个（`LifecyclePolicy`、`ExpectedInstance`、`DeadlineDocker`、`probe_loopback`、
+`Book.instance/load_stopped/retry_stopped_load`、`Runtime.load_stopped_generation`、`DeploymentRecoveryPort`、
+`ServingGate`、`TcpServerAdapter`、`ControlServer.prepare/activate`、`measurements_index`、
+`require_instance_identity`、`lifecycle_policy`）；改签名 2 处（`LlamaCppAdapter.release` 加 `deadline`、
+`build_candidate.measurements_dir` 改可选）；位置纠正 2 处（`build_v2_context` 在 `run.py:86` 不在 `runtime.py`；
+`require_production_openable` 在 `contracts_v2.py:568` 不在 `candidate.py`）。另确认 K5 适配器须满足既有
+`ControlRecoveryPort`（`contracts.py:106`），不新造同形 Protocol。
+
+K4 launch 来源已核实：`ports_v3.LaunchOperation`（`ports_v3.py:78`）← `model_runner.SupervisedLaunch`
+（`model_runner.py:45`）← `DockerProcessObserver.launch_lookup`（`process_observer.py:309`）。两处缺口已确认：
+`process_observer.py:348` 在 `launch is None` 时默认 `launcher_terminal=True`，且 `run.py:139-142` 只传三个位置
+参数；`LlamaCppAdapter.load`（`llama_cpp.py:299-317`）不创建 `SupervisedLaunch` 且 `launch_operation` 恒为 `None`。
+故该分支固定失败封闭（`launch_unresolved` → UNKNOWN，recover `ok=False`），控制协议 launch 终结能力另立任务。
+
+验证：`git diff --check` exit 0；Python 3.12.11 下 12 个代码块 `compile` 全部通过。
+本次未执行 runtime 全量测试、未 push、未做目标同步；用户两个未提交文件保持原样未入本提交。
 
 ## Task RP01：增加兼容结果字段与Book唯一身份接口
 

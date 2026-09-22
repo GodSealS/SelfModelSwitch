@@ -24,6 +24,21 @@ Docker 不可达、端口未知占用、解析失败均为 UNKNOWN。
 身份包括 container ID、StartedAt、deployment_id、model/runtime ID、candidate digest、image digest。
 禁止按容器名称停止未知实例；shutdown、recover、取消和切换使用同一证据规则。
 
+**ERROR0：加载被证明 STOPPED 仍是错误状态（RP00 冻结，K3）**。加载代际被可信证据证明 STOPPED 时，该模型转
+ERROR 并**释放预留**（`reservation=0`、`admission_blocked=True`、`instance=None`、`operation_id=None`、
+`stopped_at=now`、`last_error=load_proven_stopped`），同时在 `Runtime.load_stopped_generation` 记下本代 marker。
+它仍是错误状态：普通 `acquire` 继续抛 `ModelUnavailable(last_error)`，不新增透明重试。只有 `warm/preload` 在
+epoch/generation 一致、无 lease、marker 属于本代时消费 marker 做有限重试（默认首次加最多 3 次，
+`load_retry_limit=0` 为首次失败后拒绝）。反向约束同样重要：**不能**只凭“ERROR 且零预留”或历史 `stopped_at`
+判定本代已证停止——`failed`/`begin_recovery`/`begin_load` 都会清 marker，且 `begin_load` 必须先用旧
+`stopped_at` 完成停止后内存重采样再清除。
+
+**加载见证（RP00 冻结，K1/K4）**。adapter 返回 UNKNOWN/STOPPED 或控制异常时**不**进入新的 load-witness 轮询，
+保守保预算并交给恢复或受控 cleanup；只有 adapter 返回 RUNNING 才轮询。轮询使用内部固定策略（首版软件值
+10/0.5/2/2/60 秒，**不是硬件已验证参数**），截止后不再派发新观察，迟到 RUNNING 不接受；`sampled_at` 是采集
+开始时间，须同时满足 `0<=now-sampled_at<=max_age` 与 `now<valid_until`。控制 HTTP 超时、task 取消、StopAck
+以及“端口此刻关闭”都只是控制事实，不是 STOPPED。
+
 ## 3. 通用独占会话
 
 会话 PREPARING → ACTIVE → DRAINING → CLOSED；清理不能确认则 BLOCKED。
@@ -50,6 +65,19 @@ worker 在设备同步完成后报告可信 terminal；响应缺身份或 quiesc
 scheduler 重启先关准入，清理该 deployment 旧实例，确认停止后开放，不接管旧 session/lease。
 模型盘故障关闭准入并清理；recover 重新确认挂载、全量 hash 和停止状态，不自动重放推理。
 客户端断线由会话 TTL 触发资源清理；它的业务恢复由客户端负责。
+
+**恢复总预算与排空（RP00 冻结，K5）**。自动恢复由当前加载的 UNKNOWN 被接受触发：锁内创建唯一恢复任务、
+给 `now+60s` 的总预算、`begin_recovery` 一次并保存 epoch，**立即关闭**新 load/lease/session dispatch。
+在同一 deadline 内等现有 lease 可信归还、已派发 load/eviction/cleanup 终结；未排空则失败并保持 recovering、
+保留预留/身份/lease，不执行全局 stop、不删 lease、不释放预算。排空后才调用异步恢复端口（满足既有
+`ControlRecoveryPort`）；端口返回后锁内校验 epoch 与完整 `stopped_models` 集合才 `finish_recovery` 并清身份。
+重复触发合并且**不延长** deadline；epoch 变化的迟到结果无效；成功恢复不自动重放推理、不清空加载重试计数。
+人工显式 recover 只在旧恢复失败、无活动恢复任务且租约/控制动作已排空后创建新的有界尝试，不自动循环。
+触发者自身的 load task 须先从 `_loads` 安全摘除再进入等待，避免恢复等待自己。启动 reconcile 与运行时 recover
+使用不同接口、同一受限 helper，且 reconcile 移出事件循环阻塞路径，接受 Book 结果仍在宿主事件循环。
+
+**launch 终结缺口（K4）**。当前控制协议不能证明启动操作已终结，该分支返回 `launch_unresolved` 并保持
+UNKNOWN，恢复不得报成功；来源核实与失败封闭行为见 [08 §C03 增量](08-execution-plan.md)。
 
 ## 5. 内存准入
 

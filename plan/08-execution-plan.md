@@ -40,6 +40,29 @@
 排除草稿的 226 项只用于说明已有实现基线；不等于完整测试集通过。P02 之后不得沿用此 ignore。
 本次没有构建、部署、启动模型或重验硬件，不能生成 `software_verified` / `device_backend_ready` 报告。
 
+### 1.2.1 本轮修复基线（RP00，2026-09-22）
+
+本轮修复（RP00—RP17）的事实复核基线是提交 `79d44d22b225e955e3fb2083c6d2982ec8c83ab7`（短 `79d44d2`）；
+本节所在的执行计划与契约冻结基线是 `c1d547aa42d37adb13d58ac02dc3bc86b8a33688`（短 `c1d547a`，只新增 `check/` 文档）。
+本节记录的 3.13.5 不是发布要求的版本；RP00 已核验独立解释器
+`/Users/monster/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/bin/python3.12`（Python 3.12.11），
+RP01 起的 `$PY` 使用它并在每条验证记录里写明实际版本。
+
+工作区另有**用户未提交**的两个文件。它们不属于任何 RP 的交付，不 reset、不覆盖、不混入无关提交，
+由 RP04 以有界策略整合：
+
+| 文件 | 工作区 blob（`git hash-object`） | `git diff` 的 SHA-256 |
+|---|---|---|
+| `model_scheduler/backend_control.py` | `a6c0b0744af631cf4cb03d46854cdde3b525f7b5` | `45de54f485d0fe8c98191eb45b18860338f2a353a886b65fdb89bb311d196a30` |
+| `tests/test_backend_control.py` | `05cfb29b50ab02d6dfa6d7e0d9555392fffb24f2` | `1ffaad7d3b189eb6043c8ff8eaf8ff1c9282b0ccc2bb3cdb3e6e1e04072d243e` |
+
+归属：把加载路径的单次观察改为轮询见证（`ManagedLifecycle._verify_running`）及其测试，等价于被 `a6497fd`
+回退的 `142746c`。它与本轮 K1 的重合部分由 RP04 重写，不直接沿用其循环与时钟。
+
+原审查意见见 [`check/20260922-v3plan-review-verification.md`](../check/20260922-v3plan-review-verification.md)。
+**该文档整体不是需求**：只有映射到 RP00—RP17 的条目才是本轮范围，映射表见
+[`check/20260922-v3plan-execution-plan.md`](../check/20260922-v3plan-execution-plan.md) 第 4 节。
+
 ### 1.3 每个实施任务的统一交付规则
 
 1. 在开发机编辑，使用发布 Python 3.12。先写能揭露违约的测试，再实施；测试不得仅复述内部实现。
@@ -144,6 +167,48 @@ STOPPED 的唯一计算：已确认容器退出/不存在 AND 启动操作终结
 停止前用不可变 container ID 及标签全身份核对，禁止按名称杀未知容器。端口被未知进程占用时保持 UNKNOWN。
 启动用受控、可观察的子进程组；cancel Future 不等于启动子进程退出。重启按 deployment 标签枚举旧实例和启动者，
 核验属于本 deployment 后清理，禁止 `runtime.build_scheduler()` 在观察前批量 bootstrap_stopped。
+
+#### C03 增量：本轮修复冻结的 K1—K5（RP00，2026-09-22 同步）
+
+真源是 [`check/20260922-v3plan-execution-contracts.md`](../check/20260922-v3plan-execution-contracts.md) 的
+K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边界；C03 其余条款不变，C02 公式不改。
+所有代码块中的 `...` 仅表示省略的实现体，签名以源码为准。
+
+| 议题 | 旧行为（现有源码） | 新行为（本轮固定） | 兼容边界 |
+|---|---|---|---|
+| 身份所有者 | `ManagedLifecycle._instances` 私有字典（`backend_control.py:112`），bridge 自写 | 唯一已接受身份是 `Book.Runtime.instance`；`_instances` 删除，bridge `instance()` 只调用注入的只读 `instance_lookup` | adapter 的 identity 回调仍经同一入口取值；不得新增 prepared/committed 身份缓存或待提交映射 |
+| 结果字段 | `contracts.Observation` 为 `presence/instance_id/healthy/observed_at` + `detail_code=None`（`contracts.py:74`） | 末尾新增 `instance=None`、`valid_until=None` 两个带默认值字段 | 原五个位置参数构造不变；纯 DTO，不新增 HTTP 字段、不改 control-v1 schema |
+| 加载见证 | HEAD 上加载只采样一次（`142746c` 已被 `a6497fd` 回退） | K1 内部 `LifecyclePolicy`（`ports_v3.py`，当前不存在，RP02 新增）固定 10/0.5/2/2/60；UNKNOWN→RUNNING 精确轮询，截止后零次新观察 | 该组是**软件初值**，不是 C02 硬件已验证参数；测试显式注入短值；不新增环境变量/CLI 开关 |
+| 已证停止的加载 | 无此状态 | K3 新增 `Runtime.load_stopped_generation`（本代 marker），转 ERROR 且 `reservation=0`、`admission_blocked=True`、`instance=None`、`last_error=load_proven_stopped` | 普通 `acquire` 在 ERROR 仍抛 `ModelUnavailable`；`warm/preload` 沿用 `load_retry_limit` 消费 marker 后有限重试 |
+| UNKNOWN 策略 | adapter 返回 UNKNOWN 后仍可能进入见证轮询 | 只有 adapter 返回 **RUNNING** 才轮询；UNKNOWN/STOPPED/控制异常直接保守保预算，交恢复或受控 cleanup | 不顺带重新设计 adapter readiness 重试；控制超时/取消/StopAck 都不是 STOPPED |
+| 新鲜度与截止 | `SAMPLE_MAX_AGE_SECONDS=2.0` 只用于内存样本（`ports_v3.py:47`） | `sampled_at_monotonic` 是采集**开始**时间；RUNNING/STOPPED 需 `0<=now-sampled_at<=max_age` 且 `now<valid_until` | 三级绝对截止 `caller_deadline`→`verify_deadline`→`sample_deadline`，各 I/O 阶段共用，不逐阶段重置；UTC 只用于证据 |
+| 模式判定 | 依赖 `getattr(adapter,"release",None)`（`backend_control.py:156`） | `ModelScheduler(..., require_instance_identity=...)` 显式区分；managed 装配固定 True，无弱校验 fallback | 禁止用 `getattr(result,"instance",...)` 或有无某方法猜模式；禁止反射跳过 `release` |
+| 恢复 | scheduler 默认 `recovery=None`；`RunContextV2.recovery`（`run.py:72`）是同步 `DeploymentRecovery`（`control_recovery.py:173`） | 新增异步适配器（K5）满足**既有** `ControlRecoveryPort`（`contracts.py:106`），60s 总预算；先关准入→冻结 epoch→排空→才调用 | 删除“drain 超时直接 `book.release(ABORTED)`”作为恢复手段；启动 reconcile 与运行时 recover 用不同接口、同一受限 helper |
+
+**launch 终结事实的已核实来源（K4）**。类型与生产者：`ports_v3.LaunchOperation`（`ports_v3.py:78`，
+`is_terminal` 即 `state != "starting"`，`state ∈ {starting, completed, failed}`）由
+`model_runner.SupervisedLaunch`（`model_runner.py:45`）产生；消费方是 `DockerProcessObserver.observe` 的可选
+`launch_lookup`（`process_observer.py:309`），结果进入 `stopped_is_proven(launch_operation_terminal=...)`
+（`process_observer.py:350`）。已核实两处缺口：
+
+1. `launch_lookup` 默认是 `None`，且 `process_observer.py:348` 在 `launch is None` 时取
+   `launcher_terminal = True`——即“没有启动记录”被等同于“启动已终结”。生产装配 `run.py:139-142` 只传
+   `deployment_id, model_id, port` 三个位置参数，因此恒为 `launch is None`。
+2. v2 managed 加载路径 `LlamaCppAdapter.load`（`llama_cpp.py:299-317`）经 HTTP 派发给控制面，不创建
+   `SupervisedLaunch`，返回的 `launch_operation` 恒为 `None`（`llama_cpp.py:316`）。
+   `SupervisedLaunch` 当前只被 `deploy/model-runner.py:106` 与 `scripts/capture_control_fixture.py:251` 使用。
+
+结论：**当前固定控制协议（control-v1 的 load/unload HTTP）不能提供 launch 终结证明**。该分支因此固定为
+**失败封闭**，并规定可测试的失败行为：
+
+- 未派发——本 boot 从未对该 target 发起启动**且观察者能正面确认**——才可证明“无 launch”；
+- 派发后失联必须保持 `launch_unresolved` → UNKNOWN。**禁止**用 `asyncio.Task.done()` 代替：它只说明协程结束，
+  不说明启动子进程或容器启动已退出（同 C03 现有“cancel Future 不等于启动子进程退出”）；
+- 该分支下 bridge 不得返回 STOPPED，`DeploymentRecoveryPort.recover` 必须 `ok=False`；
+- RP04 断言该分支返回 UNKNOWN + `launch_unresolved` 且 STOPPED 次数为 0；RP07 断言该分支 `ok=False`。
+
+让控制面暴露逐 load 的启动操作状态（或让 managed 加载改走 `SupervisedLaunch` 监督路径）是**新的控制协议
+能力**，另立任务；本轮不得伪造接口实现，也不得默认 `terminal=True`。
 
 ### C04：会话与执行状态机
 
@@ -272,6 +337,27 @@ control listener 适配器必须从 accepted Unix socket 读取 Linux SO_PEERCRE
 实现前 P17 的真实 Linux 契约测试必须证明 peer credential 可达 handler，失败则阻塞，不退化为相信请求头。
 仅接受HTTP/1.1有界请求，禁止upgrade/proxy；关闭时两入口先停止接收，共享清理只执行一次。
 
+#### C08 增量：准备/开放分离与唯一 lifespan（K7，RP00 同步）
+
+真源是执行契约 K7；下面接口当前均不存在，由 RP13/RP14 交付。现有 `ControlServer`（`control_server.py:149`）
+只有 `start()`/`stop()`。增量：
+
+- 准备与开放分离：`prepare()` 只 bind 不 accept，并在 chmod/chown 成功后返回；`activate()` 仅能在 prepare
+  成功后调用；`stop()` 幂等且只清理本次启动拥有的资源。`start()` 保留为 `prepare(); activate()` 的兼容便利入口，
+  **正式双入口装配不得调用**。
+- 新增进程内共享 `ServingGate`：`ready` 是进程内对象，不能由客户端 header/body 控制。两个业务入口的 ASGI
+  包装都在 **dispatch 前**检查 gate；未 open 时业务请求返回现有 503 格式，不读 body、不创建 Blob、不排队/加载；
+  TCP `/live` 可作存活诊断，`/health` 必须 503 且不触发业务。
+- 新增薄 `TcpServerAdapter`，以 `ready: asyncio.Future` 等 Uvicorn startup 的真实结果（当前锁定 0.53.0）；
+  禁止固定 sleep 推测就绪，禁止其他模块直接读/改 Uvicorn 内部 server 列表。
+- `serve_v2` 是唯一 owner：gate 关闭→准备 TCP 原生 socket 与 Unix listener（`start_serving=False`）→验证组并
+  完成权限→启动 reconcile→进入 TCP 应用**唯一** lifespan（Uvicorn `lifespan="off"`，control app 不跑 lifespan）
+  →启动 TCP 适配器→Unix activate→`gate.open()`。任一 bind 失败不启动 preload；任一失败走统一 finally。
+- 停止顺序固定：gate.close→两入口停止 accept→按截止排空/取消入口连接→退出唯一 lifespan 并执行共享
+  scheduler shutdown **一次**→回收自有 socket/clients。不能先关共享 Book/Blob 再让另一入口继续请求。
+- 0660 与登记客户端组是文件权限层，UID 白名单是连接层：非白名单连接仍在 HTTP 解析前关闭，不改成 403。
+  清理只 unlink 仍属于本次 bind 的 inode，不删除已有 live listener 的 socket。
+
 ### C09：候选与证据身份
 
 M01 的部署登记digest不是 v3 candidate digest。新增严格文档：
@@ -300,6 +386,24 @@ M01 的部署登记digest不是 v3 candidate digest。新增严格文档：
 `pyproject.toml`、`requirements.in`、`requirements-dev.in`、`requirements.lock`、`requirements-dev.lock`；
 目录仅收已跟踪regular文件，排除其中任何生成证据/权重/凭据。固定prefix为source、字典序文件清单、
 uid/gid/mtime=0、gzip mtime=0；不嵌入commit时间或归档自身摘要，源码字节不变则归档hash不变。
+
+#### C09 增量：候选材料范围与多模型链（K6 分阶段，RP00 同步）
+
+真源是执行契约 K6。本轮**不改**上表字段族与摘要规范，只补充输入范围与分阶段边界：
+
+- 第一阶段（RP10）：`--measurements DIR` 单目录模式只允许**配置中恰好一个模型且已测**。全未测、混测、
+  已测但缺物理峰值或材料错配，一律输入错误 exit2，不写 candidate、不覆盖已有输出、不删历史候选。
+  现有 `build_candidate`（`acceptance/candidate.py:195`）的 `measurements_dir` 是必填 `Path`，改为
+  `Path | None = None` 并新增 `measurements_index`，两者互斥且必须恰好一个。
+- 第二阶段（RP11/RP12）：**仅当最终生产模型数 > 1 时必需**。新增 `--measurements-index` 严格 JSON，
+  按 `model_id` 索引材料目录，目录相对 index 父目录且不进入语义摘要；artifact key 统一为
+  `measurements/<model_id>/<原相对路径>`。每个模型的 `measurement_ref` 仍按加 namespace **之前**的局部清单
+  计算以保持校准原摘要语义，全局 candidate 摘要绑定加 namespace 后的引用。flat 与 namespace 不可混用。
+- 拒绝未知键、重复 JSON 键、重复 model_id、绝对路径、`..`、symlink 及所有路径逃逸；材料模型集合必须等于
+  配置模型集合。缺材料/改 bytes/hash/错 namespace 退出 2；材料完整但测量语义失败退出 3。
+- 逐模型复用 `require_production_openable`——实际位置是 `contracts_v2.py:568`（不在 `candidate.py`）。
+- C02 物理门槛与 O01 不放宽；candidate 摘要中的 `passed` 只作构建前置输入，不能替代正式 evaluator 重算。
+  不满足多模型时，不能靠从配置删掉模型来伪装完成原发布范围。
 
 ## 3. 依赖图与检查点
 
