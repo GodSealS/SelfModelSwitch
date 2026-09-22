@@ -244,6 +244,16 @@ eviction/cleanup 批。**排空期间不释放、不取消、不停止任何东�
 `min(caller deadline, now + recovery_seconds)` 作为有界预算，复用失败尝试留下的 epoch 与账本；它不会自动循环，
 也不会重放推理。触发者自身先把自己的 load task 从 `_loads` 摘除，再创建恢复任务，恢复因此永远不会等待自己。
 
+**运行时恢复的真实接线与启动线程边界（RP09 已交付）**：v2 装配不再留下 `scheduler.recovery = None`——
+`build_v2_context` 用注入的（或默认的）同步 `DeploymentRecovery` helper 构造唯一的异步
+`DeploymentRecoveryPort`（逐模型 observer 映射 + 登记模型全集），经 `scheduler_kwargs["recovery"]` 交给
+`build_managed_execution`，因此生产上下文里的 `scheduler.recovery` 是真实端口而非测试注入物；
+`RunContextV2.recovery` 继续保存同步 helper，`serve_v2` 的启动 reconcile 角色不变——**两个接口共享同一底层受限
+helper**。启动路径的线程边界同时固定：`reconcile_startup` 由宿主事件循环先执行 `book.begin_recovery()` 关闭准入，
+再把 helper 的阻塞 docker 阶段放进一个 worker 线程，且传给 worker 的 `close_admission` 是 **no-op**：worker 只做
+I/O，绝不回调操作 `Book`，慢 reconcile 期间事件循环仍可服务其他任务。恢复失败（helper 或 observer 证不出停止）时
+`recovering` 保持为真，`/health` 的 `control` 检查因此为 false，不宣称恢复。
+
 **异步恢复端口的输入与信任边界（RP07 已交付）**：`DeploymentRecoveryPort`（`control_recovery.py`）是调度器在
 准入已关闭、旧动作排空之后唯一可调用的运行时恢复入口，满足**既有** `ControlRecoveryPort` 形状——只有
 `async def recover(self, deadline: float) -> RecoveryResult`。输入只有调用方的绝对 deadline，加上构造时注入的

@@ -414,10 +414,40 @@ RP08 的排空屏障需要真实调度器夹具（可控 lease/eviction/时钟�
 **Files likely touched:** `run.py`、`model_scheduler/runtime.py`、`tests/integration/test_control_socket.py`、`tests/integration/test_managed_execution.py`。
 **Documentation impact:** 当前装配图注明启动reconcile与运行时recover使用不同接口、同一底层受限helper。
 **Acceptance criteria:**
-- [ ] 用真实build_v2_context构造出的scheduler.recovery非None且满足async端口；不能靠单测手工注入绕过实际接线。
-- [ ] 未验证加载失败真正触发适配器，helper/observer失败时health不宣称恢复。
-- [ ] startup关闭Book在事件循环完成，worker仅I/O；慢reconcile期间事件循环其他诊断任务可运行。
+- [x] 用真实build_v2_context构造出的scheduler.recovery非None且满足async端口；不能靠单测手工注入绕过实际接线。
+- [x] 未验证加载失败真正触发适配器，helper/observer失败时health不宣称恢复。
+- [x] startup关闭Book在事件循环完成，worker仅I/O；慢reconcile期间事件循环其他诊断任务可运行。
 **Verification:** `"$PY" -m pytest tests/integration/test_control_socket.py tests/integration/test_managed_execution.py -q`及全量；Linux专属用例不得在macOS冒充通过。
+
+**执行结果（2026-09-22）**：生产装配接线完成。`run.build_v2_context` 用注入/默认的同步 `DeploymentRecovery`
+构造 `DeploymentRecoveryPort`（逐模型 observers + 登记模型全集），经 `scheduler_kwargs["recovery"]` 交给
+`build_managed_execution`；`RunContextV2.recovery` 仍是同步 helper，`serve_v2` 的启动 reconcile 角色不变。
+`runtime.reconcile_startup` 改为：宿主事件循环先 `book.begin_recovery()` 关闭准入，再
+`await asyncio.to_thread(recovery.reconcile(close_admission=no-op, deadline))`——worker 只做阻塞 I/O、不触
+Book，慢 reconcile 不再阻塞事件循环。
+
+新增 4 个用例：`test_control_socket.py` 的 `test_the_v2_context_wires_the_async_recovery_port_into_the_scheduler`
+（真实 `build_v2_context` 的 `scheduler.recovery` 是 `DeploymentRecoveryPort` 且 `recover` 为协程，helper 仍是
+`context.recovery`）与 `test_v2_health_never_claims_recovery_while_the_books_stay_closed`（recovering 时
+`llama_swap` 探针健康但 `control` 必须为 false）；`test_managed_execution.py` 的
+`test_an_unverified_load_really_reaches_the_wired_recovery_port`（真实 `build_managed_execution` + 真实端口：
+未见证的加载失败真正调用 helper，observer 证不出停止时 `recovering` 保持 True、模型 ERROR）；
+`test_process_lifecycle.py` 的 `test_startup_reconciliation_keeps_the_loop_live_and_admission_on_the_host`
+（worker 线程内探测事件循环仍响应，且宿主在 docker I/O 之前已关闭准入）。既有两处 v2 上下文测试的假 recovery
+（`object()`）改为真实 `DeploymentRecovery`——否则新装配会拒绝启动，这本身就是“手工注入绕不过真实接线”的证明。
+
+RED 阶段 2 failed / 2 passed（`scheduler.recovery is None`；worker 内探测到 `[False]`）。Linux 专属用例未在
+macOS 冒充。
+
+偏差说明：任务列 4 文件，实际改 5 个（`run.py`、`model_scheduler/runtime.py`、
+`tests/integration/test_control_socket.py`、`tests/integration/test_managed_execution.py`、
+`tests/integration/test_process_lifecycle.py`）——“慢 reconcile 不阻塞事件循环”需要现有 `reconcile_startup`
+夹具（`FakeDocker`/`_loaded_book`），放 `test_process_lifecycle.py` 更直接。
+
+验证：定向 4 passed；关联 `test_runtime.py + test_admin_api.py + test_control_api.py +
+test_scheduler_lifecycle.py + test_control_recovery_port.py` 154 passed；全量 `pytest tests -m 'not thor' -q`
+**993 passed、1 skipped、1 deselected**（15m37s，较 RP08 的 989 增加 4）、`ruff check .` 通过、
+`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP10：生产候选先拒绝不完整模型集合
 

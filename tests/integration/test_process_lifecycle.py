@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
 
 import pytest
@@ -302,6 +303,43 @@ async def test_startup_reconciliation_keeps_admission_closed_when_a_leftover_can
     assert outcome.error_code == "stop_failed"
     assert book.recovering is True
     assert book.committed == 300
+
+
+async def test_startup_reconciliation_keeps_the_loop_live_and_admission_on_the_host() -> None:
+    """RP09/K5: the host closes admission, the worker thread only performs I/O.
+
+    The helper's docker stage is held open, and the liveness probe is sent from
+    inside the worker: whatever the worker can observe about the loop while it
+    blocks is what the loop was really doing. The Book must already be closed by
+    the host before the worker starts (never by a worker callback).
+    """
+    book = _loaded_book()
+    entered, release = threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    probes: list[bool] = []
+
+    def loop_answered(timeout: float) -> bool:
+        """Ask the loop from this thread to run a callback; True only if it did."""
+        answered = threading.Event()
+        loop.call_soon_threadsafe(answered.set)
+        return answered.wait(timeout)
+
+    def blocking_docker(argv: list[str]) -> tuple[int, str, str]:
+        if argv[1] == "ps":
+            entered.set()
+            probes.append(loop_answered(0.5))  # the loop must answer while this thread blocks
+            release.wait(timeout=3)
+        return 0, "", ""
+
+    recovery = DeploymentRecovery(DEPLOYMENT, docker=blocking_docker)
+    reconciling = asyncio.create_task(reconcile_startup(book, recovery, {}, deadline=time.monotonic() + 5))
+    assert await asyncio.to_thread(entered.wait, 5)
+    assert book.recovering is True  # admission closed on the host, before any docker I/O
+    release.set()
+    outcome = await reconciling
+
+    assert probes == [True], "the event loop must keep running while the reconcile worker blocks"
+    assert outcome.ok is False and outcome.error_code == "unproven_stop"
 
 
 def _loaded_book() -> Book:

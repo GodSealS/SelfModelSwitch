@@ -41,7 +41,7 @@ from model_scheduler.control_protocol_v1 import Fence, InstanceIdentity
 from model_scheduler.execution_service import ExecutionService
 from model_scheduler.model_registry import Book
 from model_scheduler.ports_v3 import CancelAck, ExecutionHandle
-from model_scheduler.scheduler import ModelScheduler
+from model_scheduler.scheduler import ModelScheduler, ModelUnavailable
 from model_scheduler.session_manager import SessionManager
 
 
@@ -661,3 +661,77 @@ async def test_cancelled_round_trip_publishes_nothing_after_the_stop(tmp_path) -
     assert record.result is None and record.evidence.reason == "independent_STOPPED"
     assert blobs.metadata.usage("uid-1000").published_bytes == 0  # no partial output, ever
     assert book.runtime[LAB_MODEL].state.value == "unloaded"
+
+
+# -- K5/RP09: an unverified load reaches the port this composition really wired -------------
+
+from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort  # noqa: E402
+
+STUCK_POLICY = pv.LifecyclePolicy(verify_window_seconds=0.2, poll_seconds=0.01,
+                                  observation_timeout_seconds=0.1, observation_max_age_seconds=0.1,
+                                  recovery_seconds=5.0)
+
+
+class RecordingRecovery(DeploymentRecovery):
+    """The real synchronous helper, counting every reconcile it is asked to run."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.reconciles = 0
+
+    def reconcile(self, *, close_admission, deadline):
+        self.reconciles += 1
+        return super().reconcile(close_admission=close_admission, deadline=deadline)
+
+
+class StuckSwap(LabSwap):
+    """A llama-swap whose load command never lands a container."""
+
+    async def load(self, model_id: str) -> None:
+        self.loads.append(model_id)
+
+
+@pytest.mark.asyncio
+async def test_an_unverified_load_really_reaches_the_wired_recovery_port(tmp_path) -> None:
+    """The scheduler holds the port this composition built; the failure path reaches it."""
+    docker = LabDocker()  # no container ever appears
+    swap = StuckSwap(docker)
+    client, _calls = lab_server()
+    spec = ModelSpec(LAB_MODEL, "http://127.0.0.1:18099", frozenset({Capability.CHAT}), 100, max_concurrency=1)
+    book = Book({LAB_MODEL: spec}, model_budget=1_000, free_floor=20, margin=0)
+    book.bootstrap_stopped(LAB_MODEL)
+    expected = pv.ExpectedInstance(deployment_id=LAB_DEPLOYMENT, model_id=LAB_MODEL, runtime_id=LAB_RUNTIME,
+                                   image_digest=LAB_IMAGE, identity_digest=LAB_CONFIG_SHA)
+
+    def occupied_port(_port: int) -> str:
+        return "listening"  # an unknown process owns the port: STOPPED is never provable
+
+    observer = DockerProcessObserver(
+        LAB_DEPLOYMENT, LAB_MODEL, 18099, docker=docker, port_state=occupied_port,
+        launch_lookup=lambda target: None, process_state=lambda pid: "absent", clock=SystemClock(),
+        expected=expected,
+    )
+    helper = RecordingRecovery(LAB_DEPLOYMENT, docker=docker)
+    port = DeploymentRecoveryPort(deployment_id=LAB_DEPLOYMENT, recovery=helper,
+                                  observers={LAB_MODEL: observer}, models=(LAB_MODEL,))
+    sessions = SessionManager(wait_seconds=100.0, hard_deadline_seconds=3600.0, heartbeat_seconds=10.0,
+                              ttl_seconds=120.0, prepare_seconds=100.0, drain_seconds=30.0, retry_seconds=30.0,
+                              cleanup_seconds=60.0, cancel_seconds=10.0, stop_grace_seconds=30.0, reconcile_seconds=5.0)
+    runtime = build_managed_execution(
+        boot_id="boot-lab", deployment=lab_deployment(), deployment_id=LAB_DEPLOYMENT, book=book,
+        resources=LabResources(), control=swap, clients={LAB_MODEL: client},
+        observers={LAB_MODEL: observer}, inference_base_urls={LAB_MODEL: "http://127.0.0.1:18099"},
+        blobs=BlobStore(tmp_path / "blobs"), sessions=sessions, fixture_path=LAB_FIXTURE,
+        scheduler_kwargs={"poll_interval_seconds": 0.01, "recovery": port},
+        execution_kwargs={"poll_seconds": 0.01, "wait_seconds": 600.0},
+        lifecycle_policy=STUCK_POLICY,
+        expected_instances={LAB_MODEL: expected},
+    )
+    assert runtime.scheduler.recovery is port  # the composition did the wiring, not this test
+
+    with pytest.raises(ModelUnavailable):
+        await asyncio.wait_for(runtime.scheduler.acquire(LAB_MODEL, "req-1", time.monotonic() + 10), 10)
+
+    assert await eventually(lambda: helper.reconciles == 1)  # the wired port really asked the helper
+    assert book.recovering is True        # the observer could not prove a stop: no recovery is claimed
+    assert book.runtime[LAB_MODEL].state.value == "error"

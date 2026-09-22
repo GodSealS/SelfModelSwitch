@@ -30,6 +30,7 @@ import psutil
 import pytest
 
 from model_scheduler.control_identity import PeerIdentity
+from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort
 from model_scheduler.control_server import (
     CONTROL_APP_NAME,
     ControlServer,
@@ -252,7 +253,8 @@ def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) 
 
     monkeypatch.setattr(run_module, "build_backend", no_v1_join)
     config = _v2_config(sdir)
-    fake_ports = {"control": object(), "resources": None, "recovery": object(),
+    fake_ports = {"control": object(), "resources": None,
+                  "recovery": DeploymentRecovery("orin-lab", docker=lambda argv: (1, "", "")),
                   "observers": {mid: object() for mid in config.models},
                   "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
     context = run_module.build_v2_context(config, config_sha256="a" * 64, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
@@ -265,11 +267,58 @@ def test_v2_context_shares_one_boot_and_never_the_v1_backend(sdir, monkeypatch) 
     assert context.lifecycle.instance("embedding") is None  # nothing loaded yet, and no guessed identity
 
 
+def test_the_v2_context_wires_the_async_recovery_port_into_the_scheduler(sdir) -> None:
+    """K5/RP09: the composition hands the scheduler the async port, never None.
+
+    The port must be the real adapter built here over the injected helper — a
+    stub handed to the scheduler by a test would prove nothing about the
+    production join.
+    """
+    import inspect
+
+    config = _v2_config(sdir)
+    helper = DeploymentRecovery("orin-lab", docker=lambda argv: (1, "", ""))
+    fake_ports = {"control": object(), "resources": None, "recovery": helper,
+                  "observers": {mid: object() for mid in config.models},
+                  "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    context = run_module.build_v2_context(config, config_sha256="a" * 64,
+                                          env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+
+    port = context.scheduler.recovery
+    assert isinstance(port, DeploymentRecoveryPort)
+    assert inspect.iscoroutinefunction(port.recover)  # satisfies the existing ControlRecoveryPort shape
+    # two interfaces over one helper: the startup path keeps its synchronous reconcile
+    assert context.recovery is helper
+
+
+async def test_v2_health_never_claims_recovery_while_the_books_stay_closed(sdir) -> None:
+    """K5/RP09: a failed recovery keeps `recovering`, and health must say so."""
+
+    class HealthyControl:
+        async def health(self) -> bool:
+            return True
+
+    config = _v2_config(sdir)
+    fake_ports = {"control": HealthyControl(), "resources": None,
+                  "recovery": DeploymentRecovery("orin-lab", docker=lambda argv: (1, "", "")),
+                  "observers": {mid: object() for mid in config.models},
+                  "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
+    context = run_module.build_v2_context(config, config_sha256="a" * 64,
+                                          env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
+
+    context.book.begin_recovery()  # exactly the state a failed recovery leaves behind
+    checks = await run_module.v2_health_checks(context)()
+
+    assert checks["llama_swap"] is True  # the control probe itself is healthy
+    assert checks["control"] is False    # ... but a recovery in progress is never reported as recovered
+
+
 def test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes(sdir) -> None:
     from fastapi.testclient import TestClient as _TestClient
 
     config = _v2_config(sdir)
-    fake_ports = {"control": object(), "resources": None, "recovery": object(),
+    fake_ports = {"control": object(), "resources": None,
+                  "recovery": DeploymentRecovery("orin-lab", docker=lambda argv: (1, "", "")),
                   "observers": {mid: object() for mid in config.models},
                   "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
     context = run_module.build_v2_context(config, config_sha256="a" * 64, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)

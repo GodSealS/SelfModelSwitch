@@ -96,7 +96,7 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
 
     from model_scheduler.blob_store import BlobStore
     from model_scheduler.contracts_v2 import GGUF_PROFILE, DeploymentSpec
-    from model_scheduler.control_recovery import DeploymentRecovery
+    from model_scheduler.control_recovery import DeploymentRecovery, DeploymentRecoveryPort
     from model_scheduler.model_registry import Book
     from model_scheduler.process_observer import DockerProcessObserver
     from model_scheduler.resource_monitor import ResourceMonitor
@@ -164,6 +164,12 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
     }
     resources = ports.get("resources") or ResourceMonitor()
     recovery = ports.get("recovery") or DeploymentRecovery(deployment_id)
+    # K5/RP09: the scheduler's runtime recovery entry is the async adapter over this
+    # same helper; the helper itself keeps its startup-reconcile role in the context.
+    recovery_port = DeploymentRecoveryPort(
+        deployment_id=deployment_id, recovery=recovery, observers=observers,
+        models=tuple(config.models),
+    )
     policy = config.scheduler.sessions
     sessions = SessionManager(
         max_sessions=policy.queue_capacity, wait_seconds=policy.queue_timeout_seconds,
@@ -184,6 +190,7 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
             "switch_drain_timeout_seconds": config.scheduler.switch_drain_timeout_seconds,
             "switch_retry_seconds": config.scheduler.switch_retry_seconds,
             "max_evictions": config.scheduler.max_evictions_per_request,
+            "recovery": recovery_port,
         },
         execution_kwargs={"queue_capacity": policy.queue_capacity, "wait_seconds": policy.queue_timeout_seconds},
         expected_instances=expected_instances,

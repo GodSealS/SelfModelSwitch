@@ -1,6 +1,7 @@
 """Explicit runtime composition for the single scheduler process."""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
@@ -101,13 +102,17 @@ async def reconcile_startup(
 ) -> StartupReconciliation:
     """Close admission, clean this deployment's leftovers, then clear the book.
 
-    Admission closes before any docker I/O. Only a model whose instance is
-    independently observed STOPPED may be reconciled; any unproven or unremoved
-    instance keeps `Book.recovering` set, so no load is admitted and no
-    reservation is released (plan/08-execution-plan.md C03).
+    Admission closes on the host event loop before any I/O, and the helper's
+    blocking docker stages run in one worker thread: the worker never touches the
+    Book (its admission hook is a no-op) and a slow reconcile cannot stall the
+    loop. Only a model whose instance is independently observed STOPPED may be
+    reconciled; any unproven or unremoved instance keeps `Book.recovering` set,
+    so no load is admitted and no reservation is released
+    (plan/08-execution-plan.md C03).
     """
     epoch = book.begin_recovery()
-    outcome: ReconcileOutcome = recovery.reconcile(close_admission=lambda: book.begin_recovery(), deadline=deadline)
+    outcome: ReconcileOutcome = await asyncio.to_thread(
+        lambda: recovery.reconcile(close_admission=lambda: None, deadline=deadline))
     confirmed: set[str] = set()
     unproven: set[str] = set(book.specs) - set(observers)
     for model_id, observer in observers.items():
