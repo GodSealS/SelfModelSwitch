@@ -1848,3 +1848,32 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 状态（`main@142746c` + 原工作区改动 blob `203c6aa4…`），lab2 调度器已重启。原始证据：
 `/home/jtzn/self-model-switch-evidence/rp17-20260922T145856Z/`（`FINDINGS.md`、`target-pytest.log`、
 `probe-launch-source.txt`、`model-sha256.txt`、`pre-run-facts.txt`、`pre-sync-*`）。
+
+### RP17 修复与复验（2026-09-22 同日，提交 `4f84c88`）
+
+修复：`backend_control.BootLaunchRecords`（boot 级派发记录，K4 的正向来源）由 `ManagedLifecycle` 在 `load` 派发前写入
+`dispatched(model_id, fence)`、在终态裁决（见证 RUNNING / 加载期见证 STOPPED / `stop()` 证明 STOPPED）时 `settled()`；
+异常/未见证/UNKNOWN 不 settle。`run.py` 把同一个账本交给观察者（`launch_lookup`）与 `build_managed_execution(launch_records=…)`。
+本地：全量 `pytest tests -m 'not thor' -q` **1032 passed、1 skipped、1 deselected**（较修复前 +15 项：账本 9、生命周期 5、
+装配守卫 1），`ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+
+目标机复验（同一 lab2 配置，SHA `4f84c8806fdf9ac955c1129da3f56ddb455f4db8`，目标 checkout 干净、与三处远端一致）：
+- **冷启动成功**：`/api/status` 报 `recovering: false`、8090 监听、两个模型 `unloaded`（修复前此步以
+  `unproven_stop` 退出）。
+- **冷启动→见证→READY→执行**：首次 `POST /v1/chat/completions` **HTTP 200、10.80s**，`finish_reason=stop`、内容 "OK."；
+  期间容器 `sms-sms-orin-lab2-qwen25vl-7b | Up`，状态 `ready`。
+- **stop**：`POST /api/models/qwen25vl-7b/unload` **HTTP 200、1.16s**，容器移除、状态回到 `unloaded`。
+- **reload**：第二次请求 **HTTP 200、5.75s**，状态 `ready`（K1—K5 的见证/停止证据在真机上被真实走通）。
+- **入口守卫（K7/RP14）**：用同一 TCP 端口、自有 socket/lock 的第二份配置启动新实例 → **exit 78**、
+  `configuration error: cannot bind the TCP entry to 127.0.0.1:8090: [Errno 98] Address already in use`——端口守卫在
+  lifespan 之前生效；在跑实例与在用控制 socket（inode/mtime 不变）未受影响。
+- 第二实例的早前注入先被更早的锁守卫拒绝（`exit 73 scheduler instance already running`），亦记录。
+
+**未完成/不可作为通过依据**：控制/观测故障的"有界 UNKNOWN → 恢复"未在真机干净隔离——本次占用模型端口 10002 的注入
+时序有误（占位进程在请求结束前 8 秒自行释放），该请求 184s 后成功返回 200，**不能据此声称有界失败与恢复已验证**；
+该分支仍以同 SHA 目标机上通过的全量套件（含受控时钟的 UNKNOWN/截止/恢复用例）为依据，真机注入留待后续。
+`qwen36-27b` 未做功能复验；S/B/O 未运行；**生产验收仍未宣称，`device_backend_ready` 未生成**。
+
+目标机终态：checkout 停在 `4f84c88`（干净），lab2 调度器由该 SHA 运行并在 8090 服务。复验证据：
+`retest-scheduler.log`、`retest-scenario.log`、`retest-chat1.json`、`retest-unload.json`、`retest-chat2.json`、
+`injection/`（第二实例日志与配置）、`rp17-retest.sh`、`rp17-injections.sh`。

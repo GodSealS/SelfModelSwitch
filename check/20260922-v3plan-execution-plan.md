@@ -660,11 +660,12 @@ C03/C08/C09 与实现一致性的探针复核通过：`LifecyclePolicy` 值 = 10
 **Documentation impact:** 记录实际提交和目标证据索引，逐任务填写真实结果；保留失败记录，明确lab与production结论。
 **Acceptance criteria:**
 - [x] 双端remote/branch/完整SHA与target干净状态匹配；目标确为预期硬件，模型只读且SHA-256匹配。
-- [ ] 真机冷启动→见证→READY→stop→reload；控制/观测故障→有界UNKNOWN→恢复；记录采样次数、耗时、lease/预算和静默证据。**BLOCKED：真机冷启动被真实缺陷拒绝（见执行状态）。**
-- [ ] Linux双UID/入口启动失败/退出无遗留；失败注入限制在本deployment，保留失败材料。（部分：同SHA目标机全量套件在 Linux 通过，含 K7 socket/gate/owner 用例；唯一 skip 是仅 root 可跑的双 UID 用例；v2 入口失败注入因服务无法启动而未执行。）
-- [ ] 最终候选模型清单符合决策；S/B/O全集与06性能策略真实通过才宣称device_backend_ready。只完成lab则明确“lab复验完成，生产未验收”。（**未宣称**：模型清单符合决策已记录，但 S/B/O 未运行，lab 功能复验本身被阻塞。）
+- [ ] 真机冷启动→见证→READY→stop→reload；控制/观测故障→有界UNKNOWN→恢复；记录采样次数、耗时、lease/预算和静默证据。（**前半已通过**：缺陷修复后 `4f84c88` 在真机完成冷启动→200/10.80s→unload/1.16s→reload/5.75s；**后半未完成**：控制/观测故障的真机注入不成立，见执行状态。）
+- [ ] Linux双UID/入口启动失败/退出无遗留；失败注入限制在本deployment，保留失败材料。（部分：同SHA目标机全量套件在 Linux 通过（含 K7 socket/gate/owner 用例），入口启动失败真机注入通过（exit 78，端口守卫在 lifespan 前生效，在跑实例与在用 socket 未受影响）；**真双 UID 用例需 root，未覆盖**（套件中按设计 skip）。）
+- [ ] 最终候选模型清单符合决策；S/B/O全集与06性能策略真实通过才宣称device_backend_ready。只完成lab则明确“lab复验完成，生产未验收”。（**未宣称**：模型清单符合决策已记录，但 S/B/O 未运行。）
 
-**执行状态（2026-09-22）：BLOCKED——真机冷启动发现真实缺陷，未做任何伪造修复。**
+**执行状态（2026-09-22）：缺陷已修并在真机复验（部分通过）——真机冷启动发现真实缺陷、未做伪造修复，按 AGENTS 第 7 步
+本地修复、全量检查、推送、重新同步后复验；故障注入的一半与真双 UID 未覆盖，生产未宣称。**
 
 已完成并通过的部分：开发机 `47cb747` push 到 GitHub（`git ls-remote` = 本地 SHA）与目标裸仓库；目标 checkout
 守卫式 ff-only 到同一 SHA（`verified_target_sha=47cb7473a205aa32d10fb50ad3af15bb53296686`，前后工作区为空）。
@@ -692,8 +693,23 @@ TDD（含真实派发后仍 UNKNOWN 的负例）并重跑全量，然后重做 R
 目标机状态：未在目标机做任何修复；已恢复到 RP17 之前的状态（`main@142746c` + 原工作区改动，blob
 `203c6aa48e15d0fefb6a7a6f2dffce2798e9e51d`），lab2 调度器已重启并在 8090 正常服务。原始证据在
 `/home/jtzn/self-model-switch-evidence/rp17-20260922T145856Z/`（`FINDINGS.md`、`target-pytest.log`、
-`probe-launch-source.txt`、`model-sha256.txt`、`pre-run-facts.txt`、`pre-sync-*`）。**生产验收未宣称**，
-`device_backend_ready` 未生成。
+`probe-launch-source.txt`、`model-sha256.txt`、`pre-run-facts.txt`、`pre-sync-*`）。
+
+**修复与复验（同日，提交 `4f84c88`）**：按用户选择"按 K4 修"，落地 `backend_control.BootLaunchRecords`（boot 级派发记录）
+并由 `ManagedLifecycle` 在 load 派发前写入、在终态裁决（见证 RUNNING / 加载期见证 STOPPED / stop 证明 STOPPED）时 settle；
+异常/未见证/UNKNOWN 不 settle，“派发后失联”仍是 `launch_unresolved → UNKNOWN`。`run.py` 把同一账本交给观察者
+（`launch_lookup`）与 `build_managed_execution(launch_records=…)`，并以 `DockerProcessObserver.launch_source` +
+`ManagedLifecycle.launch_records` 使该装配可被结构化断言（RP17 根因回归）。本地：全量
+**1032 passed、1 skipped、1 deselected**（+15：账本 9 / 生命周期 5 / 装配守卫 1）、`ruff check .`、
+`run.py --check-config`、`git diff --check` 通过；已 push 到 GitHub 与目标裸仓库并守卫式重同步（目标树干净）。
+真机复验（`4f84c88`，同 lab2 配置）：冷启动成功（`recovering=false`、8090 监听、模型 `unloaded`）；首次 chat
+**200 / 10.80s**（容器 Up、`ready`）；unload **200 / 1.16s**（容器移除、`unloaded`）；reload **200 / 5.75s**；
+入口守卫注入 **exit 78 `cannot bind the TCP entry to 127.0.0.1:8090`**（端口守卫在 lifespan 前生效，在跑实例与在用 socket
+未受影响）；第二实例更早先被锁守卫拒绝（`exit 73`）。**未成立**：占用模型端口 10002 的故障注入时序有误（占位进程提前
+8 秒释放），请求 184s 后成功，"有界 UNKNOWN → 恢复"**不得据此声称已验证**，仍以同 SHA 目标机套件（受控时钟用例）
+为依据；`qwen36-27b` 未做功能复验。目标机终态：checkout 停在 `4f84c88`（干净），lab2 调度器由该 SHA 运行。
+**生产验收仍未宣称**，`device_backend_ready` 未生成。复验证据：`retest-scenario.log`、`retest-chat1.json`、
+`retest-unload.json`、`retest-chat2.json`、`injection/`、`rp17-retest.sh`、`rp17-injections.sh`。
 **Verification:** 使用既有acceptance CLI及06/P29—P31；命令先以本次源版本`--help`确认，记录实际命令、exit、耗时、峰值内存、CUDA/runtime、模型hash、停止/静默及运行前后Git状态。不同设备/配置/source archive不得复用旧通过报告。
 
 ## 4. 原问题到任务的覆盖关系
