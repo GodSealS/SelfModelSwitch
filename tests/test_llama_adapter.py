@@ -887,3 +887,121 @@ async def test_identity_provider_resolves_per_action_and_results_are_captured_on
                          inline_input={"messages": [{"role": "user", "content": "hi"}]}), _fence(), _deadline())
     assert handle2.instance == second
     await client.aclose()
+
+
+# --- RP03/K4: control calls are bounded, and a control answer is never a proof --
+
+
+class RecordingControl:
+    """A lifecycle control that records what was dispatched and can hang."""
+
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.calls: list[str] = []
+        self.delay = delay
+
+    async def load(self, model_id: str) -> None:
+        self.calls.append(f"load:{model_id}")
+        await asyncio.sleep(self.delay)
+
+    async def unload(self, model_id: str) -> None:
+        self.calls.append(f"unload:{model_id}")
+        await asyncio.sleep(self.delay)
+
+
+def _health_routes() -> dict[str, object]:
+    return {
+        "/health": (200, {"status": "ok"}),
+        "/slots": (200, [{"id": 0, "is_processing": False, "n_ctx": 32768}]),
+    }
+
+
+def _expired() -> float:
+    return asyncio.get_running_loop().time() - 1.0
+
+
+def _almost_gone() -> float:
+    return asyncio.get_running_loop().time() + 0.05
+
+
+async def test_an_expired_deadline_never_reaches_the_control_plane() -> None:
+    control = RecordingControl()
+    client, transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=None)
+
+    load = await adapter.load(_model(), _fence(execution_id=None, attempt=None), _expired())
+    stop = await adapter.stop(_identity(), _fence(execution_id=None, attempt=None), _expired())
+    released = await adapter.release("qwen25vl-7b-q4", _expired())
+
+    assert control.calls == []          # not one control request was dispatched
+    assert transport.requests == []     # and not one HTTP request either
+    assert load.state == "unknown" and load.instance is None
+    assert stop.accepted is False
+    assert released is False
+    await client.aclose()
+
+
+async def test_a_control_call_that_outlives_the_deadline_returns_unverified() -> None:
+    control = RecordingControl(delay=5.0)
+    client, _transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=None)
+
+    observation = await adapter.load(_model(), _fence(execution_id=None, attempt=None), _almost_gone())
+
+    assert observation.state == "unknown"        # unverified: not running, and never a stop
+    assert observation.instance is None
+    assert observation.launch_resolved is False  # the launch stays unresolved, never terminal
+    await client.aclose()
+
+
+async def test_a_timed_out_load_keeps_the_fact_that_it_was_dispatched() -> None:
+    control = RecordingControl(delay=5.0)
+    client, _transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=None)
+
+    await adapter.load(_model(), _fence(execution_id=None, attempt=None), _almost_gone())
+
+    assert control.calls == ["load:qwen25vl-7b-q4"]  # reached, so it is not "never sent"
+    await client.aclose()
+
+
+async def test_stop_uses_the_caller_deadline_instead_of_dropping_it() -> None:
+    control = RecordingControl(delay=5.0)
+    client, _transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=_identity())
+
+    ack = await adapter.stop(_identity(), _fence(execution_id=None, attempt=None), _almost_gone())
+
+    assert ack.accepted is False  # an unload that never landed is not an acknowledgement
+    assert control.calls == ["unload:qwen25vl-7b-q4"]
+    await client.aclose()
+
+
+async def test_release_reaches_an_orphan_that_never_had_an_identity() -> None:
+    control = RecordingControl()
+    client, _transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=None)
+
+    assert await adapter.release("qwen25vl-7b-q4", _deadline()) is True
+    assert control.calls == ["unload:qwen25vl-7b-q4"]
+    await client.aclose()
+
+
+async def test_release_without_a_deadline_still_works_for_the_transitional_call_site() -> None:
+    """RP04 makes the bridge pass the deadline; until then the one-argument call still runs."""
+    control = RecordingControl()
+    client, _transport = _client(_health_routes())
+    adapter = _adapter(client, control=control, identity=None)
+
+    assert await adapter.release("qwen25vl-7b-q4") is True
+    assert control.calls == ["unload:qwen25vl-7b-q4"]
+    await client.aclose()
+
+
+async def test_the_managed_adapter_declares_the_release_capability_explicitly() -> None:
+    from model_scheduler.ports_v3 import ManagedAdapterPort
+
+    client, _transport = _client({})
+    adapter = _adapter(client, control=RecordingControl())
+
+    assert isinstance(adapter, ManagedAdapterPort)  # not discovered by getattr guesswork
+    await client.aclose()

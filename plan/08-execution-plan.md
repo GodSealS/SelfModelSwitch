@@ -222,6 +222,14 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 截止限制的是**新工作派发与结果接受**：超时后的子进程回收仍须完成并记录，不得在未回收完成时声称资源静默；
 `task.cancel()` 不等于子进程退出，也不能当作 launch 终结事实。
 
+**控制阶段的边界（RP03 已交付）**：`ManagedAdapterPort`（`ports_v3.py`）显式声明 `load/stop/release`，
+`release` 是声明的能力而不是靠 `getattr` 猜出来的。三条控制调用都取调用方的绝对 deadline：已过期一次 HTTP 都不发；
+执行中用剩余时间收敛，超时/未回执一律返回**不可证**——load 返回 UNKNOWN 且 `launch_resolved=False`（**不是** STOPPED，
+也不许伪装成“未派发”，因为命令可能已经发出），stop 返回 `StopAck(accepted=False)`。取消直接向上抛，不折算成“被拒绝”。
+adapter 从不监督 launcher，因此它给出的 Observation 恒为 `launch_resolved=False`：启动是否终结只能由观察侧证明。
+正常模型协议与 legacy 客户端路径不变。遗留缺口：bridge 仍以单参数调用 `release(model_id)`，
+`deadline` 因此暂留默认值，RP04 改桥接时一并去掉。
+
 ### C04：会话与执行状态机
 
 | 对象 | 状态/转换 | 约束 |

@@ -296,12 +296,50 @@ class LlamaCppAdapter:
             raise AdapterError("instance identity is required after dispatch", "instance_unknown")
         return identity
 
+    async def _control_call(self, action: str, model_id: str, deadline: float) -> bool:
+        """One bounded lifecycle command; False means "it could not be proven".
+
+        An expired deadline dispatches nothing at all, and a cancelled caller is
+        re-raised rather than reported as a refusal — a cancellation proves just as
+        little about the control plane as a timeout does, and swallowing it would
+        make the caller believe the command was declined.
+        """
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        try:
+            async with asyncio.timeout(remaining):
+                await getattr(self._control, action)(model_id)
+        except (asyncio.TimeoutError, TimeoutError):
+            return False
+        return True
+
+    def _unverified(self) -> Observation:
+        """The answer for a control call whose outcome could not be proven (K4).
+
+        Deliberately not STOPPED: the command may already have been dispatched, so
+        claiming a stop here would fabricate the very evidence only observation can
+        give. The launch stays unresolved because this adapter supervises no
+        launcher and can therefore never prove one terminated.
+        """
+        return Observation(
+            state="unknown",
+            sampled_at_monotonic=time.monotonic(),
+            sampled_at_utc=datetime.now(UTC),
+            port_state="unknown",
+            subprocess_state="unknown",
+            instance=None,
+            launch_operation=None,
+            launch_resolved=False,
+        )
+
     async def load(self, spec: ModelSpec, fence: Fence, deadline: float) -> Observation:
         if spec.model_id != self._model.model_id:
             raise AdapterError("load spec does not match this adapter", "contract_violation")
         if self._control is None:
             raise AdapterError("lifecycle control is required for load", "backend_failed")
-        await self._control.load(spec.model_id)
+        if not await self._control_call("load", spec.model_id, deadline):
+            return self._unverified()
         status, health = await self._json("GET", self._endpoint("health"), deadline=deadline)
         healthy = status == 200 and isinstance(health, dict) and health.get("status") == "ok"
         if healthy:
@@ -314,6 +352,7 @@ class LlamaCppAdapter:
             subprocess_state="running" if healthy else "unknown",
             instance=self._resolve_identity(),
             launch_operation=None,
+            launch_resolved=False,  # this adapter starts no supervised launcher
         )
 
     async def execute(self, request: ExecutionRequest, fence: Fence, deadline: float) -> ExecutionHandle:
@@ -380,21 +419,34 @@ class LlamaCppAdapter:
         return CancelAck(execution_id=handle.execution_id, accepted=True)
 
     async def stop(self, identity: InstanceIdentity, fence: Fence, deadline: float) -> StopAck:
-        del fence, deadline
+        """Send the unload for this exact identity, bounded by the caller's deadline.
+
+        An acknowledgement only ever means the command was processed; it is never a
+        stop. A deadline that ran out before or during the call is reported as not
+        accepted, because nothing about the unload could be confirmed — and the four
+        facts are still what proves the stop.
+        """
         if self._control is None:
             return StopAck(accepted=False)
-        await self._control.unload(identity.model_id)
-        return StopAck(accepted=True)
+        return StopAck(accepted=await self._control_call("unload", identity.model_id, deadline))
 
-    async def release(self, model_id: str) -> bool:
+    async def release(self, model_id: str, deadline: float | None = None) -> bool:
         """Unload a model by name when no verified instance was ever recorded.
 
         A load that fails verification can leave the control plane holding a container
         this boot never accepted. The unload endpoint is model-scoped, so the orphan can
         still be let go and the stop proven by observation; without this the model would
         keep a runtime it can neither use nor address.
+
+        `deadline` is part of the declared `ManagedAdapterPort` capability. It is
+        optional only while the bridge still calls this with the model id alone;
+        RP04 makes the bridge pass the caller's deadline, and this default is
+        removed together with that call site.
         """
         if self._control is None:
             return False
-        await self._control.unload(model_id)
+        if deadline is None:
+            await self._control.unload(model_id)
+            return True
+        return await self._control_call("unload", model_id, deadline)
         return True

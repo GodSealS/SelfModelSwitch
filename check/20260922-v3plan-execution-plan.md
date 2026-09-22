@@ -199,9 +199,28 @@ bridge 私有缓存 `_instances` 的移除仍属 RP04，本片只提供 Book 侧
 **Files likely touched:** `model_scheduler/adapters/llama_cpp.py`、`model_scheduler/ports_v3.py`、`tests/test_llama_adapter.py`、`tests/test_backend_control.py`。
 **Documentation impact:** 控制响应仅是控制事实，不是STOPPED；adapter UNKNOWN策略不变。
 **Acceptance criteria:**
-- [ ] load/stop/release均接受绝对deadline；已过期不发HTTP；无身份孤儿仍可显式release(model_id, deadline)。
-- [ ] HTTP超时/取消不生成已证STOPPED或terminal launch；正常模型协议和legacy客户端仍兼容。
+- [x] load/stop/release均接受绝对deadline；已过期不发HTTP；无身份孤儿仍可显式release(model_id, deadline)。
+- [x] HTTP超时/取消不生成已证STOPPED或terminal launch；正常模型协议和legacy客户端仍兼容。
 **Verification:** `"$PY" -m pytest tests/test_llama_adapter.py tests/test_backend_control.py -q`；超时fake验证control调用次数及参数，之后全量检查。
+
+**执行结果（2026-09-22）**：`ports_v3` 新增 `ManagedAdapterPort`（显式声明 `load/stop/release`，均带绝对 deadline）。
+`LlamaCppAdapter` 新增 `_control_call(action, model_id, deadline)`：过期零派发；执行中用 `asyncio.timeout(剩余)`
+收敛；超时返回 False 表示“不可证”；`CancelledError` 向上抛而不折算为拒绝。新增 `_unverified()` 作为控制不可证时的
+返回——state=UNKNOWN、`launch_operation=None`、`launch_resolved=False`，**不是** STOPPED。`load` 改为经 `_control_call`，
+`stop` 不再 `del deadline` 并按结果返回 `StopAck(accepted=...)`，`release(model_id, deadline=None)` 支持显式 deadline。
+
+新增 8 个测试（`tests/test_llama_adapter.py`，含可挂起的 `RecordingControl`）：过期 deadline 对控制面与 HTTP 均零
+派发；控制调用超时返回 UNKNOWN 且 `launch_resolved=False`；超时后仍保留“已派发”事实（断言控制面被真正调用过）；
+stop 用调用方 deadline 且超时返回 non-accepted；无身份孤儿可显式 `release(model_id, deadline)`；
+过渡期单参数 `release(model_id)` 仍可用；adapter 满足 `ManagedAdapterPort`。RED 阶段 6 failed / 21 passed。
+
+遗留缺口（RP04 关闭）：`ManagedLifecycle.stop` 仍以 `await release(model_id)` 单参数调用，且仍用
+`getattr(adapter, "release", None)`；`release` 的 `deadline` 默认值与该调用点一并去除。本次未改动
+`backend_control.py`——它含用户未提交改动，编辑会把用户代码混入提交。
+
+验证：定向 `test_llama_adapter.py + test_backend_control.py` 37 passed；全量
+`pytest tests -m 'not thor' -q` **945 passed、1 skipped、1 deselected**（较 RP02 的 938 增加 7）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP04：见证验证与原子身份提交贯通
 

@@ -423,6 +423,23 @@ class DeadlineDocker(Protocol):
 
 
 @runtime_checkable
+class ManagedAdapterPort(Protocol):
+    """The control surface a *managed* adapter implements explicitly (K4).
+
+    Every control call takes the caller's absolute deadline, and `release` is a
+    declared capability rather than something discovered with `getattr`: a model
+    whose load never verified must still be let go by name, and silently skipping
+    that would strand a container forever.
+    """
+
+    async def load(self, spec: ModelSpec, fence: Fence, deadline: float) -> Observation: ...
+
+    async def stop(self, identity: InstanceIdentity, fence: Fence, deadline: float) -> StopAck: ...
+
+    async def release(self, model_id: str, deadline: float) -> bool: ...
+
+
+@runtime_checkable
 class Clock(Protocol):
     """Time source: monotonic for deadlines and samples, UTC for evidence."""
 
