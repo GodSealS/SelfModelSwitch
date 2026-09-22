@@ -391,7 +391,7 @@ eviction 批全部结束；**删除**“drain 超时直接 `book.release(lease, 
 人工 `recover(deadline)` 改为显式、有界（`min(caller, now+60)`）的重试入口：只在无活动恢复任务时接受、
 复用当前 epoch、不自动循环。触发者仍在 `_loads` 摘除后才创建恢复任务，不自锁。
 
-新增 6 个用例（`tests/test_scheduler_lifecycle.py`，该文件现 71 个）：过期 caller 仍得到 fresh 60s 预算、
+新增 6 个用例（`tests/test_scheduler_lifecycle.py`，该文件现 65 个）：过期 caller 仍得到 fresh 60s 预算、
 两个失败合并为一次尝试且 deadline 不延长、lease 未归还时到期不调用端口且 lease/预算/身份保留、eviction 批
 未终结前端口调用数为 0、恢复运行中新准入立即得到 `control_recovering`、失败尝试后人工有界重试可完成。
 另修正 `test_a_late_load_write_back_is_rejected_and_keeps_the_raw_fence` 的同步点（K5 下 begin_recovery 先于
