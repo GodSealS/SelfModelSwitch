@@ -471,6 +471,118 @@ def test_bootstrap_stopped_and_a_finished_recovery_leave_no_identity() -> None:
     assert book.instance("b") is None
 
 
+# --- K3/RP05: a proven-stopped load releases the budgets but stays an error ---
+
+
+def _loading(book: Book, model_id: str, *, at: float = 0.0) -> Operation:
+    return book.begin_load(model_id, MemorySample(1_000, 900, at), at)
+
+
+def _proven_stopped(book: Book, model_id: str) -> Operation:
+    """One generation whose load was proven stopped, with another model resident."""
+    load_identified(book, model_id)
+    book.stopped(book.begin_eviction([model_id])[0], 1.0)
+    operation = _loading(book, model_id, at=2.0)
+    book.load_stopped(operation, 3.0)
+    return operation
+
+
+def test_a_proven_stopped_load_releases_both_budgets_but_stays_an_error() -> None:
+    book = make_book()
+    load_identified(book, "b")  # a second resident model, so the drop is observable
+    load_identified(book, "a")
+    book.stopped(book.begin_eviction(["a"])[0], 1.0)
+    operation = _loading(book, "a", at=2.0)
+    assert book.committed == 200
+
+    book.load_stopped(operation, 3.0)
+
+    assert book.committed == 100  # exactly one reservation came back
+    runtime = book.runtime["a"]
+    assert runtime.state is State.ERROR
+    assert runtime.reservation == 0
+    assert runtime.admission_blocked is True
+    assert book.instance("a") is None
+    assert runtime.last_error == "load_proven_stopped"
+    assert runtime.load_stopped_generation == runtime.generation
+    with pytest.raises(Conflict):
+        book.acquire_ready("a", "req-1", 4.0)  # ERROR still refuses an ordinary acquire
+    del operation
+
+
+def test_an_unknown_failure_keeps_the_budget_and_sets_no_marker() -> None:
+    book = make_book()
+    load_identified(book, "a")
+    book.stopped(book.begin_eviction(["a"])[0], 1.0)
+    operation = _loading(book, "a", at=2.0)
+
+    book.failed(operation, "load_timeout")
+
+    assert book.committed == 100  # the reservation survived
+    assert book.runtime["a"].reservation == 100
+    assert book.runtime["a"].load_stopped_generation is None
+
+
+def test_the_marker_is_consumed_once_and_only_by_its_own_generation() -> None:
+    book = make_book()
+    _proven_stopped(book, "a")
+    generation = book.runtime["a"].generation
+
+    book.retry_stopped_load("a", expected_epoch=book.epoch, expected_generation=generation)
+
+    assert book.runtime["a"].state is State.UNLOADED
+    assert book.runtime["a"].admission_blocked is False
+    assert book.runtime["a"].load_stopped_generation is None  # consumed
+    with pytest.raises(Conflict):  # a second consumption must fail, not double-count
+        book.retry_stopped_load("a", expected_epoch=book.epoch, expected_generation=generation)
+    with pytest.raises(StaleOperation):  # and never across an epoch
+        book.retry_stopped_load("a", expected_epoch=book.epoch + 1, expected_generation=generation)
+
+
+def test_a_late_or_foreign_operation_cannot_release_the_budget() -> None:
+    book = make_book()
+    load_identified(book, "a")
+    book.stopped(book.begin_eviction(["a"])[0], 1.0)
+    operation = _loading(book, "a", at=2.0)
+    stale = Operation(operation.operation_id, "a", operation.generation, book.epoch + 1)
+
+    with pytest.raises(StaleOperation):
+        book.load_stopped(stale, 3.0)
+    assert book.committed == 100  # nothing was released
+
+    book.load_stopped(operation, 3.0)
+    assert book.committed == 0  # released once
+    with pytest.raises(StaleOperation):  # the same result a second time changes nothing
+        book.load_stopped(operation, 4.0)
+    assert book.committed == 0
+
+
+def test_a_new_load_clears_the_marker_and_the_historical_stop_instant() -> None:
+    book = make_book()
+    _proven_stopped(book, "a")
+    book.retry_stopped_load("a", expected_epoch=book.epoch, expected_generation=book.runtime["a"].generation)
+    assert book.runtime["a"].stopped_at == 3.0
+
+    _loading(book, "a", at=4.0)  # the sample may still be compared against the old stop
+
+    assert book.runtime["a"].stopped_at is None
+    assert book.runtime["a"].load_stopped_generation is None
+
+
+def test_a_recovery_clears_the_marker_so_no_retry_crosses_the_epoch() -> None:
+    book = make_book()
+    operation = _loading(book, "a")
+    book.load_stopped(operation, 1.0)
+    assert book.runtime["a"].load_stopped_generation is not None
+
+    book.begin_recovery()
+
+    assert book.runtime["a"].load_stopped_generation is None
+    with pytest.raises(Conflict):
+        book.retry_stopped_load("a", expected_epoch=book.epoch,
+                                expected_generation=book.runtime["a"].generation)
+
+
 def test_an_aborted_lease_keeps_the_identity_until_a_stop_is_proven() -> None:
     book = make_book()
     load_identified(book, "a")

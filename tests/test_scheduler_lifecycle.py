@@ -620,6 +620,55 @@ async def test_a_zero_retry_limit_keeps_a_failed_load_terminal() -> None:
     assert registry.runtime["chat"].state.value == "error"
 
 
+class ProvenStoppedBackend(Backend):
+    """A load whose own stop was proven: the retry must not ask for another stop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stops: list[str] = []
+
+    async def load(self, operation, deadline):
+        self.loads += 1
+        if self.loads == 1:
+            return Observation(Presence.STOPPED, None, False, 0, "load_proven_stopped")
+        return Observation(Presence.RUNNING, "instance", True, 0)
+
+    async def stop(self, operation, deadline):
+        self.stops.append(operation.model_id)
+        return Observation(Presence.STOPPED, None, False, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_proven_stopped_load_retries_without_another_stop() -> None:
+    """K3: the marker is consumed instead of spending a docker stop on a stopped runtime."""
+    registry = book()
+    backend = ProvenStoppedBackend(); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend)
+    deadline = asyncio.get_running_loop().time() + 5
+
+    await scheduler.warm("chat", deadline)
+
+    assert backend.loads == 2
+    assert backend.stops == []  # no extra stop: nothing was holding a runtime
+    assert registry.runtime["chat"].state.value == "ready"
+    assert registry.runtime["chat"].load_stopped_generation is None  # consumed, not left behind
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_warms_never_exceed_the_retry_allowance() -> None:
+    """The allowance is granted inside the lock, so two warmers cannot each spend one."""
+    registry = book()
+    backend = FlakyBackend(failures=99); backend.finish.set()
+    scheduler = ModelScheduler(registry, Resources(), backend, load_retry_limit=1)
+    deadline = asyncio.get_running_loop().time() + 5
+
+    outcomes = await asyncio.gather(scheduler.warm("chat", deadline), scheduler.warm("chat", deadline),
+                                    return_exceptions=True)
+
+    assert all(isinstance(item, ModelUnavailable) for item in outcomes)
+    assert backend.loads == 2  # the first attempt plus exactly one shared retry
+
+
 @pytest.mark.asyncio
 async def test_warm_reclaims_through_the_managed_observe_shape() -> None:
     """The managed lifecycle reports presence with a deadline and a v3 `state`."""

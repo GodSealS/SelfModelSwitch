@@ -285,11 +285,27 @@ bridge 在 labels 层之外再按期望值核对 runtime/image/digest。v1 分�
 **Files likely touched:** `model_scheduler/model_registry.py`、`model_scheduler/scheduler.py`、`tests/test_registry.py`、`tests/test_scheduler_lifecycle.py`。
 **Documentation impact:** C03新增ERROR0状态行，明确物理/逻辑预算、错误与准入是独立维度。
 **Acceptance criteria:**
-- [ ] 当前LOADING+STOPPED转ERROR0，双committed下降一次、instance清空、last_error保留；普通acquire仍失败。
-- [ ] UNKNOWN保预算；旧generation/epoch/重复结果/有lease均不能释放或消费marker。
-- [ ] begin_load/failed/begin_recovery清marker；历史stopped_at不能授权本代retry。
-- [ ] 默认warm连续失败恰4次load、已证停止路径0次额外stop；limit0只首次；两个并发warm不超额计数。
+- [x] 当前LOADING+STOPPED转ERROR0，双committed下降一次、instance清空、last_error保留；普通acquire仍失败。
+- [x] UNKNOWN保预算；旧generation/epoch/重复结果/有lease均不能释放或消费marker。
+- [x] begin_load/failed/begin_recovery清marker；历史stopped_at不能授权本代retry。
+- [x] 默认warm连续失败恰4次load、已证停止路径0次额外stop；limit0只首次；两个并发warm不超额计数。
 **Verification:** `"$PY" -m pytest tests/test_registry.py tests/test_scheduler_lifecycle.py tests/integration/test_managed_execution.py -q`及全量。
+
+**执行结果（2026-09-22）**：`Runtime` 新增 `load_stopped_generation`；`Book` 新增 `load_stopped(op, now,
+code="load_proven_stopped")` 与 `retry_stopped_load(model_id, *, expected_epoch, expected_generation)`；
+`failed`/`begin_load`/`begin_recovery` 清 marker，`begin_load` 在 `can_load` 用掉旧 `stopped_at` 后才清它。
+scheduler：`_finish_load` 见到 STOPPED 转 `load_stopped`（而非 `failed`）；`_reclaim_failed_model` 在同一锁内
+重查额度，有本代 marker 就消费它（**不发 Docker 卸载**），否则走既有 cleanup+真实 STOPPED 路径，且只有真正
+取得转换才计数一次。
+
+新增 8 个测试：Book 侧 6 个（ERROR0 双预算下降且 acquire 仍拒、UNKNOWN 保预算且无 marker、marker 只消费一次且
+不接受跨 epoch、迟到/重复结果不释放、新 load 清 marker 与历史 stopped_at、recovery 清 marker）；
+调度器侧 2 个（已证停止路径 2 次 load 且 0 次 stop、两个并发 warm 只花一份额度）。
+「默认连续失败恰 4 次 load」「limit=0 只首次」**已有覆盖**（`test_warm_gives_up_after_the_retry_limit`、
+`test_a_zero_retry_limit_keeps_a_failed_load_terminal`），按「不重复报告已有覆盖」未重复添加。
+
+验证：全量 `pytest tests -m 'not thor' -q` **965 passed、1 skipped、1 deselected**（15m36s，较 RP04a 的 957 增加 8）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP06：恢复helper的每个Docker阶段都有截止
 

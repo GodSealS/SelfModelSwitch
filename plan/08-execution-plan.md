@@ -230,6 +230,15 @@ adapter 从不监督 launcher，因此它给出的 Observation 恒为 `launch_re
 正常模型协议与 legacy 客户端路径不变。遗留缺口：bridge 仍以单参数调用 `release(model_id)`，
 `deadline` 因此暂留默认值，RP04 改桥接时一并去掉。
 
+**ERROR0 与两个维度（RP05 已交付）**：`Book.load_stopped(op, now, code="load_proven_stopped")` 把「本代加载已被证
+停止」写成 ERROR + `reservation=0` + `admission_blocked=True` + `instance=None` + `stopped_at=now` + marker
+`load_stopped_generation = 当前 generation`。**错误与准入是两个独立维度**：ERROR0 仍是错误，普通 `acquire` 照旧抛
+`ModelUnavailable`；两个 committed（逻辑预留与静态物理）各下降一次，但那只是预算回来了，不代表模型可用。
+反向约束同样重要：**不能**只凭「ERROR 且零预留」或历史 `stopped_at` 认定本代可重试——`failed`、`begin_load`、
+`begin_recovery` 都清 marker，`begin_recovery` 后旧停止证据不得跨 epoch 授权重试。
+`Book.retry_stopped_load(model_id, *, expected_epoch, expected_generation)` 只消费本代 marker，不发 Docker 卸载；
+warm/preload 的额度在**同一把锁内**重查并计数，两个并发 warm 不会各自花掉一份。
+
 ### C04：会话与执行状态机
 
 | 对象 | 状态/转换 | 约束 |

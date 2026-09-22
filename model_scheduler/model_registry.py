@@ -60,6 +60,11 @@ class Runtime:
     # K2: the single accepted identity. Only `Book.loaded` writes it and only a
     # proven stop clears it; a failure, an UNKNOWN or a pending recovery keeps it.
     instance: InstanceIdentity | None = None
+    # K3: "this generation was proven stopped". It is a marker for one load
+    # attempt, never a second budget ledger: ERROR with a released reservation is
+    # still an error, so the marker is the only thing that says why it is safe to
+    # retry without another stop.
+    load_stopped_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,10 @@ class Book:
         runtime.generation += 1
         runtime.state, runtime.reservation = State.LOADING, self.required(model_id)
         runtime.operation_id, runtime.idle_since, runtime.last_error = uuid4().hex, None, None
+        # `can_load` already used the old `stopped_at` for `sample_after_stop`, so the
+        # previous generation's stop evidence can now be dropped: it may never
+        # authorise a retry (or a memory sample) of the generation that follows.
+        runtime.stopped_at, runtime.load_stopped_generation = None, None
         return Operation(runtime.operation_id, model_id, runtime.generation, self.epoch)
 
     def _operation(self, operation: Operation) -> Runtime:
@@ -235,6 +244,38 @@ class Book:
     def failed(self, operation: Operation, code: str) -> None:
         runtime = self._operation(operation)
         runtime.state, runtime.operation_id, runtime.admission_blocked, runtime.last_error = State.ERROR, None, True, code
+        runtime.load_stopped_generation = None  # an unknown failure authorises no retry marker
+
+    def load_stopped(self, operation: Operation, now: float, code: str = "load_proven_stopped") -> None:
+        """A load whose stop was proven: still ERROR, but both budgets come back.
+
+        ERROR with a zero reservation is exactly what an ordinary failure looks
+        like, so the state alone never says "this generation may be retried
+        without another stop" — only `load_stopped_generation` does.
+        """
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise ValueError("the proven stop needs a finite instant")
+        runtime = self._operation(operation)
+        if runtime.state is not State.LOADING or runtime.leases:
+            raise Conflict("not a loading model without leases")
+        runtime.state, runtime.operation_id, runtime.admission_blocked = State.ERROR, None, True
+        runtime.reservation, runtime.instance = 0, None
+        runtime.stopped_at, runtime.last_error = now, code
+        runtime.load_stopped_generation = runtime.generation
+
+    def retry_stopped_load(self, model_id: str, *, expected_epoch: int, expected_generation: int) -> None:
+        """Consume this generation's proven-stop marker; no docker unload is issued."""
+        runtime = self.runtime[model_id]
+        if self.recovering:
+            raise Conflict("a recovery owns this model")
+        if expected_epoch != self.epoch or expected_generation != runtime.generation:
+            raise StaleOperation("load retry generation")
+        if (runtime.state is not State.ERROR or runtime.reservation != 0 or runtime.instance is not None
+                or runtime.operation_id is not None or runtime.leases
+                or runtime.load_stopped_generation != runtime.generation):
+            raise Conflict("this generation was not proven stopped")
+        runtime.state, runtime.admission_blocked = State.UNLOADED, False
+        runtime.load_stopped_generation = None  # consumed: it authorises one retry only
 
     def _heat(self, runtime: Runtime, now: float) -> float:
         return runtime.heat_value * math.pow(0.5, max(0, now - runtime.heat_updated_at) / self.half_life)
@@ -385,6 +426,7 @@ class Book:
         self.recovering = True
         for runtime in self.runtime.values():
             runtime.operation_id, runtime.admission_blocked = None, True
+            runtime.load_stopped_generation = None  # a stop never survives into a new epoch
             if runtime.state is not State.UNLOADED:
                 runtime.state, runtime.last_error = State.ERROR, "control_recovering"
         return self.epoch

@@ -265,6 +265,13 @@ class ModelScheduler:
                         self._emit_writeback_rejection("load", operation, "stale_operation")
                     else:
                         self._record_cold_load(now)
+                elif observation.presence is Presence.STOPPED:
+                    # K3: this load's own stop was proven, so both budgets come back.
+                    # It stays an error, and only this generation may retry it.
+                    try:
+                        self.book.load_stopped(operation, now)
+                    except StaleOperation:
+                        self._emit_writeback_rejection("load", operation, "stale_operation")
                 else:
                     self.book.failed(operation, observation.detail_code or "load_unverified")
                     recover = self.recovery is not None and not self.book.recovering
@@ -516,6 +523,17 @@ class ModelScheduler:
         async with self._condition:
             runtime = self.book.runtime[model_id]
             if runtime.state.value != "error" or runtime.leases or runtime.operation_id:
+                return
+            # Re-checked in the same lock that grants the attempt, so two concurrent
+            # warmers can never both spend one allowance.
+            if self._load_retries.get(model_id, 0) >= self.load_retry_limit:
+                raise ModelUnavailable(runtime.last_error or "preload_failed")
+            if runtime.load_stopped_generation == runtime.generation:
+                # Proven stopped: no further docker stop is needed, just the marker.
+                self.book.retry_stopped_load(model_id, expected_epoch=self.book.epoch,
+                                             expected_generation=runtime.generation)
+                self._load_retries[model_id] = self._load_retries.get(model_id, 0) + 1
+                self._condition.notify_all()
                 return
             try:
                 operations = self.book.begin_cleanup([model_id])
