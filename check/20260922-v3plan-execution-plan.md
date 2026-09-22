@@ -314,9 +314,25 @@ scheduler：`_finish_load` 见到 STOPPED 转 `load_stopped`（而非 `failed`�
 **Files likely touched:** `model_scheduler/control_recovery.py`、`tests/test_control_recovery_port.py`、`tests/test_process_observer.py`（若需共享runner夹具）。
 **Documentation impact:** 区分“下令停止”与“采集到停止”，补helper超时证据。
 **Acceptance criteria:**
-- [ ] 任一步耗尽预算，下一步不再派发；Docker stop timeout与整体deadline一致。
-- [ ] 不操作其他deployment；旧identity不可重定向到新容器；未知结果保守失败。
+- [x] 任一步耗尽预算，下一步不再派发；Docker stop timeout与整体deadline一致。
+- [x] 不操作其他deployment；旧identity不可重定向到新容器；未知结果保守失败。
 **Verification:** `"$PY" -m pytest tests/test_control_recovery_port.py tests/test_process_observer.py -q`及全量。
+
+**执行结果（2026-09-22）**：`DeploymentRecovery` 把注入的 docker 收进 `DeadlineDockerRunner(self._monotonic, ...)`，
+listing / inspect / stop / 复查四个阶段共用同一 deadline，且每段派发前各自检查剩余预算（不再只在循环外判断）。
+新增 `_stop_argv(container_id, deadline)`：`--time` 取**剩余预算**（不超过既有 30s 宽限），预算耗尽则不派发。
+`_inspect` 与 `_verified_stop` 现在都带 deadline，并在到期时按超时/未知保守失败。
+`reconcile` 的 listing 异常按「是否已到期」区分 `recovery_timeout` 与 `container_listing_failed`。
+`stop_instance` 与 `_verified_stop` 的复查返回 None（复查做不出来）时返回 `docker_unavailable`，
+**不因命令已发出就记为已停止**——即「下令停止」与「采集到停止」分开。
+
+新增 3 个测试（`tests/test_control_recovery_port.py`，含可控 `Clock`）：listing 吃掉预算后不再派发 inspect/stop
+（断言 verbs 只有 `ps`）、`--time` 等于剩余预算（12s）而非固定 30、复查失败不算停止。
+「不操作其他 deployment」「旧 identity 不重定向」为既有覆盖，未重复添加。
+
+验证：定向 `test_control_recovery_port.py + test_process_observer.py` 61 passed；
+全量 `pytest tests -m 'not thor' -q` **968 passed、1 skipped、1 deselected**（15m38s，较 RP05 的 965 增加 3）、
+`ruff check .` 通过、`run.py --check-config` 通过。解释器为 uv 提供的 CPython 3.12.11。
 
 ## Task RP07：构建不写Book的异步恢复端口
 

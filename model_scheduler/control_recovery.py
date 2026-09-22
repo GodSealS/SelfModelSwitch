@@ -24,6 +24,7 @@ from .process_observer import (
     DEPLOYMENT_LABEL,
     MODEL_LABEL,
     ContainerFact,
+    DeadlineDockerRunner,
     ObservationError,
     canonical_utc,
     list_container_ids,
@@ -183,8 +184,16 @@ class DeploymentRecovery:
         if not isinstance(deployment_id, str) or not deployment_id:
             raise ValueError("reconciliation requires a deployment id")
         self._deployment_id = deployment_id
-        self._docker = docker or run_docker
         self._monotonic = monotonic or time.monotonic
+        # K4: every docker stage of a reconcile is bounded by the *same* absolute
+        # deadline, so a slow listing cannot leave the following stop a fresh
+        # allowance, and nothing is dispatched once the budget is gone.
+        self._docker = DeadlineDockerRunner(
+            self._monotonic,
+            # A legacy `docker(argv)` takes no timeout; the runner derives one from
+            # the deadline, so the injected callers keep their original signature.
+            None if docker is None else (lambda argv, *, timeout: docker(list(argv))),
+        )
 
     @property
     def deployment_id(self) -> str:
@@ -196,9 +205,11 @@ class DeploymentRecovery:
         if self._monotonic() >= deadline:
             return ReconcileOutcome(False, "recovery_timeout", (), ())
         try:
-            container_ids = list_container_ids(self._deployment_id, None, self._docker)
+            container_ids = list_container_ids(
+                self._deployment_id, None, lambda argv: self._docker(list(argv), deadline=deadline))
         except ObservationError:
-            return ReconcileOutcome(False, "container_listing_failed", (), ())
+            expired = self._monotonic() >= deadline
+            return ReconcileOutcome(False, "recovery_timeout" if expired else "container_listing_failed", (), ())
         stopped: list[str] = []
         remaining: list[str] = []
         error_code: str | None = None
@@ -207,7 +218,7 @@ class DeploymentRecovery:
                 remaining.append(container_id)
                 error_code = error_code or "recovery_timeout"
                 continue
-            proven, failure = self._verified_stop(container_id)
+            proven, failure = self._verified_stop(container_id, deadline)
             if proven:
                 stopped.append(container_id)
             else:
@@ -221,7 +232,7 @@ class DeploymentRecovery:
             return StopOutcome(False, False, "foreign_instance", None)
         if self._monotonic() >= deadline:
             return StopOutcome(False, False, "recovery_timeout", identity.container_id)
-        fact = self._inspect(identity.container_id)
+        fact = self._inspect(identity.container_id, deadline)
         if fact is _ABSENT:
             return StopOutcome(True, True, None, identity.container_id)
         if fact is None:
@@ -230,16 +241,37 @@ class DeploymentRecovery:
             return StopOutcome(False, False, "stale_identity", identity.container_id)
         if not fact.running:
             return StopOutcome(True, True, None, identity.container_id)
-        exit_code, _stdout, _stderr = self._docker(["docker", "stop", "--time", str(STOP_GRACE_SECONDS), identity.container_id])
+        argv = self._stop_argv(identity.container_id, deadline)
+        if argv is None:  # the budget ran out before the stop could be ordered
+            return StopOutcome(False, False, "recovery_timeout", identity.container_id)
+        try:
+            exit_code, _stdout, _stderr = self._docker(argv, deadline=deadline)
+        except ObservationError:
+            return StopOutcome(False, False, "recovery_timeout", identity.container_id)
         if exit_code != 0:
             return StopOutcome(False, False, "stop_failed", identity.container_id)
-        after = self._inspect(identity.container_id)
+        after = self._inspect(identity.container_id, deadline)
+        if after is None:  # the re-check itself could not be made: never assume a stop
+            return StopOutcome(False, False, "docker_unavailable", identity.container_id)
         if after is _ABSENT or (after is not None and not after.running):
             return StopOutcome(True, True, None, identity.container_id)
         return StopOutcome(False, False, "stop_not_verified", identity.container_id)
 
-    def _verified_stop(self, container_id: str) -> tuple[bool, str | None]:
-        fact = self._inspect(container_id)
+    def _stop_argv(self, container_id: str, deadline: float) -> list[str] | None:
+        """The stop command with whatever grace is left; None once the budget is gone.
+
+        The grace is the remaining budget rather than a fixed constant, so docker
+        itself can never wait longer than the reconcile was allowed to take.
+        """
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            return None
+        return ["docker", "stop", "--time", str(int(min(STOP_GRACE_SECONDS, remaining))), container_id]
+
+    def _verified_stop(self, container_id: str, deadline: float) -> tuple[bool, str | None]:
+        if self._monotonic() >= deadline:
+            return False, "recovery_timeout"
+        fact = self._inspect(container_id, deadline)
         if fact is _ABSENT:
             return True, None
         if fact is None:
@@ -248,11 +280,19 @@ class DeploymentRecovery:
             return False, "foreign_instance"
         if not fact.running:
             return True, None
-        exit_code, _stdout, _stderr = self._docker(["docker", "stop", "--time", str(STOP_GRACE_SECONDS), container_id])
+        argv = self._stop_argv(container_id, deadline)
+        if argv is None:
+            return False, "recovery_timeout"
+        try:
+            exit_code, _stdout, _stderr = self._docker(argv, deadline=deadline)
+        except ObservationError:
+            return False, "recovery_timeout"
         if exit_code != 0:
             return False, "stop_failed"
-        after = self._inspect(container_id)
-        if after is _ABSENT or (after is not None and not after.running):
+        after = self._inspect(container_id, deadline)
+        if after is None:  # the re-check could not be made, so nothing is assumed
+            return False, "docker_unavailable"
+        if after is _ABSENT or not after.running:
             return True, None
         return False, "stop_not_verified"
 
@@ -266,8 +306,13 @@ class DeploymentRecovery:
         except ObservationError:
             return False
 
-    def _inspect(self, container_id: str) -> ContainerFact | None | object:
-        exit_code, stdout, stderr = self._docker(["docker", "inspect", container_id])
+    def _inspect(self, container_id: str, deadline: float) -> ContainerFact | None | object:
+        if self._monotonic() >= deadline:
+            return None
+        try:
+            exit_code, stdout, stderr = self._docker(["docker", "inspect", container_id], deadline=deadline)
+        except ObservationError:
+            return None
         if exit_code != 0:
             if structured_not_found(exit_code, stderr):
                 return _ABSENT

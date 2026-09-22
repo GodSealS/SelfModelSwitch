@@ -222,6 +222,13 @@ K1—K5。本节只记录对上面 C03 的**增量**、旧/新行为与兼容边
 截止限制的是**新工作派发与结果接受**：超时后的子进程回收仍须完成并记录，不得在未回收完成时声称资源静默；
 `task.cancel()` 不等于子进程退出，也不能当作 launch 终结事实。
 
+**恢复 helper 的「下令停止」与「采集到停止」（RP06 已交付）**：`DeploymentRecovery` 的 listing、inspect、stop
+与复查四个阶段全部走 `DeadlineDocker`，共用同一个绝对 deadline，且每一段派发**之前**各自检查剩余预算——不再只在
+循环外判断。`docker stop --time` 取**剩余预算**（不超过既有的 30s 宽限），因此 helper 不会比整体期限等得更久。
+语义边界必须分清：`stop` 的退出码 0 只是**下令停止**，只有复查（或结构化 not-found）才**采集到停止**；
+复查做不出来时按未知结果保守失败，绝不因为命令已发出就记为已停止。helper 只操作本 deployment 的容器，
+旧 identity 不得重定向到新容器。
+
 **控制阶段的边界（RP03 已交付）**：`ManagedAdapterPort`（`ports_v3.py`）显式声明 `load/stop/release`，
 `release` 是声明的能力而不是靠 `getattr` 猜出来的。三条控制调用都取调用方的绝对 deadline：已过期一次 HTTP 都不发；
 执行中用剩余时间收敛，超时/未回执一律返回**不可证**——load 返回 UNKNOWN 且 `launch_resolved=False`（**不是** STOPPED，

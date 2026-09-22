@@ -254,6 +254,63 @@ def test_stop_instance_treats_a_structured_not_found_as_already_stopped() -> Non
     assert outcome.error_code is None
 
 
+class Clock:
+    """A controllable monotonic source for the recovery helper."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_a_stage_that_consumes_the_budget_prevents_the_next_one() -> None:
+    """K4: the deadline is checked before every stage, not only around the loop."""
+    docker = FakeDocker((container_fact(running=True),))
+    clock = Clock(0.0)
+
+    def spending(argv: list[str]) -> tuple[int, str, str]:
+        clock.now += 10.0  # the listing alone ate the whole budget
+        return docker(argv)
+
+    outcome = DeploymentRecovery(DEPLOYMENT, docker=spending, monotonic=clock).reconcile(
+        close_admission=lambda: None, deadline=1.0)
+
+    assert outcome.ok is False
+    assert outcome.error_code == "recovery_timeout"
+    assert docker.verbs() == ["ps"]  # no inspect, and certainly no stop
+
+
+def test_the_stop_grace_is_the_remaining_budget_not_a_fixed_constant() -> None:
+    docker = FakeDocker((container_fact(running=True),))
+
+    DeploymentRecovery(DEPLOYMENT, docker=docker, monotonic=Clock(100.0)).stop_instance(
+        identity(), deadline=112.0)  # twelve seconds left
+
+    assert docker.stop_arguments() == [["docker", "stop", "--time", "12", CONTAINER_ID]]
+
+
+def test_a_recheck_that_cannot_be_made_is_not_a_stop() -> None:
+    """The unload can land and the re-check can still fail; that proves nothing."""
+    docker = FakeDocker((container_fact(running=True),))
+    inspected = 0
+
+    def flaky(argv: list[str]) -> tuple[int, str, str]:
+        nonlocal inspected
+        if argv[1] == "inspect":
+            inspected += 1
+            if inspected > 1:
+                return 1, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        return docker(argv)
+
+    outcome = DeploymentRecovery(DEPLOYMENT, docker=flaky).stop_instance(
+        identity(), deadline=time.monotonic() + 60)
+
+    assert outcome.accepted is False
+    assert outcome.stopped is False
+    assert outcome.error_code == "docker_unavailable"
+
+
 def test_stop_instance_does_not_treat_a_docker_failure_as_a_stop() -> None:
     def docker(argv: list[str]) -> tuple[int, str, str]:
         return 1, "", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
