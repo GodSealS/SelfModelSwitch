@@ -7,6 +7,9 @@
 范围：模型服务的 `/v1/chat/completions` 兼容面、C06 封套、能力注册、运行时渲染及对应验收。
 本文件是独立的新能力方案，不属于 RP00—RP17 修复轮；保留在 `Idea/`，不代表正式规范或生产验收。
 
+实施入口已整理为 [plan 执行计划](../plan/tool-calling-and-reasoning/README.md)。后续接口、任务状态与验收分别以该目录
+contracts、README、acceptance为真源；本文件保留设计与审查来由，不再平行维护实施契约。
+
 ## 0. 修订结论与审查闭环
 
 | 审查问题 | 修订后的决定 | 验收 |

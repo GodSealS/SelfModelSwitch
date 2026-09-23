@@ -8,6 +8,10 @@ software_verified 只说明 S 通过；device_backend_ready 要求最终候选 S
 视频项目另做 [集成与产品验收](video-analysis/04-acceptance.md)，不能从模型服务通过推导分析效果。
 旧 reference、报告字段检查和 health200 均不构成真机通过。
 
+待实施的tools/thinking扩展采用[专门诊断与验收规格](tool-calling-and-reasoning/acceptance.md)，
+通过兼容HTTP执行真实多轮场景。其lab附加报告不替代本文件的完整S/B/O发布门禁；
+能力case语法及fixture/evaluator的代码扩展由[CT03、CT07—CT08](tool-calling-and-reasoning/README.md)交付后才生效。
+
 ## 2. 执行和证据
 
 executor 通过正式API施加动作，collector 采集真实实例/资源/事件，evaluator 从原始材料重算，gate检查全集。

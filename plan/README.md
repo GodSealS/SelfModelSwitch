@@ -25,6 +25,7 @@ SelfModelSwitch 只提供模型挂载、加载、卸载、切换及其必要的�
 | [05-tasks-and-acceptance.md](05-tasks-and-acceptance.md) | 仅模型服务的实施任务（范围定义；进度见 08） |
 | [06-acceptance.md](06-acceptance.md) | 模型服务独立验收与发布门禁（**规范性真源**） |
 | [08-execution-plan.md](08-execution-plan.md) | v3 执行计划：C01—C09 接口/行为约束、有序任务与验证模板 |
+| [tool-calling-and-reasoning/README.md](tool-calling-and-reasoning/README.md) | 工具调用/思考扩展执行计划：CT00—CT12、TC01—TC09接口及A01—A12验收；仅计划，尚未实施 |
 | [adr/decisions.md](adr/decisions.md) | 本次 Grill Review 与边界决策 |
 | [m00-envelope.md](m00-envelope.md) | M00 首轮最大输入与并发探测规格 |
 | [validation.md](validation.md) | 证据与验证记录（不是规范），含历史快照段落 |
@@ -42,6 +43,8 @@ SelfModelSwitch 只提供模型挂载、加载、卸载、切换及其必要的�
 
 - **当前规范**：`01`—`06` 与 `08` 的 C01—C09 约束；`06` 始终是必测集合与发布门槛的规范来源，
   K1—K8 契约在 `check/20260922-v3plan-execution-contracts.md`，08 的 Cxx 节引用它们。
+- **待实施扩展**：[工具调用/思考计划](tool-calling-and-reasoning/README.md)是该扩展的任务入口，
+  其contracts与acceptance定义未来实现的接口和用例；不表示当前已支持，也不放宽06或ADR-05的生产门禁。
 - **基线快照（历史）**：`legacy-v1`、`legacy-v2`、`video-analysis`、`05` 的 M00—M07 任务表、
   `08` §1 的实施前核对（含 3.13.5 解释器、226 passed、当时“模块不存在”等判断）、`validation.md` 的旧段落。
   它们记录实施前的事实，不再代表当前状态。

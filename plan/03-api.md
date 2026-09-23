@@ -8,6 +8,10 @@
 未知模型404、能力不符422、有效租约/会话阻止卸载409；队列忙不等于 health 不健康。
 status 展示实际 boot_id、模型状态、execution 数、预留字节和 readiness_reason，不暴露完整控制 token。
 
+待实施的工具调用/思考兼容增量见[执行计划](tool-calling-and-reasoning/README.md)及
+[TC01—TC06接口契约](tool-calling-and-reasoning/contracts.md)。该扩展明确输出预算规范化等兼容例外，
+模型能力与internal operation分离；此引用不表示代码已实现，控制协议v1不因此增加工具operation。
+
 ## 2. 拟议通用控制接口
 
 以下协议的 DTO、限制与错误表已由 P02 固定（见 §5），HTTP 路由、身份接线与 Blob 实现仍待 M04；本节不代表接口已可访问。
