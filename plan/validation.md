@@ -1962,8 +1962,9 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   - 上游 HTTP JSON 捕获（A01/A02）：`RecordingGateway` 断言缺省→1024、4096→1024、64→64；别名保留原字段名并裁剪；
     多预算字段/0/-1/null/true/1.5/"64" → 422 `contract_violation` 且 acquire/gateway 零调用；`n=1` 通过、其余拒绝；
     SSE 与非 SSE 同预算；`tests/test_envelopes.py` 覆盖 `normalize_output` 全矩阵。
-  - 提交：`29a894f512a6b2b3ab46537b4401fdc568dc1a09`；push 到 GitHub 与目标镜像后两端 ref 相同
-    （开发机与目标 `git ls-remote origin feature/ct02-output-budget` 均等于该 SHA）。
+  - 提交：`29a894f512a6b2b3ab46537b4401fdc568dc1a09`（代码）；push 到 GitHub 与目标镜像后两端 ref 均包含该 SHA
+    （开发机与目标 `git ls-remote origin feature/ct02-output-budget` 一致）。其后仅追加 `plan/` 文档回填提交，
+    运行时代码不变；目标 checkout 保持在该被测 SHA。
 - 目标同步（remote/branch/SHA）：checkout `/home/jtzn/SelfModelSwitch`，分支 `feature/ct02-output-budget`，
   HEAD=`29a894f…`；测试前 `git status --porcelain --untracked-files=all` 为空（`state-pre/git.txt`），
   测试后进程仍运行于同一 checkout（`state-post/procs.txt`）。

@@ -178,7 +178,7 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 ### CT02 输出预算有效请求纵向修复（2026-09-24 已执行）
 
 - 交付：`29a894f512a6b2b3ab46537b4401fdc568dc1a09`（分支 `feature/ct02-output-budget`，基于 `e10f168`；
-  GitHub 与目标镜像 `refs/heads/feature/ct02-output-budget` 均等于该 SHA，目标 checkout 干净）。
+  该代码提交已推送 GitHub 与目标镜像，其后仅有 `plan/` 文档回填提交，运行时代码不变；目标 checkout 停在该 SHA 且干净）。
   `model_scheduler/envelope_validator.py` 新增 `PreparedChat`/`prepare_chat`/`normalize_output`/`canonical_json_bytes`
   与固定镜像策略 `DEFAULT_OUTPUT_POLICY`（recognized/supported 预算字段取 CT01 `probe-e/policy-candidates.json`：
   `max_tokens,max_completion_tokens,n_predict`）；`app.py` 兼容 chat 路由先 `prepare_chat` 得到唯一 `body_json`，
