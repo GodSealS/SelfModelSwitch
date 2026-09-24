@@ -26,6 +26,7 @@ from model_scheduler.envelope_validator import (
     DEFAULT_MAX_DOCUMENTS,
     EnvelopeError,
     FixedOutputBudgetPolicy,
+    canonical_json_bytes,
     check_chat_budget,
     check_chat_input,
     check_embeddings_input,
@@ -47,11 +48,15 @@ CHAT_ENVELOPE = Envelope(ctx_size=8192, max_input_tokens=4096, max_output_tokens
                          max_image_tokens=1280, max_image_edge_pixels=1024, max_images=1)
 
 #: Recognises every alias, supports two of them: unit tests must be able to tell
-#: "recognised" from "supported" apart (acceptance §4).
+#: "recognised" from "supported" apart (acceptance §4). The effort set and the
+#: denied template fields are unit-test material only (acceptance §4).
 SYNTHETIC_POLICY = FixedOutputBudgetPolicy(
     policy_id="synthetic-unit-policy",
     recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
     supported_output_fields=frozenset({"max_tokens", "max_completion_tokens"}),
+    effort_values=frozenset({"none", "low"}),
+    denied_template_fields=frozenset({"chat_template", "chat_template_kwargs", "reasoning_format",
+                                      "parse_tool_calls", "generation_prompt"}),
 )
 
 
@@ -440,18 +445,426 @@ def test_a02_n_may_be_one_or_absent_and_nothing_else() -> None:
         assert refused.value.param == "n"
 
 
-def test_a01_prepare_chat_projects_the_capability_demand_without_refusing_it() -> None:
-    tools = {"model": "m", "messages": _chat_messages(), "tools": [{"type": "function"}]}
-    history = {"model": "m", "messages": [{"role": "tool", "tool_call_id": "call-1", "content": "{}"}]}
+def test_a04_the_capability_demand_is_authoritative_in_prepare_chat() -> None:
+    # CT04 supersedes the CT02 projection: the same pure step now also refuses a
+    # model that does not carry the capability the request needs.
+    tools = {"model": "m", "messages": _chat_messages(), "tools": [_tool()]}
+    history = {"model": "m", "messages": _exchange(_call())}
     thinking = {"model": "m", "messages": [{"role": "assistant", "content": "42", "reasoning_content": "why"}]}
 
-    assert prepare_chat(tools, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY).requires_tools
-    assert prepare_chat(history, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY).requires_tools
-    assert not prepare_chat(_chat_body(), capabilities={"chat"}, envelope=CHAT_ENVELOPE,
-                            policy=SYNTHETIC_POLICY).requires_tools
-    assert prepare_chat(thinking, capabilities={"chat"}, envelope=CHAT_ENVELOPE,
-                        policy=SYNTHETIC_POLICY).requires_thinking
+    for body in (tools, history):
+        assert _prepare(body).requires_tools
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare(body, capabilities=("chat",))
+        assert refused.value.code == "capability_mismatch"
+    assert not _prepare(_chat_body()).requires_tools
+    assert _prepare(thinking).requires_thinking
 
 
 def _chat_body() -> dict:
     return {"model": "qwen-small", "messages": _chat_messages()}
+
+
+# --------------------------------------------------------------------------- TC03/TC04: the request contract (A03/A04/A06-local)
+
+NEW_CAPABILITIES = ("chat", "tools", "thinking")
+
+
+def _tool(name: str = "get_weather", *, description=None, parameters=None, strict=None) -> dict:
+    function: dict = {"name": name}
+    if description is not None:
+        function["description"] = description
+    if parameters is not None:
+        function["parameters"] = parameters
+    if strict is not None:
+        function["strict"] = strict
+    return {"type": "function", "function": function}
+
+
+def _call(call_id: str = "call-1", name: str = "get_weather", arguments: str = "{}") -> dict:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def _exchange(*calls: dict, assistant: dict | None = None, results: bool = True) -> list[dict]:
+    """One user turn, one assistant turn carrying the calls, and one result each."""
+    assistant_turn = {"role": "assistant", "tool_calls": list(calls)}
+    if assistant is not None:
+        assistant_turn.update(assistant)
+    messages = [_chat_messages()[0], assistant_turn]
+    if results:
+        messages += [{"role": "tool", "tool_call_id": call.get("id", "fallback-id"), "content": "{}"}
+                     for call in calls]
+    return messages
+
+
+def _prepare(body: dict, *, capabilities=NEW_CAPABILITIES, policy=None):
+    prepared_body = {"model": "m", **body}
+    return prepare_chat(prepared_body, capabilities=frozenset(capabilities),
+                        envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY if policy is None else policy)
+
+
+def _sized_tool(prefix: str, target_bytes: int) -> dict:
+    """One tool whose canonical JSON is exactly `target_bytes` (descriptions pad it)."""
+    tool = _tool(f"{prefix}-tool", description="")
+    overhead = len(canonical_json_bytes(tool))
+    assert target_bytes >= overhead
+    tool["function"]["description"] = "x" * (target_bytes - overhead)
+    assert len(canonical_json_bytes(tool)) == target_bytes
+    return tool
+
+
+def _tools_of_canonical_bytes(total: int, count: int = 9) -> list[dict]:
+    """`count` tools whose whole array is exactly `total` canonical bytes.
+
+    The padding is spread over every tool so the per-object budget stays out of
+    the way: only the array budget under test may react.
+    """
+    base = 128
+    residual = total - (2 + (count - 1) + count * base)  # brackets, commas, base sizes
+    assert residual >= count
+    share, extra = divmod(residual, count)
+    tools = [_sized_tool(f"tool-{index}", base + share + (extra if index == count - 1 else 0))
+             for index in range(count)]
+    assert len(canonical_json_bytes(tools)) == total
+    return tools
+
+
+@pytest.mark.parametrize("name", ["a", "get_weather-2", "A" * 64, "with_underscore"])
+def test_a03_tool_names_of_the_right_shape_pass(name) -> None:
+    assert _prepare({"messages": _chat_messages(), "tools": [_tool(name)]}).requires_tools
+
+
+@pytest.mark.parametrize("name", ["A" * 65, "get.weather", "get_weather\n", "", "天气"])
+def test_a03_bad_tool_names_are_refused(name) -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": [_tool(name)]})
+    assert refused.value.code == "contract_violation"
+    assert refused.value.param == "tools[0].function.name"
+
+
+def test_a03_tools_null_is_refused_and_an_empty_array_is_allowed() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": None})
+    assert refused.value.code == "contract_violation" and refused.value.param == "tools"
+
+    assert not _prepare({"messages": _chat_messages(), "tools": []}).requires_tools
+
+
+def test_a03_a_tool_is_exactly_type_and_function() -> None:
+    for tool in ({"function": _tool()["function"]}, {"type": "function"},
+                 {"type": "function", "function": {"name": "f"}, "extra": 1},
+                 {"type": "other", "function": {"name": "f"}}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [tool]})
+        assert refused.value.code == "contract_violation"
+
+
+def test_a03_function_optional_fields_may_be_omitted_but_never_null() -> None:
+    _prepare({"messages": _chat_messages(), "tools": [_tool()]})  # name only
+    for function in ({"name": "f", "description": None}, {"name": "f", "parameters": None}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [{"type": "function", "function": function}]})
+        assert refused.value.param.endswith(("description", "parameters"))
+    _prepare({"messages": _chat_messages(), "tools": [_tool(description="", parameters={})]})
+
+
+def test_a03_strict_defaults_to_false_and_true_is_refused() -> None:
+    _prepare({"messages": _chat_messages(), "tools": [_tool()]})
+    _prepare({"messages": _chat_messages(), "tools": [_tool(strict=False)]})
+    for value in (True, None, "false", 1):
+        tool = {"type": "function", "function": {"name": "f", "strict": value}}
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [tool]})
+        assert refused.value.param == "tools[0].function.strict"
+
+
+def test_a03_duplicate_tool_names_are_case_sensitively_refused() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": [_tool("get_weather"), _tool("get_weather")]})
+    assert refused.value.param == "tools"
+    _prepare({"messages": _chat_messages(), "tools": [_tool("get_weather"), _tool("Get_weather")]})
+
+
+def test_a03_tool_count_object_bytes_and_array_bytes_are_bounded() -> None:
+    _prepare({"messages": _chat_messages(), "tools": [_tool(f"t{index}") for index in range(32)]})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": [_tool(f"t{index}") for index in range(33)]})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "tools"
+
+    _prepare({"messages": _chat_messages(), "tools": [_sized_tool("max", 8192)]})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": [_sized_tool("over", 8193)]})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "tools[0]"
+
+    _prepare({"messages": _chat_messages(), "tools": _tools_of_canonical_bytes(65536)})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "tools": _tools_of_canonical_bytes(65537)})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "tools"
+
+
+@pytest.mark.parametrize("choice", ["auto", "none", "required"])
+def test_a03_string_tool_choice_values_pass(choice) -> None:
+    _prepare({"messages": _chat_messages(), "tools": [_tool()], "tool_choice": choice})
+
+
+def test_a03_tool_choice_shape_matrix() -> None:
+    for choice in ("", "any", 1, None, True):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [_tool()], "tool_choice": choice})
+        assert refused.value.code == "contract_violation"
+        assert refused.value.param.startswith("tool_choice")
+
+    _prepare({"messages": _chat_messages(), "tools": [_tool()],
+              "tool_choice": {"type": "function", "function": {"name": "get_weather"}}})
+    for bad in ({"type": "function"}, {"type": "function", "function": {}},
+                {"type": "function", "function": {"name": "get_weather", "extra": 1}},
+                {"type": "function", "function": {"name": ""}},
+                {"type": "other", "function": {"name": "get_weather"}}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [_tool()], "tool_choice": bad})
+        assert refused.value.code == "contract_violation"
+
+
+def test_a03_parallel_tool_calls_only_false_is_accepted() -> None:
+    _prepare({"messages": _chat_messages()})
+    _prepare({"messages": _chat_messages(), "tools": [_tool()], "parallel_tool_calls": False})
+    for value in (True, None, 0, "false"):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "tools": [_tool()], "parallel_tool_calls": value})
+        assert refused.value.param == "parallel_tool_calls"
+
+
+def test_a03_reasoning_effort_must_be_a_non_empty_string() -> None:
+    _prepare({"messages": _chat_messages(), "reasoning_effort": "low"})
+    for value in ("", None, 1, True):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), "reasoning_effort": value})
+        assert refused.value.param == "reasoning_effort"
+
+
+@pytest.mark.parametrize("assistant", [{}, {"content": None}, {"content": ""}, {"content": "42"},
+                                       {"content": [{"type": "text", "text": "hi"}]}])
+def test_a04_assistant_content_is_free_when_it_carries_calls(assistant) -> None:
+    prepared = _prepare({"messages": _exchange(_call(), assistant=assistant)})
+    assert prepared.requires_tools
+
+
+@pytest.mark.parametrize("value", [None, []])
+def test_a04_tool_calls_null_or_empty_are_refused(value) -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": [{"role": "assistant", "content": "hi", "tool_calls": value}]})
+    assert refused.value.code == "contract_violation"
+    assert refused.value.param == "messages[0].tool_calls"
+
+
+def test_a04_call_items_are_closed_and_typed() -> None:
+    for call in ({"id": "c", "type": "function"},
+                 {"id": "c", "type": "function", "function": {"name": "f"}},
+                 {"id": "c", "type": "other", "function": {"name": "f", "arguments": "{}"}},
+                 {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                 {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}, "extra": 1},
+                 {"type": "function", "function": {"name": "f", "arguments": "{}"}}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _exchange(call)})
+        assert refused.value.code == "contract_violation"
+
+
+@pytest.mark.parametrize("arguments", [None, {}, 1, ["{}"]])
+def test_a04_arguments_must_be_a_string(arguments) -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(_call(arguments=arguments))})
+    assert refused.value.param == "messages[1].tool_calls[0].function.arguments"
+
+
+def test_a04_id_and_tool_call_id_byte_limits() -> None:
+    _prepare({"messages": _exchange(_call("a" * 64))})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(_call("a" * 65))})
+    assert refused.value.code == "envelope_exceeded"
+    assert refused.value.param == "messages[1].tool_calls[0].id"
+
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "tool_calls": [_call("c-1")]},
+                {"role": "tool", "tool_call_id": "b" * 65, "content": "{}"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": messages})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "messages[2].tool_call_id"
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "a\ud800b"])
+def test_a04_ids_must_be_symbolic_text(bad) -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(_call(bad))})
+    assert refused.value.code == "contract_violation"
+    assert refused.value.param == "messages[1].tool_calls[0].id"
+
+
+def test_a04_history_arguments_total_is_bounded() -> None:
+    _prepare({"messages": _exchange(_call(arguments="x" * 262_144))})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(_call(arguments="x" * 262_145))})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "messages"
+
+
+def test_a04_calls_per_assistant_are_bounded() -> None:
+    _prepare({"messages": _exchange(*[_call(f"call-{index}") for index in range(32)])})
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(*[_call(f"call-{index}") for index in range(33)])})
+    assert refused.value.code == "envelope_exceeded" and refused.value.param == "messages[1].tool_calls"
+
+
+def test_a04_only_assistant_carries_calls_and_only_tool_carries_results() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": [{"role": "user", "content": "hi", "tool_calls": [_call()]}]})
+    assert refused.value.param == "messages[0].tool_calls"
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": [{"role": "user", "content": "hi", "tool_call_id": "c"}]})
+    assert refused.value.param == "messages[0].tool_call_id"
+
+
+def test_a04_tool_content_must_be_a_string() -> None:
+    _prepare({"messages": _exchange(_call())})
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "tool_calls": [_call()]},
+                {"role": "tool", "tool_call_id": "call-1"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": messages})
+    assert refused.value.param == "messages[2].content"
+
+
+@pytest.mark.parametrize("value", [None, "", "why"])
+def test_a04_null_placeholder_and_empty_string_reasoning_are_kept(value) -> None:
+    prepared = _prepare({"messages": [{"role": "assistant", "content": "hi", "reasoning_content": value}]})
+    decoded = prepared.decoded_body()["messages"][0]["reasoning_content"]
+    assert decoded == value and (decoded is None) == (value is None)
+
+
+def test_a04_reasoning_content_is_assistant_only() -> None:
+    for message in ({"role": "user", "content": "hi", "reasoning_content": None},
+                    {"role": "user", "content": "hi", "reasoning_content": "why"}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": [message]})
+        assert refused.value.param == "messages[0].reasoning_content"
+
+
+def test_a04_plain_null_assistant_content_is_still_refused() -> None:
+    with pytest.raises(EnvelopeError):
+        _prepare({"messages": [{"role": "assistant", "content": None}]})
+
+
+def test_a04_out_of_order_results_and_serial_batches_pass() -> None:
+    messages = [{"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [_call("c-1"), _call("c-2", name="other")]},
+                {"role": "tool", "tool_call_id": "c-2", "content": "{}"},
+                {"role": "tool", "tool_call_id": "c-1", "content": "{}"},
+                {"role": "assistant", "content": "done"}]
+    prepared = _prepare({"messages": messages})
+    assert prepared.requires_tools  # the history still demands the capability
+
+    serial = [{"role": "user", "content": "hi"},
+              {"role": "assistant", "tool_calls": [_call("c-1")]},
+              {"role": "tool", "tool_call_id": "c-1", "content": "{}"},
+              {"role": "assistant", "tool_calls": [_call("c-2")]},
+              {"role": "tool", "tool_call_id": "c-2", "content": "{}"}]
+    _prepare({"messages": serial})  # a new batch after a closed one is legal
+
+
+def test_a04_orphan_duplicate_and_incomplete_results_are_refused() -> None:
+    orphan = [{"role": "user", "content": "hi"},
+              {"role": "tool", "tool_call_id": "c-1", "content": "{}"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": orphan})
+    assert refused.value.param == "messages[1].tool_call_id"
+
+    duplicate = [{"role": "user", "content": "hi"},
+                 {"role": "assistant", "tool_calls": [_call("c-1")]},
+                 {"role": "tool", "tool_call_id": "c-1", "content": "{}"},
+                 {"role": "tool", "tool_call_id": "c-1", "content": "{}"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": duplicate})
+    assert refused.value.param == "messages[3].tool_call_id"
+
+    incomplete = [{"role": "user", "content": "hi"},
+                  {"role": "assistant", "tool_calls": [_call("c-1"), _call("c-2")]},
+                  {"role": "tool", "tool_call_id": "c-1", "content": "{}"},
+                  {"role": "user", "content": "again"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": incomplete})
+    assert refused.value.param == "messages[3].role"
+
+    trailing = [{"role": "user", "content": "hi"}, {"role": "assistant", "tool_calls": [_call("c-1")]}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": trailing})
+    assert refused.value.param == "messages"
+
+    duplicated_call_id = [{"role": "user", "content": "hi"},
+                          {"role": "assistant", "tool_calls": [_call("c-1")]},
+                          {"role": "tool", "tool_call_id": "c-1", "content": "{}"},
+                          {"role": "assistant", "tool_calls": [_call("c-1")]}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": duplicated_call_id})
+    assert refused.value.param == "messages[3].tool_calls"
+
+
+def test_a04_history_without_chat_capability_is_refused() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _exchange(_call())}, capabilities=("vision",))
+    assert refused.value.code == "capability_mismatch" and refused.value.param == "tools"
+
+
+def test_a04_history_calls_are_checked_without_current_tools() -> None:
+    prepared = _prepare({"messages": _exchange(_call())})  # no top-level tools at all
+    assert prepared.requires_tools
+
+
+def test_a06_local_explicit_effort_and_reasoning_require_thinking() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "reasoning_effort": "low"}, capabilities=("chat",))
+    assert refused.value.code == "capability_mismatch" and refused.value.param == "reasoning_effort"
+
+    history = [{"role": "assistant", "content": "hi", "reasoning_content": "why"}]
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": history}, capabilities=("chat",))
+    assert refused.value.code == "capability_mismatch" and refused.value.param == "messages"
+
+    placeholder = [{"role": "assistant", "content": "hi", "reasoning_content": None}]
+    assert not _prepare({"messages": placeholder}, capabilities=("chat",)).requires_thinking
+
+    empty = [{"role": "assistant", "content": "hi", "reasoning_content": ""}]
+    assert _prepare({"messages": empty}).requires_thinking
+
+
+def test_a06_local_an_unlisted_effort_value_is_refused() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        _prepare({"messages": _chat_messages(), "reasoning_effort": "high"})
+    assert refused.value.code == "contract_violation" and refused.value.param == "reasoning_effort"
+    _prepare({"messages": _chat_messages(), "reasoning_effort": "none"})
+
+
+def test_a06_local_new_capability_models_refuse_template_overrides() -> None:
+    for field in sorted(SYNTHETIC_POLICY.denied_template_fields):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), field: None})
+        assert refused.value.code == "contract_violation" and refused.value.param == field
+
+    # A model without tools/thinking keeps the historical passthrough.
+    for field in sorted(SYNTHETIC_POLICY.denied_template_fields):
+        _prepare({"messages": _chat_messages(), field: "value"}, capabilities=("chat", "vision"))
+
+
+def test_a06_local_tool_choice_association_matrix() -> None:
+    tools = [_tool()]
+    _prepare({"messages": _chat_messages(), "tools": tools})
+    _prepare({"messages": _chat_messages(), "tools": tools, "tool_choice": "auto"})
+    _prepare({"messages": _chat_messages(), "tools": tools, "tool_choice": "required"})
+    _prepare({"messages": _chat_messages(), "tools": tools,
+              "tool_choice": {"type": "function", "function": {"name": "get_weather"}}})
+    _prepare({"messages": _chat_messages(), "tools": [], "tool_choice": "none"})
+    _prepare({"messages": _chat_messages(), "parallel_tool_calls": False})
+
+    for body in ({"tools": [], "tool_choice": "auto"},
+                 {"tools": [], "tool_choice": "required"},
+                 {"tools": [], "tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+                 {"tools": tools, "tool_choice": {"type": "function", "function": {"name": "missing"}}}):
+        with pytest.raises(EnvelopeError) as refused:
+            _prepare({"messages": _chat_messages(), **body})
+        assert refused.value.code == "contract_violation"
+        assert refused.value.param.startswith("tool_choice")

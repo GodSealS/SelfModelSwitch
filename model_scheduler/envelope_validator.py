@@ -32,6 +32,7 @@ import binascii
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
@@ -56,6 +57,20 @@ TokenCounter = Callable[[list[Any], int], Awaitable[int]]
 
 
 DEFAULT_OUTPUT_BUDGET = 4096  # what an unbudgeted request may consume at most (TC02)
+
+# TC03/TC04: the compat chat request contract. Shapes are refused with
+# `contract_violation`; their byte and count budgets with `envelope_exceeded`.
+MAX_TOOLS = 32
+MAX_TOOL_OBJECT_BYTES = 8_192
+MAX_TOOLS_ARRAY_BYTES = 65_536
+MAX_CALLS_PER_ASSISTANT = 32
+MAX_HISTORY_ARGUMENTS_BYTES = 262_144
+MAX_CALL_ID_BYTES = 64
+TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
+TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+#: Capabilities that change the request contract itself: their models refuse
+#: every template override and are the only ones that consult the effort set.
+_NEW_MODEL_CAPABILITIES = frozenset({"tools", "thinking"})
 
 
 class EnvelopeError(ValueError):
@@ -150,7 +165,12 @@ def collect_image_sizes(messages: Any) -> list[tuple[int, int]]:
         raise EnvelopeError("messages must be a non-empty list")
     for message in messages:
         item = _json_object(message, "message")
-        for part in _message_parts(item.get("content")):
+        content = item.get("content")
+        # TC04: an assistant turn that carries tool calls may leave its content
+        # out (absent or null); such a turn contributes no parts to scan.
+        if content is None and item.get("role") == "assistant" and item.get("tool_calls"):
+            continue
+        for part in _message_parts(content):
             if not isinstance(part, dict):
                 raise EnvelopeError("message part must be an object")
             kind = part.get("type")
@@ -188,15 +208,19 @@ class OutputBudgetPolicy(Protocol):
     policy_id: str
     recognized_output_fields: frozenset[str]
     supported_output_fields: frozenset[str]
+    effort_values: frozenset[str]
+    denied_template_fields: frozenset[str]
 
 
 @dataclass(frozen=True)
 class FixedOutputBudgetPolicy:
-    """The one runtime policy CT02 knows; CT06 keys it per runtime (TC01)."""
+    """The one runtime policy CT02/CT04 know; CT06 keys it per runtime (TC01)."""
 
     policy_id: str
     recognized_output_fields: frozenset[str]
     supported_output_fields: frozenset[str]
+    effort_values: frozenset[str] = frozenset()
+    denied_template_fields: frozenset[str] = frozenset()
 
 
 #: Recognised and supported come from CT01's probe-e material: on image
@@ -204,10 +228,21 @@ class FixedOutputBudgetPolicy:
 #: exhausted the budget and reported `finish_reason=length`). Until CT06 binds
 #: the policy to `(profile_id, image_digest, model_sha256)`, this is the fixed
 #: image's own policy and no other runtime may be assumed to share it.
+#:
+#: `effort_values` is CT01's candidate empty list: D06 did not run, so the
+#: allowed values are NOT established. The empty set is the fail-closed software
+#: default — an explicit effort is refused, never forwarded — and it is not a
+#: claim about the image; CT06 must register the probed set before serving a
+#: thinking model. `denied_template_fields` is CT01's D09 material: every
+#: template/parse override the fixed image forwards.
 DEFAULT_OUTPUT_POLICY = FixedOutputBudgetPolicy(
     policy_id="llama-cpp-4bc272f-baseline",
     recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
     supported_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+    effort_values=frozenset(),
+    denied_template_fields=frozenset(
+        {"chat_template", "chat_template_kwargs", "generation_prompt", "parse_tool_calls", "reasoning_format"}
+    ),
 )
 
 
@@ -260,53 +295,335 @@ def normalize_output(payload: Mapping, envelope, policy: OutputBudgetPolicy) -> 
     return body, field, effective
 
 
-def _requires_tools(payload: Mapping) -> bool:
-    """Projection only: TC04 owns the authoritative rule and the capability refusal."""
-    if payload.get("tools"):
-        return True
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return False
-    return any(isinstance(message, Mapping) and (message.get("tool_calls") or message.get("role") == "tool")
-               for message in messages)
+# ---------------------------------------------------------------------------
+# TC03/TC04: the request contract
+#
+# The stage order is fixed (contracts.md TC03): one output budget and n (TC02),
+# then the new field shapes, then their byte/count budgets, then what the whole
+# request needs of the model (capability demand and the template-override
+# refusal), and last the cross-field rules and the tool-history state machine.
+# Within one array the index decides; across fields the documented order does.
 
 
-def _requires_thinking(payload: Mapping) -> bool:
-    if "reasoning_effort" in payload:
-        return True
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return False
-    return any(isinstance(message, Mapping) and message.get("reasoning_content") is not None
-               for message in messages)
+def _contract(param: str, message: str) -> ChatContractError:
+    return ChatContractError("contract_violation", param, message)
+
+
+def _limit(param: str, message: str) -> ChatContractError:
+    return ChatContractError("envelope_exceeded", param, message)
+
+
+def _object(value: Any, param: str) -> dict:
+    if not isinstance(value, dict):
+        raise _contract(param, "expected an object")
+    return value
+
+
+def _call_id(value: Any, param: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise _contract(param, "expected a non-empty string")
+    if "\x00" in value:
+        raise _contract(param, "must not contain NUL")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _contract(param, "must be valid UTF-8") from exc
+    return value
+
+
+_TOOL_KEYS = frozenset({"type", "function"})
+_TOOL_FUNCTION_KEYS = frozenset({"name", "description", "parameters", "strict"})
+_TOOL_CALL_KEYS = frozenset({"id", "type", "function"})
+_TOOL_CALL_FUNCTION_KEYS = frozenset({"name", "arguments"})
+
+
+def _validate_tools_shape(body: Mapping) -> list[Any] | None:
+    """Stage 2: the tools array and every tool/function object in it."""
+    if "tools" not in body:
+        return None
+    raw = body["tools"]
+    if not isinstance(raw, list):
+        raise _contract("tools", "expected an array")
+    names: set[str] = set()
+    for index, tool in enumerate(raw):
+        where = f"tools[{index}]"
+        item = _object(tool, where)
+        unknown = sorted(set(item) - _TOOL_KEYS)
+        if unknown:
+            raise _contract(where, f"unknown fields: {', '.join(unknown)}")
+        if set(item) != _TOOL_KEYS:
+            raise _contract(where, "type and function are required")
+        if item["type"] != "function":
+            raise _contract(f"{where}.type", "only function tools are supported")
+        function = _object(item["function"], f"{where}.function")
+        unknown = sorted(set(function) - _TOOL_FUNCTION_KEYS)
+        if unknown:
+            raise _contract(f"{where}.function", f"unknown fields: {', '.join(unknown)}")
+        name = function.get("name")
+        if not isinstance(name, str) or not TOOL_NAME_RE.fullmatch(name):
+            raise _contract(f"{where}.function.name", "expected 1..64 of [A-Za-z0-9_-]")
+        if name in names:
+            raise _contract("tools", f"duplicate tool name {name!r}")
+        names.add(name)
+        if "description" in function and not isinstance(function["description"], str):
+            raise _contract(f"{where}.function.description", "expected a string")
+        if "parameters" in function and not isinstance(function["parameters"], dict):
+            raise _contract(f"{where}.function.parameters", "expected an object")
+        if "strict" in function:
+            strict = function["strict"]
+            if isinstance(strict, bool) and strict:
+                raise _contract(f"{where}.function.strict", "strict tools are not supported")
+            if not isinstance(strict, bool):
+                raise _contract(f"{where}.function.strict", "expected a boolean")
+    return raw
+
+
+def _validate_tool_choice_shape(body: Mapping) -> None:
+    """Stage 2: structure only; the association with tools is a stage-5 rule."""
+    if "tool_choice" not in body:
+        return
+    choice = body["tool_choice"]
+    if isinstance(choice, str):
+        if choice not in TOOL_CHOICE_STRINGS:
+            raise _contract("tool_choice", "expected auto, none, required or a function object")
+        return
+    item = _object(choice, "tool_choice")
+    if set(item) != {"type", "function"}:
+        raise _contract("tool_choice", "a named choice has exactly type and function")
+    if item["type"] != "function":
+        raise _contract("tool_choice.type", "only function choices are supported")
+    function = _object(item["function"], "tool_choice.function")
+    if set(function) != {"name"}:
+        raise _contract("tool_choice.function", "a named choice has exactly name")
+    name = function["name"]
+    if not isinstance(name, str) or not name:
+        raise _contract("tool_choice.function.name", "expected a non-empty string")
+
+
+def _validate_parallel_tool_calls_shape(body: Mapping) -> None:
+    if "parallel_tool_calls" in body and body["parallel_tool_calls"] is not False:
+        raise _contract("parallel_tool_calls", "only false is supported")
+
+
+def _validate_reasoning_effort_shape(body: Mapping) -> None:
+    if "reasoning_effort" not in body:
+        return
+    value = body["reasoning_effort"]
+    if not isinstance(value, str) or not value:
+        raise _contract("reasoning_effort", "expected a non-empty string")
+
+
+def _validate_message_shapes(messages: list) -> None:
+    """Stage 2: the new per-message fields and their pairing with the role."""
+    for index, message in enumerate(messages):
+        where = f"messages[{index}]"
+        item = _object(message, where)
+        role = item.get("role")
+        if "tool_calls" in item:
+            if role != "assistant":
+                raise _contract(f"{where}.tool_calls", "tool_calls is only allowed on assistant messages")
+            calls = item["tool_calls"]
+            if not isinstance(calls, list) or not calls:
+                raise _contract(f"{where}.tool_calls", "expected a non-empty array")
+            for call_index, call in enumerate(calls):
+                call_where = f"{where}.tool_calls[{call_index}]"
+                entry = _object(call, call_where)
+                unknown = sorted(set(entry) - _TOOL_CALL_KEYS)
+                if unknown:
+                    raise _contract(call_where, f"unknown fields: {', '.join(unknown)}")
+                if set(entry) != _TOOL_CALL_KEYS:
+                    raise _contract(call_where, "id, type and function are required")
+                if entry["type"] != "function":
+                    raise _contract(f"{call_where}.type", "only function calls are supported")
+                _call_id(entry["id"], f"{call_where}.id")
+                function = _object(entry["function"], f"{call_where}.function")
+                if set(function) != _TOOL_CALL_FUNCTION_KEYS:
+                    raise _contract(f"{call_where}.function", "name and arguments are required")
+                if not isinstance(function["name"], str) or not function["name"]:
+                    raise _contract(f"{call_where}.function.name", "expected a non-empty string")
+                if not isinstance(function["arguments"], str):
+                    raise _contract(f"{call_where}.function.arguments", "expected a string")
+        if "tool_call_id" in item:
+            if role != "tool":
+                raise _contract(f"{where}.tool_call_id", "tool_call_id is only allowed on tool messages")
+            _call_id(item["tool_call_id"], f"{where}.tool_call_id")
+        if role == "tool" and not isinstance(item.get("content"), str):
+            raise _contract(f"{where}.content", "tool content must be a string")
+        if "reasoning_content" in item:
+            if role != "assistant":
+                raise _contract(f"{where}.reasoning_content",
+                                "reasoning_content is only allowed on assistant messages")
+            value = item["reasoning_content"]
+            if value is not None and not isinstance(value, str):
+                raise _contract(f"{where}.reasoning_content", "expected a string or null")
+
+
+def _check_tools_limits(tools: list[Any] | None) -> None:
+    """Stage 3: the tools count and the two byte budgets, on the canonical JSON."""
+    if tools is None:
+        return
+    if len(tools) > MAX_TOOLS:
+        raise _limit("tools", f"at most {MAX_TOOLS} tools")
+    for index, tool in enumerate(tools):
+        if len(canonical_json_bytes(tool)) > MAX_TOOL_OBJECT_BYTES:
+            raise _limit(f"tools[{index}]", f"a tool must fit in {MAX_TOOL_OBJECT_BYTES} bytes")
+    if len(canonical_json_bytes(tools)) > MAX_TOOLS_ARRAY_BYTES:
+        raise _limit("tools", f"the tools array must fit in {MAX_TOOLS_ARRAY_BYTES} bytes")
+
+
+def _check_message_limits(messages: list) -> None:
+    """Stage 3: per-assistant call counts, the argument total and call-id bytes."""
+    for index, item in enumerate(messages):
+        calls = item.get("tool_calls")
+        if calls and len(calls) > MAX_CALLS_PER_ASSISTANT:
+            raise _limit(f"messages[{index}].tool_calls", f"at most {MAX_CALLS_PER_ASSISTANT} calls")
+    total = 0
+    for item in messages:
+        for call in item.get("tool_calls") or []:
+            total += len(call["function"]["arguments"].encode("utf-8"))
+    if total > MAX_HISTORY_ARGUMENTS_BYTES:
+        raise _limit("messages", f"history arguments must fit in {MAX_HISTORY_ARGUMENTS_BYTES} bytes")
+    for index, item in enumerate(messages):
+        for call_index, call in enumerate(item.get("tool_calls") or []):
+            if len(call["id"].encode("utf-8")) > MAX_CALL_ID_BYTES:
+                raise _limit(f"messages[{index}].tool_calls[{call_index}].id",
+                             f"a call id must fit in {MAX_CALL_ID_BYTES} bytes")
+        if "tool_call_id" in item and len(item["tool_call_id"].encode("utf-8")) > MAX_CALL_ID_BYTES:
+            raise _limit(f"messages[{index}].tool_call_id",
+                         f"a call id must fit in {MAX_CALL_ID_BYTES} bytes")
+
+
+def _capability_demand(body: Mapping, messages: list) -> tuple[bool, bool]:
+    """What the whole request needs of the model (TC03 stage 4)."""
+    tools = body.get("tools")
+    choice = body.get("tool_choice")
+    requires_tools = bool(tools) or isinstance(choice, dict) or choice == "required" or any(
+        item.get("tool_calls") or item.get("role") == "tool" for item in messages)
+    requires_thinking = "reasoning_effort" in body or any(
+        item.get("role") == "assistant" and item.get("reasoning_content") is not None for item in messages)
+    return requires_tools, requires_thinking
+
+
+def _check_capability_demand(requires_tools: bool, requires_thinking: bool, body: Mapping,
+                             capabilities: Iterable[str]) -> None:
+    caps = frozenset(str(item) for item in capabilities)
+    if requires_tools and "tools" not in caps:
+        raise EnvelopeError("this request requires the tools capability", "capability_mismatch", "tools")
+    if requires_thinking and "thinking" not in caps:
+        param = "reasoning_effort" if "reasoning_effort" in body else "messages"
+        raise EnvelopeError("this request requires the thinking capability", "capability_mismatch", param)
+
+
+def _check_denied_template_fields(body: Mapping, capabilities: Iterable[str],
+                                  policy: OutputBudgetPolicy) -> None:
+    """A model that turns on tools/thinking refuses every template override (TC03)."""
+    if not (frozenset(str(item) for item in capabilities) & _NEW_MODEL_CAPABILITIES):
+        return
+    for field in sorted(set(body) & policy.denied_template_fields):
+        raise _contract(field, f"{field} must not be overridden on a tools/thinking model")
+
+
+def _check_effort_values(body: Mapping, capabilities: Iterable[str], policy: OutputBudgetPolicy) -> None:
+    if "reasoning_effort" not in body:
+        return
+    if "thinking" not in frozenset(str(item) for item in capabilities):
+        return  # stage 4 already refused this request
+    value = body["reasoning_effort"]
+    if value not in policy.effort_values:
+        raise _contract("reasoning_effort", f"unsupported reasoning_effort {value!r}")
+
+
+def _check_tool_choice_association(body: Mapping, tools: list[Any] | None) -> None:
+    """Stage 5: a choice may only reference the tools this request carries."""
+    choice = body.get("tool_choice")
+    names = {tool["function"]["name"] for tool in tools} if tools else set()
+    if names:
+        if choice is None or (isinstance(choice, str) and choice in TOOL_CHOICE_STRINGS):
+            return
+        if isinstance(choice, dict):
+            if choice["function"]["name"] not in names:
+                raise _contract("tool_choice.function.name", "the named function is not in tools")
+            return
+        raise _contract("tool_choice", "unsupported tool choice")  # shapes are closed; defensive
+    if choice is None or choice == "none":
+        return
+    raise _contract("tool_choice", "this tool_choice needs a non-empty tools array")
+
+
+def validate_tool_history(messages: list) -> None:
+    """TC04: the submitted history must pair every call with exactly one result.
+
+    Results may arrive in any order inside their batch, but a batch is never
+    interrupted and a call is never left open at the end.
+    """
+    seen_ids: set[str] = set()
+    pending: dict[str, str] = {}
+    for index, item in enumerate(messages):
+        where = f"messages[{index}]"
+        role = item.get("role")
+        if role == "tool":
+            call_id = item["tool_call_id"]
+            if call_id not in pending:
+                raise _contract(f"{where}.tool_call_id", "orphan or duplicate result")
+            del pending[call_id]
+            continue
+        if pending:
+            raise _contract(f"{where}.role", "tool results are incomplete")
+        for call in item.get("tool_calls") or []:
+            if call["id"] in seen_ids:
+                raise _contract(f"{where}.tool_calls", "duplicate call id")
+            seen_ids.add(call["id"])
+            pending[call["id"]] = call["function"]["name"]
+    if pending:
+        raise _contract("messages", "tool results are incomplete")
 
 
 def prepare_chat(payload: Mapping, *, capabilities: Iterable[str], envelope,
                  policy: OutputBudgetPolicy) -> PreparedChat:
-    """Prepare one compat chat/vision body: the budget is decided here or nowhere (TC02).
+    """Prepare one compat chat/vision body: every local rule is decided here (TC02/TC03/TC04).
 
-    Pure: no I/O, no counting, no capability refusal beyond what the shape gives.
-    The caller's payload is never modified — the prepared body is a deep copy, so
-    the count and the dispatch can be compared byte for byte later.
+    Pure: no I/O, no counting. The caller's payload is never modified — the
+    prepared body is a deep copy, so the count and the dispatch can be compared
+    byte for byte later, and a local refusal has made no runtime call at all.
     """
     if not isinstance(payload, Mapping):
         raise EnvelopeError("chat input requires an object")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise EnvelopeError("chat input requires a non-empty messages list")
-    image_count = len(collect_image_sizes(messages))
+    # Stage 1 (TC02): the one output budget and n.
     body, field, output_tokens = normalize_output(payload, envelope, policy)
+    body_messages = body["messages"]
+    # Stage 2 (TC03): the new field shapes.
+    tools = _validate_tools_shape(body)
+    _validate_tool_choice_shape(body)
+    _validate_parallel_tool_calls_shape(body)
+    _validate_reasoning_effort_shape(body)
+    _validate_message_shapes(body_messages)
+    # Stage 3 (TC03): their byte and count budgets.
+    _check_tools_limits(tools)
+    _check_message_limits(body_messages)
+    # Stage 4 (TC03): what the request needs, then the template-override refusal.
+    requires_tools, requires_thinking = _capability_demand(body, body_messages)
+    _check_capability_demand(requires_tools, requires_thinking, body, capabilities)
+    _check_denied_template_fields(body, capabilities, policy)
+    # Stage 5 (TC03/TC04): effort values, the tools association, the history and
+    # the existing image rules.
+    _check_effort_values(body, capabilities, policy)
+    _check_tool_choice_association(body, tools)
+    validate_tool_history(body_messages)
+    sizes = collect_image_sizes(body_messages)
+    check_images(sizes, capabilities=capabilities, envelope=envelope,
+                 operation="vision" if sizes else "chat")
     body_json = canonical_json_bytes(body)
-    # `capabilities` is part of the contract: TC04's stage 4 turns it into the
-    # capability refusal. CT02 only projects the body, so it is unused here.
     return PreparedChat(body_json=body_json,
                         body_sha256=hashlib.sha256(body_json).hexdigest(),
                         model_id=str(payload.get("model") or ""),
-                        image_count=image_count,
+                        image_count=len(sizes),
                         output_field=field,
                         output_tokens=output_tokens,
-                        requires_tools=_requires_tools(body),
-                        requires_thinking=_requires_thinking(body),
+                        requires_tools=requires_tools,
+                        requires_thinking=requires_thinking,
                         policy_id=policy.policy_id)
 
 

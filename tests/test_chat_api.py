@@ -472,3 +472,170 @@ def test_a02_n_one_and_sampling_extras_survive_the_prepared_body(tmp_path) -> No
     assert dispatched["n"] == 1 and dispatched["temperature"] == 0.25
     assert dispatched["custom_extension"] == {"keep": [1, 2]}
     assert dispatched["max_tokens"] == 64
+
+
+# --------------------------------------------------------------------------- TC03/TC04: local refusals make no runtime call
+
+
+CONTRACT_POLICY = FixedOutputBudgetPolicy(
+    policy_id="synthetic-contract-policy",
+    recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+    supported_output_fields=frozenset({"max_tokens", "max_completion_tokens"}),
+    effort_values=frozenset({"none", "low"}),
+    denied_template_fields=frozenset({"chat_template", "chat_template_kwargs", "reasoning_format",
+                                      "parse_tool_calls", "generation_prompt"}),
+)
+
+
+class RecordingScheduler:
+    """Counts the runtime calls a local refusal must never reach."""
+
+    def __init__(self) -> None:
+        self.acquired: list[str] = []
+        self.warmed: list[str] = []
+        self.releases: list[Outcome] = []
+
+    async def acquire(self, model_id: str, request_id: str, deadline: float) -> Lease:
+        self.acquired.append(model_id)
+        return Lease("lease", request_id, model_id, 1)
+
+    async def release(self, lease: Lease, outcome: Outcome, tokens=None) -> None:
+        self.releases.append(outcome)
+
+    async def warm(self, model_id: str, deadline: float) -> None:
+        self.warmed.append(model_id)
+
+
+def _contract_fixture(tmp_path: Path, *, new_capabilities: bool) -> Path:
+    """The public software fixture, optionally as a chat+vision+tools+thinking model."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "sms_v2_chat_fixture", Path(__file__).resolve().parent / "test_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    text = module.V2_CHAT_FIXTURE
+    if new_capabilities:
+        text = text.replace("capabilities: [chat, vision]",
+                            "capabilities: [chat, vision, tools, thinking]")
+        assert "tools, thinking" in text
+    path = tmp_path / ("contract-new-capabilities.yaml" if new_capabilities else "contract-chat-only.yaml")
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _post_contract(tmp_path: Path, payload: dict, *, new_capabilities: bool = False, counter=8):
+    """One request through the fixture, with every runtime call counted."""
+    from model_scheduler.config import load_config
+
+    gateway = RecordingGateway()
+    scheduler = RecordingScheduler()
+    calls = {"counter": 0}
+
+    async def counting_counter(model_id, messages, image_count):
+        calls["counter"] += 1
+        if counter is None:
+            raise RuntimeError("the runtime cannot tokenize yet")
+        return counter
+
+    app = create_app(config=load_config(_contract_fixture(tmp_path, new_capabilities=new_capabilities)),
+                     scheduler=scheduler, gateway=gateway, token_counter=counting_counter,
+                     chat_policy=CONTRACT_POLICY)
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=payload)
+    return response, scheduler, gateway, calls
+
+
+_USER = {"role": "user", "content": "hi"}
+
+
+def _tool() -> dict:
+    return {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+
+
+def _call(**overrides) -> dict:
+    call = {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+    call.update(overrides)
+    return call
+
+
+LOCAL_REFUSALS = [
+    ("tools-null", {"tools": None}, "contract_violation", "tools"),
+    ("tool-name", {"tools": [{"type": "function", "function": {"name": "bad.name"}}]},
+     "contract_violation", "tools[0].function.name"),
+    ("tool-choice", {"tools": [_tool()], "tool_choice": "any"}, "contract_violation", "tool_choice"),
+    ("parallel", {"tools": [_tool()], "parallel_tool_calls": True}, "contract_violation", "parallel_tool_calls"),
+    ("effort-shape", {"reasoning_effort": ""}, "contract_violation", "reasoning_effort"),
+    ("orphan-result", {"messages": [_USER, {"role": "tool", "tool_call_id": "call_1", "content": "{}"}]},
+     "contract_violation", "messages[1].tool_call_id"),
+]
+
+
+@pytest.mark.parametrize("name,extra,code,param", LOCAL_REFUSALS, ids=[case[0] for case in LOCAL_REFUSALS])
+def test_a03_a04_a06_local_refusals_are_422_and_make_no_runtime_call(tmp_path, name, extra, code, param) -> None:
+    response, scheduler, gateway, calls = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": [_USER], **extra}, new_capabilities=True)
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == code and error["param"] == param
+    # the refusal is local: not a lease, a warm-up, a token count or a dispatch
+    assert scheduler.acquired == [] and scheduler.warmed == [] and scheduler.releases == []
+    assert calls["counter"] == 0 and gateway.payloads == []
+
+
+@pytest.mark.parametrize("extra,param", [
+    ({"tools": [_tool()]}, "tools"),
+    ({"reasoning_effort": "low"}, "reasoning_effort"),
+    ({"messages": [_USER, {"role": "assistant", "content": "42", "reasoning_content": "why"}]}, "messages"),
+])
+def test_a04_a06_a_model_without_the_new_capabilities_is_refused_before_any_call(tmp_path, extra, param) -> None:
+    response, scheduler, gateway, calls = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": [_USER], **extra})
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "capability_mismatch" and error["param"] == param
+    assert scheduler.acquired == [] and scheduler.warmed == []
+    assert calls["counter"] == 0 and gateway.payloads == []
+
+
+@pytest.mark.parametrize("field", ["chat_template", "chat_template_kwargs", "reasoning_format",
+                                   "parse_tool_calls", "generation_prompt"])
+def test_a06_local_a_new_capability_model_refuses_template_overrides(tmp_path, field) -> None:
+    response, scheduler, gateway, calls = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": [_USER], field: None}, new_capabilities=True)
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "contract_violation" and error["param"] == field
+    assert scheduler.acquired == [] and gateway.payloads == [] and calls["counter"] == 0
+
+
+def test_a03_the_accepted_tool_fields_reach_the_upstream_unchanged(tmp_path) -> None:
+    tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+    sent = {"model": "qwen-small", "messages": [_USER], "tools": [_tool()], "tool_choice": tool_choice,
+            "parallel_tool_calls": False, "max_tokens": 64, "reasoning_effort": "low"}
+    response, scheduler, gateway, calls = _post_contract(tmp_path, sent, new_capabilities=True)
+
+    assert response.status_code == 200, response.text
+    dispatched = gateway.payloads[0]
+    assert dispatched["tools"] == [_tool()] and dispatched["tool_choice"] == tool_choice
+    assert dispatched["parallel_tool_calls"] is False and dispatched["reasoning_effort"] == "low"
+    assert dispatched["max_tokens"] == 64 and "max_completion_tokens" not in dispatched
+    assert scheduler.acquired == ["qwen-small"] and scheduler.releases == [Outcome.SUCCESS]
+    assert calls["counter"] == 1
+
+
+def test_a04_a_closed_history_reaches_the_upstream_with_its_ids(tmp_path) -> None:
+    messages = [_USER, {"role": "assistant", "tool_calls": [_call()]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"marker\":\"OK\"}"}]
+    response, scheduler, gateway, calls = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": messages, "max_tokens": 64}, new_capabilities=True)
+
+    assert response.status_code == 200, response.text
+    dispatched = gateway.payloads[0]["messages"]
+    assert dispatched[1]["tool_calls"][0]["id"] == "call_1"
+    assert dispatched[1]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert dispatched[2]["tool_call_id"] == "call_1"
+    assert scheduler.acquired == ["qwen-small"] and calls["counter"] == 1

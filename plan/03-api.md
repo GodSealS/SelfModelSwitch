@@ -16,7 +16,13 @@ status 展示实际 boot_id、模型状态、execution 数、预留字节和 rea
 模型能力与 internal operation 的分离已由 CT03 交付：模型能力闭集（`contracts_v2.MODEL_CAPABILITIES`）为
 `chat|vision|embeddings|rerank|tools|thinking`（`tools`/`thinking` 依赖 chat、资产仍为 model），
 而 control protocol v1 的 operation 闭集（`control_protocol_v1.EXECUTION_OPERATIONS`）
-保持 `chat|vision|embeddings|rerank`；控制协议不因此增加工具 operation，工具/思考字段规则仍为待实施规范。
+保持 `chat|vision|embeddings|rerank`；控制协议不因此增加工具 operation。
+工具/思考请求的字段与错误优先级已由 CT04 交付（[TC03/TC04](tool-calling-and-reasoning/contracts.md)）：
+`tools`/`tool_choice`/`parallel_tool_calls`/`reasoning_effort`/`assistant.tool_calls`/`reasoning_content`
+的形状与字节、计数限制，能力需求（tools/thinking→chat，图片→vision），新能力模型的模板覆盖拒绝，
+以及工具历史状态机，全部在 `prepare_chat` 内本地判定——拒绝时未取得租约、未计数、未派发。
+**顶层未知 extra 仍原样透传**（只对登记 tools/thinking 的模型拒绝 policy 列出的模板覆盖字段），
+不得据此收紧既有兼容面的字段接受范围。
 
 ## 2. 拟议通用控制接口
 
