@@ -719,8 +719,10 @@ class ChatProbe:
                                            {"model_id": model_id, "url": url, "method": "POST",
                                             "headers": _redact(self._headers()), "body": payload})
         started = self.clock.utc_now()
+        # A cold load happens inside this call, so the frozen *total* bounds the wait;
+        # a per-chunk idle bound would cut a load that legitimately takes minutes.
         answer = self.http.request("POST", url, headers=self._headers(), body=body,
-                                   timeout=self.site.timeouts.read_idle_seconds)
+                                   timeout=self.site.timeouts.total_seconds)
         elapsed = (self.clock.utc_now() - started).total_seconds()
         parsed: Any = None
         try:
@@ -742,7 +744,7 @@ class ChatProbe:
         url = model.upstream_base_url.rstrip("/") + path
         body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         answer = self.http.request(method, url, headers=self._headers(), body=body,
-                                   timeout=self.site.timeouts.read_idle_seconds)
+                                   timeout=self.site.timeouts.total_seconds)
         parsed: Any = None
         try:
             parsed = answer.json()
@@ -833,7 +835,7 @@ class ChatProbe:
                 identity = None
             report.setdefault("inspect", []).append({"digest": digest, "exit": done.returncode,
                                                      "resolved_id": _first_id(identity),
-                                                     "matches_site": _first_id(identity) == digest})
+                                                     "matches_site": _matches_digest(identity, digest)})
             for label, flag in (("version", "--version"), ("help", "--help")):
                 # A short process with no model and no GPU: the CUDA libraries are
                 # bind-mounted read-only, so no compute context is created.
@@ -1050,30 +1052,22 @@ class ChatProbe:
         supported: set[str] = set()
         for model_id in self.site.models:
             model_report: dict[str, Any] = {}
-            # "none" sends no budget field at all, which is how the default is measured.
-            for field in (*BUDGET_FIELDS, "none"):
+            for field in BUDGET_FIELDS:
                 values: tuple[int | None, ...] = ((BUDGET_SMALL, BUDGET_LARGE) if field == "max_tokens"
-                                                  else (BUDGET_SMALL,) if field != "none" else (None,))
+                                                  else (BUDGET_SMALL,))
                 for value in values:
                     payload: dict[str, Any] = {"model": model_id,
-                                               "messages": [{"role": "user", "content": BUDGET_PROMPT}]}
-                    if field != "none" and value is not None:
-                        payload[field] = value
+                                               "messages": [{"role": "user", "content": BUDGET_PROMPT}],
+                                               field: value}
                     if ignore_eos:
                         payload["ignore_eos"] = True
-                    answer = ctx.chat(f"{model_id}-{field}-{value if value is not None else 'default'}",
-                                      model_id, payload)
-                    key = f"{field}-{value if value is not None else 'default'}"
+                    answer = ctx.chat(f"{model_id}-{field}-{value}", model_id, payload)
+                    key = f"{field}-{value}"
                     if answer is None:
                         model_report[key] = {"status": None, "reason": "request_limit"}
                         statuses.append(STATUS_NOT_RUN)
                         continue
                     observation = _summarise_completion(answer)
-                    if value is None:
-                        # The default run only records what an unbounded request does.
-                        model_report[key] = observation
-                        statuses.append(STATUS_PASSED if observation["http_status"] == 200 else STATUS_FAILED)
-                        continue
                     exhausted = (observation["finish_reason"] == "length"
                                  and isinstance(observation["completion_tokens"], int)
                                  and 0 < observation["completion_tokens"] <= value)
@@ -1088,6 +1082,21 @@ class ChatProbe:
                         statuses.append(STATUS_FAILED)  # a short answer does not prove the budget
                         observation["not_proven"] = True
             per_field[model_id] = model_report
+        # The unbudgeted default runs last: nothing is left to collect that a runtime
+        # generating without a bound could disturb.
+        for model_id in self.site.models:
+            payload: dict[str, Any] = {"model": model_id,
+                                       "messages": [{"role": "user", "content": BUDGET_PROMPT}]}
+            if ignore_eos:
+                payload["ignore_eos"] = True
+            answer = ctx.chat(f"{model_id}-none-default", model_id, payload)
+            observation = ({"status": None, "reason": "request_limit"} if answer is None
+                           else _summarise_completion(answer))
+            per_field[model_id]["none-default"] = observation
+            if answer is None:
+                statuses.append(STATUS_NOT_RUN)
+            else:
+                statuses.append(STATUS_PASSED if observation["http_status"] == 200 else STATUS_FAILED)
         ctx.observe("budget", per_field)
         self.helpers["supported_output_fields"] = supported
         actual = {"per_model": per_field, "supported_output_fields": sorted(supported),
@@ -1528,6 +1537,22 @@ def _first_id(document: Any) -> str | None:
         identifier = document[0].get("Id")
         return identifier if isinstance(identifier, str) else None
     return None
+
+
+def _matches_digest(document: Any, digest: str) -> bool:
+    """`sms-llama-cpp@sha256:<hex>` must match the resolved image id's own hex."""
+    expected = digest.rsplit("@", 1)[-1]
+    if not expected or not isinstance(document, list) or not document or not isinstance(document[0], dict):
+        return False
+    entry = document[0]
+    found: list[str] = []
+    identifier = entry.get("Id")
+    if isinstance(identifier, str):
+        found.append(identifier.rsplit("@", 1)[-1])
+    listed = entry.get("RepoDigests")
+    if isinstance(listed, list):
+        found.extend(item.rsplit("@", 1)[-1] for item in listed if isinstance(item, str))
+    return expected in found
 
 
 def _stamp(moment: datetime) -> str:

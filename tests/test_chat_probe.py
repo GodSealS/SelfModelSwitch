@@ -33,6 +33,11 @@ UPSTREAM_7B = "http://127.0.0.1:10002"
 UPSTREAM_27B = "http://127.0.0.1:10003"
 IMAGE_DIGEST = "sms-llama-cpp@sha256:" + "8e" * 32
 VERSION_OUTPUT = "version: 0.4.1-dev (build 1, commit 4bc272f)\nbuilt with GNU 11.4.0 for Linux aarch64\n"
+_TEMPLATE = b"{{ messages }}"
+MODEL_BYTES = (b"GGUF" + struct.pack("<IQQ", 3, 0, 1)
+                + struct.pack("<Q", len(b"tokenizer.chat_template")) + b"tokenizer.chat_template"
+                + struct.pack("<IQ", 8, len(_TEMPLATE)) + _TEMPLATE)
+
 HELP_OUTPUT = ("--jinja, --no-jinja    whether to use jinja template engine for chat\n"
                "--reasoning-format FORMAT  controls thought tags; - deepseek\n"
                "--reasoning-effort LEVEL   reasoning effort level\n"
@@ -43,9 +48,11 @@ HELP_OUTPUT = ("--jinja, --no-jinja    whether to use jinja template engine for 
 
 
 class FakeShell:
-    def __init__(self, *, inspect_id: str = IMAGE_DIGEST, version: str = VERSION_OUTPUT,
+    def __init__(self, *, inspect_id: str = IMAGE_DIGEST, repo_digests: tuple[str, ...] = (IMAGE_DIGEST,),
+                 version: str = VERSION_OUTPUT,
                  help_text: str = HELP_OUTPUT, git_head: str = "a" * 40, dirty: bool = False) -> None:
         self.inspect_id = inspect_id
+        self.repo_digests = list(repo_digests)
         self.version = version
         self.help_text = help_text
         self.git_head = git_head
@@ -56,7 +63,7 @@ class FakeShell:
         self.calls.append(list(argv))
         joined = " ".join(argv)
         if "image inspect" in joined:
-            document = [{"Id": self.inspect_id, "RepoDigests": [IMAGE_DIGEST]}]
+            document = [{"Id": self.inspect_id, "RepoDigests": self.repo_digests}]
             return probe_module.CommandResult(tuple(argv), 0, json.dumps(document), "")
         if "--version" in argv:
             return probe_module.CommandResult(tuple(argv), 0, self.version, "")
@@ -129,8 +136,9 @@ def _site_document(root: Path, *, phase: str = "baseline", request_limit: int = 
                    policy_sha: str | None = None, fixture_sha: str | None = None) -> dict:
     model_root = root / "models"
     model_root.mkdir(exist_ok=True)
+    # Real GGUF metadata, so the template the runtime would use can be read.
     for name in ("7b.gguf", "7b-mmproj.gguf", "27b.gguf", "27b-mmproj.gguf"):
-        (model_root / name).write_bytes(b"gguf-bytes")
+        (model_root / name).write_bytes(MODEL_BYTES)
     (root / "hardware-raw.txt").write_text("hardware\n")
     envelope = {"ctx_size": 8192, "max_input_tokens": 4096, "max_output_tokens": 1024, "max_parallel": 1,
                 "max_image_tokens": 1280, "max_image_edge_pixels": 1024, "max_images": 1}
@@ -138,17 +146,17 @@ def _site_document(root: Path, *, phase: str = "baseline", request_limit: int = 
         "qwen25vl-7b": {"capabilities": list(capabilities), "runtime_id": "llama-cpp-1",
                         "profile_id": "llama-cpp-gguf-v1", "image_digest": IMAGE_DIGEST,
                         "model_path": str(model_root / "7b.gguf"),
-                        "model_sha256": sha_of(b"gguf-bytes"),
+                        "model_sha256": sha_of(MODEL_BYTES),
                         "projector_path": str(model_root / "7b-mmproj.gguf"),
-                        "projector_sha256": sha_of(b"gguf-bytes"), "template_sha256": template_sha,
+                        "projector_sha256": sha_of(MODEL_BYTES), "template_sha256": template_sha,
                         "upstream_base_url": UPSTREAM_7B, "envelope": envelope,
                         "launch_argv": ["docker", "run", "--name", "sms-7b", IMAGE_DIGEST]},
         "qwen36-27b": {"capabilities": list(capabilities), "runtime_id": "llama-cpp-1",
                        "profile_id": "llama-cpp-gguf-v1", "image_digest": IMAGE_DIGEST,
                        "model_path": str(model_root / "27b.gguf"),
-                       "model_sha256": sha_of(b"gguf-bytes"),
+                       "model_sha256": sha_of(MODEL_BYTES),
                        "projector_path": str(model_root / "27b-mmproj.gguf"),
-                       "projector_sha256": sha_of(b"gguf-bytes"), "template_sha256": template_sha,
+                       "projector_sha256": sha_of(MODEL_BYTES), "template_sha256": template_sha,
                        "upstream_base_url": UPSTREAM_27B, "envelope": envelope,
                        "launch_argv": ["docker", "run", "--name", "sms-27b", IMAGE_DIGEST]},
     }
@@ -378,8 +386,19 @@ def test_probe_report_carries_every_case_and_hashed_artifacts(tmp_path):
         assert artifact["size"] == (out.root / artifact["path"]).stat().st_size
 
 
+def test_identity_accepts_a_digest_resolved_to_its_bare_hex(tmp_path):
+    # `docker image inspect` answers with `sha256:<hex>`, while the site names the
+    # image as `repo@sha256:<hex>`; both must be recognised as the same image.
+    probe, _ = _build(tmp_path, http=_always_200(), shell=FakeShell(inspect_id="sha256:" + "8e" * 32))
+    report = probe.probe()
+    case = next(row for row in report["cases"] if row["id"] == "D01")
+    assert case["status"] == "passed", case["reason"]
+    assert case["actual"]["image_digest_mismatch"] == []
+
+
 def test_identity_mismatch_fails_d01(tmp_path):
-    probe, _ = _build(tmp_path, http=_always_200(), shell=FakeShell(inspect_id="sha256:" + "0" * 64))
+    probe, _ = _build(tmp_path, http=_always_200(), shell=FakeShell(inspect_id="sha256:" + "0" * 64,
+                                                                    repo_digests=("other@sha256:" + "0" * 32,)))
     report = probe.probe()
     case = next(row for row in report["cases"] if row["id"] == "D01")
     assert case["status"] == "failed"
