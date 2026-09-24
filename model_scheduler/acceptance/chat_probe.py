@@ -73,6 +73,8 @@ DENIED_TEMPLATE_FIELDS: tuple[str, ...] = ("chat_template", "chat_template_kwarg
 TEMPLATE_REQUEST_FIELDS: tuple[str, ...] = ("messages", "tools", "tool_choice", "parallel_tool_calls",
                                             "reasoning_effort")
 UNKNOWN_FIELD = "sms_probe_unknown_field"
+DEFAULT_NOT_MEASURED = ("the unbudgeted default is not measured on a baseline: an unbounded generation aborted the "
+                        "request and left the model in an error state; CT02 supplies the effective default")
 MAX_ARRAY_ELEMENTS = 20_000_000
 MAX_STRING_BYTES = 64 * 1024 * 1024
 EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -673,8 +675,23 @@ class ChatProbe:
         self._auth: str | None = (os.environ.get(site.auth_env) if site.auth_env else None)
 
     def run_deferred_defaults(self) -> None:
-        """The unbudgeted requests, sent once every other case has its material."""
+        """The unbudgeted requests, sent once every other case has its material.
+
+        Only a candidate can be asked for them. On the baseline an unbudgeted
+        request really does generate without a bound: the run measured it, the
+        request aborted, and both models were left in an error state that needed
+        a restart to clear. CT02 gives the compat surface an effective default,
+        so the same request is safe — and is the honest measurement — once it is
+        deployed.
+        """
         if not self.pending_defaults:
+            return
+        if self.phase != "candidate":
+            for model_id in self.site.models:
+                self._default_observations[model_id] = {"status": None, "reason": "not_measured",
+                                                        "note": DEFAULT_NOT_MEASURED}
+                self._default_statuses.append(STATUS_NEEDS_CANDIDATE)
+            self._default_reason = DEFAULT_NOT_MEASURED
             return
         context = CaseContext(case_id="D02", out=self.out, probe=self)
         for model_id in self.site.models:
@@ -705,7 +722,10 @@ class ChatProbe:
         thinking_targets = self.capability_targets("thinking")
         vision_models = [model_id for model_id, model in self.site.models.items() if "vision" in model.capabilities]
         plan = {"D01": 0,
-                "D02": len(self.site.models) * (len(BUDGET_FIELDS) + 2),
+                # max_tokens is measured at two values; the unbudgeted default is only
+                # asked of a candidate, where CT02 bounds it.
+                "D02": len(self.site.models) * (len(BUDGET_FIELDS) + 1)
+                       + (len(self.site.models) if self.phase == "candidate" else 0),
                 "D03": len(tool_targets) * 5,
                 "D04": len(tool_targets) * 3,
                 "D05": len(tool_targets) * 3,

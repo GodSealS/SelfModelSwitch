@@ -349,6 +349,18 @@ def test_only_an_exhausted_budget_enters_the_supported_set(tmp_path):
     assert case["actual"]["per_model"]["qwen36-27b"]["max_tokens-32"]["exhausted"] is True
 
 
+def test_a_baseline_never_sends_an_unbudgeted_request(tmp_path):
+    http = _always_200(finish_reason="length", completion_tokens=32)
+    probe, _ = _build(tmp_path, http=http, phase="baseline")
+    report = probe.probe()
+    chats = [json.loads(body.decode("utf-8")) for method, url, body in http.calls if body and "chat/completions" in url]
+    assert all(any(field in payload for field in probe_module.BUDGET_FIELDS) for payload in chats)
+    case = next(row for row in report["cases"] if row["id"] == "D02")
+    assert case["status"] == "needs_candidate"
+    assert case["reason"] == probe_module.DEFAULT_NOT_MEASURED
+    assert case["actual"]["per_model"]["qwen36-27b"]["none-default"]["reason"] == "not_measured"
+
+
 def test_the_unbudgeted_default_is_sent_after_every_other_case(tmp_path):
     def handler(method: str, url: str, body: bytes | None) -> HttpResponse:
         if url.endswith("/props"):
@@ -360,7 +372,10 @@ def test_the_unbudgeted_default_is_sent_after_every_other_case(tmp_path):
         return HttpResponse(200, {}, _completion(finish_reason="length", completion_tokens=32))
 
     http = FakeHttp(handler)
-    probe, _ = _build(tmp_path, http=http)
+    site = _write_site(tmp_path, phase="candidate", policy_sha="f" * 64, fixture_sha="e" * 64,
+                       template_sha="d" * 64)
+    probe, _ = _build(tmp_path, http=http, phase="candidate")
+    assert probe.site.phase == "candidate" and probe.site.path == site
     probe.probe()
     chats = [json.loads(body.decode("utf-8")) for method, url, body in http.calls if body and "chat/completions" in url]
     unbudgeted = [payload for payload in chats
