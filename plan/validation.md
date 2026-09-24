@@ -1950,3 +1950,47 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   其中 `probe-c` 是无预算请求破坏部署的直接证据。
 - 未完成项：27B 的 D06/D07 材料未取得（受上述部署行为影响），CT10 候选阶段补齐；
   `effort_values` 未取得，CT06 不得按空集登记；thinking 与工具+思考组合未验证。
+
+### CT02 输出预算有效请求纵向修复（2026-09-24，交付分支 `feature/ct02-output-budget`）
+
+- Python/环境：本地 `/Users/monster/.local/share/selfmodelswitch/venv312/bin/python`（3.12.11，依赖齐备）；
+  目标 `/home/jtzn/self-model-switch-build/venv312/bin/python`（3.12.14）。
+- 软件交付与检查（exit 均为 0）：
+  - `pytest tests/test_envelopes.py tests/test_chat_api.py tests/test_config.py -q` → **86 passed**；
+    全量 `pytest tests -m 'not thor' -q` → **1080 passed、1 skipped、1 deselected**（940.20 s）；
+    `ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+  - 上游 HTTP JSON 捕获（A01/A02）：`RecordingGateway` 断言缺省→1024、4096→1024、64→64；别名保留原字段名并裁剪；
+    多预算字段/0/-1/null/true/1.5/"64" → 422 `contract_violation` 且 acquire/gateway 零调用；`n=1` 通过、其余拒绝；
+    SSE 与非 SSE 同预算；`tests/test_envelopes.py` 覆盖 `normalize_output` 全矩阵。
+  - 提交：`29a894f512a6b2b3ab46537b4401fdc568dc1a09`；push 到 GitHub 与目标镜像后两端 ref 相同
+    （开发机与目标 `git ls-remote origin feature/ct02-output-budget` 均等于该 SHA）。
+- 目标同步（remote/branch/SHA）：checkout `/home/jtzn/SelfModelSwitch`，分支 `feature/ct02-output-budget`，
+  HEAD=`29a894f…`；测试前 `git status --porcelain --untracked-files=all` 为空（`state-pre/git.txt`），
+  测试后进程仍运行于同一 checkout（`state-post/procs.txt`）。
+- 目标执行（UTC 2026-09-24T10:51:48Z—11:14:01Z，证据 `ct02-budget-20260924T105148Z/`）：
+  - 测试前：调度器未运行（llama-swap pid 16492 在跑，7B/27B unloaded）；硬件 `jtzn-desktop` L4T R36.4.7 aarch64、
+    磁盘/GPU/tegrastats 已采集。启动命令：`SELFMODEL_SWITCH_DEPLOYMENT_ID=sms-orin-lab2
+    SELFMODEL_SWITCH_SWAP_CONTROL_URL=http://127.0.0.1:8080 …/venv312/bin/python run.py --config …/deploy2/scheduler-v2.json`
+    （pid 322176，`/live` 200 后开始）。
+  - 用例（工具 `tools/ct02_budget_check.py`；逐例原始 `requests/`、`responses/` 与 `cases.jsonl`）：
+
+| 用例 | 模型 | 请求预算 | HTTP | finish_reason | completion_tokens | 耗时 |
+|---|---|---|---|---|---|---|
+| 7b-max_tokens-32 | 7B | max_tokens=32 | 200 | length | 32 | 7.35 s |
+| 7b-max_completion_tokens-32 | 7B | max_completion_tokens=32 | 200 | length | 32 | 1.70 s |
+| 27b-max_tokens-32 | 27B | max_tokens=32 | 200 | length | 32 | 29.07 s |
+| 27b-max_completion_tokens-32 | 27B | max_completion_tokens=32 | 200 | length | 32 | 7.36 s |
+| 7b-default | 7B | 缺省（SSE） | 200 | **stop**（自然停止，不构成证明） | — | 30.28 s |
+| 7b-ignore_eos-max_tokens-32 | 7B | max_tokens=32 + ignore_eos | 200 | length | 32 | 1.79 s |
+| 7b-ignore_eos-default-usage | 7B | 缺省 + ignore_eos + include_usage（SSE） | 200 | length | **4096** | 196.91 s |
+| 27b-default-usage | 27B | 缺省 + include_usage（SSE） | 200 | length | **1024** | 248.04 s |
+
+  - 结论：显式与别名预算在 7B/27B 均实际到达上游并被耗尽（32→32）；缺省预算
+    `min(4096, envelope.max_output_tokens)` 实际生效（7B=4096、27B=1024）且总输出被精确限制。
+  - 测试后：7B/27B 均 `ready`、generation=2、无 blocked、无 last_error，queue 0、admission 开放；
+    RAM 29597/62841 MB、GR3D 空闲档、温度 55–61 °C；llama-swap 未改动。
+- 失败材料：`7b-default` 的自然停止材料保留（not_proven），未被删除或覆盖；以 `ignore_eos` 重跑补救后仍保留原记录。
+- 最终部署状态：目标 checkout 停在 `feature/ct02-output-budget` @ `29a894f…`；调度器（pid 322176）以 CT02 代码在线，
+  能力集未变（仍为 chat/vision）；llama-swap 与 LAN 网关未改动。
+- 未完成项：并发/批量预算边界（A10）不在本任务；`DEFAULT_OUTPUT_POLICY` 待 CT06 按 runtime 绑定；
+  本轮不改变 06 的生产门禁结论。

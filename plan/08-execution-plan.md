@@ -15,7 +15,8 @@ RP15（C02 产品决策）、RP16（导航与总检查）、RP17（同 SHA 目�
 
 2026-09-24新增的[tools/thinking执行计划](tool-calling-and-reasoning/README.md)独立于本页P/RP任务状态。
 该扩展通过[TC01—TC09](tool-calling-and-reasoning/contracts.md)细化C01能力/operation边界、C06有效请求与计数租约、
-C09兼容HTTP材料链；仅为待实施规范，现有功能与验收状态不因该链接改变。
+C09兼容HTTP材料链；其中 CT02 已交付输出预算兼容例外（见执行计划 CT02 节），其余仍为待实施规范，
+现有功能与验收状态不因该链接改变。
 
 ### 1.1 已完成与未完成的边界
 
@@ -408,6 +409,11 @@ retryable 表示状态可能恢复；只有确认 not_started 或查询原幂等
   embeddings=`encoding_format`（首版仅 float）；rerank=`top_n,return_documents`。
   正整数/有限数及范围由 schema 写死；temperature 0..2、top_p (0,1]、seed 0..2^31-1。
   max_tokens 默认4096但取 min(4096,模型max_output_tokens)；rerank top_n 默认文档数、不得大于文档数。
+- 兼容 chat/vision（带 envelope 的 v2 注册）的实际发送约束由 TC02 的 `PreparedChat` 承担：
+  计数与网关消费同一份 `body_json`（唯一派发输入，原请求对象不被修改）；预算缺省补
+  `min(4096, envelope.max_output_tokens)`，显式支持的别名保留原字段名并裁剪到 `max_output_tokens`，
+  多个预算字段、非正整数或 `n≠1` 返回 422 `contract_violation`；规范化不改写采样等无关字段。
+  CT02 已交付该预算例外；持租约的完整模板投影与同租约计数仍由 TC05 任务接管。
 - embeddings inline=`input`（非空字符串或非空字符串数组）；rerank=`query,documents`（非空字符串数组）。
   batch/document 上限作为能力 profile 必填正整数，绑定 candidate；没有实测值不得生产开放该能力。
 - 文本 token 包含 chat template、特殊 token、全部消息及视觉 token；必须用同 runtime tokenizer/template

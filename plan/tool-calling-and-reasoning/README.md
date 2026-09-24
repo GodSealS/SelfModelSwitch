@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00、CT01 已执行（CT01 含未补齐的 27B 材料，见下），CT02—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT02 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证），CT03—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -46,7 +46,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 |---|---|---|---|---|
 | CT00 | 基线、硬件与部署输入确认 | 无 | done | `854f39e1…`；目标证据 `ct00-tool-calling-baseline-20260924T040501Z/`，`site_input_sha256=51b970e2…` |
 | CT01 | 固定镜像探测工具与基线材料 | CT00 | done | `7f1fdf78…`；目标证据 `ct01-baseline-20260924T050824Z/`：`inspect-a`（exit 0、missing 0）、`probe-e`（38/64）；D01/D04 passed |
-| CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | pending | — |
+| CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | done | `29a894f5…`；目标证据 `ct02-budget-20260924T105148Z/`：显式/别名预算 7B、27B 均耗尽 32→32，缺省上限 7B=4096、27B=1024 精确耗尽；本地 1080 passed |
 | CT03 | 模型能力与execution operation分离 | CT02 | pending | — |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | pending | — |
 | CT05 | 持租约完整计数与错误清理 | CT04 | pending | — |
@@ -174,6 +174,37 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
   覆盖预算缺省、裁剪、别名冲突、bool、n、SSE；仅测试effective_max_tokens返回值不算完成。
 - 真机：基线7B/27B分别验证实际发送预算和总生成上限；输出长度未达到上限不证明限制，使用有界边界输入。
 - 文档：03标记预算兼容例外、08 C06同步实际发送约束；不启用新能力。
+
+### CT02 输出预算有效请求纵向修复（2026-09-24 已执行）
+
+- 交付：`29a894f512a6b2b3ab46537b4401fdc568dc1a09`（分支 `feature/ct02-output-budget`，基于 `e10f168`；
+  GitHub 与目标镜像 `refs/heads/feature/ct02-output-budget` 均等于该 SHA，目标 checkout 干净）。
+  `model_scheduler/envelope_validator.py` 新增 `PreparedChat`/`prepare_chat`/`normalize_output`/`canonical_json_bytes`
+  与固定镜像策略 `DEFAULT_OUTPUT_POLICY`（recognized/supported 预算字段取 CT01 `probe-e/policy-candidates.json`：
+  `max_tokens,max_completion_tokens,n_predict`）；`app.py` 兼容 chat 路由先 `prepare_chat` 得到唯一 `body_json`，
+  计数与 `gateway.open` 消费同一份体，来访 payload 不被修改。`tests/test_envelopes.py`、`tests/test_chat_api.py`
+  按 A01/A02 增补捕获实际派发体（`RecordingGateway`）；`tests/test_config.py` 新增公共软件 fixture `V2_CHAT_FIXTURE`
+  （envelope 8192/4096/1024，供 HTTP 级用例复用）。旧计数签名保留（TC05 再整体替换），v1 无 envelope 路径行为不变。
+- 软件验证（开发机 Python 3.12.11）：`pytest tests/test_envelopes.py tests/test_chat_api.py tests/test_config.py -q`
+  → **86 passed**；全量 `pytest tests -m 'not thor' -q` → **1080 passed、1 skipped、1 deselected**；
+  `ruff check .`、`run.py --check-config`、`git diff --check` 通过。覆盖：缺省→1024、4096→1024、64→64；
+  `max_completion_tokens` 单独裁剪且保留原字段名；`n_predict`（识别但不支持）拒绝；多预算字段/0/-1/null/true/1.5/"64" → 422
+  且零派发；`n=1` 通过、其余值拒绝；采样式与未知 extra 保留；SSE 与非 SSE 同预算。
+- 真机（目标 checkout `29a894f`，干净；Python 3.12.14；证据 `ct02-budget-20260924T105148Z/`，检查工具与逐例原始请求/响应同目录）：
+  调度器以 CT02 代码重启（pid 322176，`/live` 200，7B/27B 均 unloaded 起步），全部请求经 `service_base_url`
+  `http://127.0.0.1:8090`，使用 D02 固定有界文本；SSE 用例以镜像支持的 `stream_options.include_usage=true` 取精确 usage：
+  1. **显式预算到达上游并被耗尽**：7B/27B 的 `max_tokens=32` 与 `max_completion_tokens=32` 全部 200、
+     `finish_reason=length`、`completion_tokens=32`（7B 1.7–7.4 s、27B 7.4–29.1 s，含冷加载）。
+  2. **27B 缺省上限**：无预算 SSE → 200、`finish_reason=length`、`usage.completion_tokens=1024`
+     （= `min(4096, envelope.max_output_tokens)`，248.0 s）；独立增量材料为 1024 个 reasoning 增量。
+  3. **7B 缺省上限**：无预算 SSE 自然停止（`finish_reason=stop`，30.3 s）**不构成上限证明**，按 not_proven 保留材料；
+     改用 `ignore_eos: true`（镜像 help 含 `--ignore-eos`，先以 32 预算证明字段被接受并耗尽）重跑无预算 SSE →
+     200、`finish_reason=length`、`usage.completion_tokens=4096`（= `min(4096, 4096)`，196.9 s）。
+  4. 测试后状态：7B/27B 均 `ready`、无 blocked、无 last_error，queue 0、admission 开放，`/live`、`/v1/models` 200；
+     设备 RAM 29597/62841 MB、GR3D 空闲档、温度 55–61 °C，与测试前一致；llama-swap（pid 16492）本轮未改动。
+- 文档：`03-api.md` 标记预算兼容例外（已交付）；`08-execution-plan.md` C06 记录兼容路径的实际发送约束。
+- 边界与未完成项：`DEFAULT_OUTPUT_POLICY` 仍是固定镜像候选策略，CT06 才按 `(profile_id,image_digest,model_sha256)` 绑定；
+  并发/批量预算边界（A10）归 CT09/CT10，本轮不宣称生产通过。
 
 ### CT03 能力与operation分离
 

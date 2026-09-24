@@ -8,9 +8,13 @@
 未知模型404、能力不符422、有效租约/会话阻止卸载409；队列忙不等于 health 不健康。
 status 展示实际 boot_id、模型状态、execution 数、预留字节和 readiness_reason，不暴露完整控制 token。
 
-待实施的工具调用/思考兼容增量见[执行计划](tool-calling-and-reasoning/README.md)及
-[TC01—TC06接口契约](tool-calling-and-reasoning/contracts.md)。该扩展明确输出预算规范化等兼容例外，
-模型能力与internal operation分离；此引用不表示代码已实现，控制协议v1不因此增加工具operation。
+工具调用/思考兼容增量见[执行计划](tool-calling-and-reasoning/README.md)及
+[TC01—TC09接口契约](tool-calling-and-reasoning/contracts.md)。其中输出预算兼容例外已由 CT02 交付：
+兼容 chat/vision 请求先经 `envelope_validator.prepare_chat` 规范化并生成唯一派发体（原 payload 不被修改），
+预算缺省补 `min(4096, envelope.max_output_tokens)`、显式支持的别名字段保留原名并裁剪到封套上限、
+多个预算字段/非正整数/`n≠1` 一律 422 `contract_violation`；计数与网关消费同一字节体，见 TC02。
+模型能力与internal operation分离、工具/思考字段规则仍为待实施规范，
+控制协议v1不因此增加工具operation。
 
 ## 2. 拟议通用控制接口
 
