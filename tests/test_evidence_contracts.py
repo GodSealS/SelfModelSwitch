@@ -270,11 +270,23 @@ def test_policy_cannot_relax_the_acceptance_thresholds():
 
 
 def test_case_id_grammar():
-    for good in ("S01", "S06", "O01", "O06", "B:qwen25vl-7b-q4:load", "B:qwen25vl-7b-q4:cap:embeddings"):
+    for good in ("S01", "S06", "O01", "O06", "B:qwen25vl-7b-q4:load", "B:qwen25vl-7b-q4:cap:embeddings",
+                 "B:qwen25vl-7b-q4:cap:tools", "B:qwen25vl-7b-q4:cap:thinking"):
         assert ec.parse_case_id(good) == good
     for bad in ("S07", "S00", "O07", "s01", "B:qwen25vl-7b-q4:predict", "B:UPPER:load", "B:qwen25vl-7b-q4:cap:audio"):
         with pytest.raises(ContractError):
             ec.parse_case_id(bad)
+
+
+def test_tool_calling_capabilities_drive_their_own_required_cases():
+    # TC01: capability-case generation follows the *model* capability set, so a
+    # registration that turns on tools/thinking must produce those cases too.
+    data = _candidate_data()
+    data["models"][0]["capabilities"] = ["chat", "vision", "tools", "thinking"]
+    candidate = ec.parse_candidate(data)
+    required = ec.required_case_ids(candidate)
+    assert {"B:qwen25vl-7b-q4:cap:tools", "B:qwen25vl-7b-q4:cap:thinking"} <= required
+    assert len(required) == len(ec.SOFTWARE_CASES) + len(ec.OPERATIONAL_CASES) + 6 + 4
 
 
 def test_required_case_ids_follow_the_candidate():

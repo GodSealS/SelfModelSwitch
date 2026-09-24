@@ -41,7 +41,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
-from .contracts_v2 import CAPABILITY_MATRIX, ContractError, canonical_json_bytes, parse_json_document
+from .contracts_v2 import ContractError, canonical_json_bytes, parse_json_document
 
 PROTOCOL_VERSION = 1
 PROTOCOL_VERSION_HEADER = "X-SMS-Protocol-Version"
@@ -55,9 +55,14 @@ IDEMPOTENCY_KEY_MAX_LENGTH = 128
 CORRELATION_ID_MAX_LENGTH = 128
 REQUEST_ID_MAX_LENGTH = 128
 
-# C06: the executable capability set is closed; audio, Torch and ORT are not
-# part of it and may only be added together with their own M00 and fixtures.
-CAPABILITIES = frozenset(CAPABILITY_MATRIX)
+# C06/TC01: the protocol's operations are this closed execution set. They are
+# never re-derived from the model capability matrix: tools/thinking are model
+# capabilities on the compat chat surface, and a control request naming them is
+# a contract error rather than an operation of this protocol.
+EXECUTION_OPERATIONS = frozenset({"chat", "vision", "embeddings", "rerank"})
+
+#: Compatibility alias for the operation set of this protocol version.
+CAPABILITIES = EXECUTION_OPERATIONS
 
 # C04 session states and preparing phases. "ready" is not a session state.
 SESSION_STATES = frozenset({"preparing", "active", "draining", "blocked", "closed"})
@@ -168,13 +173,13 @@ PARAMETER_RULES: Mapping[str, Mapping[str, ParameterRule]] = {
     },
 }
 
-# The capability set and the parameter tables must not drift apart: a new
-# capability without its own closed parameter table would silently accept
+# The operation set and the parameter tables must not drift apart: a new
+# operation without its own closed parameter table would silently accept
 # arbitrary parameters.
-if set(PARAMETER_RULES) != set(CAPABILITIES):
+if set(PARAMETER_RULES) != set(EXECUTION_OPERATIONS):
     raise RuntimeError(
-        "capability/parameter mismatch: "
-        f"rules={sorted(PARAMETER_RULES)} capabilities={sorted(CAPABILITIES)}"
+        "operation/parameter mismatch: "
+        f"rules={sorted(PARAMETER_RULES)} operations={sorted(EXECUTION_OPERATIONS)}"
     )
 
 
@@ -669,7 +674,7 @@ def parse_execution_create_request(data: Mapping, where: str = "execution_create
     data = _mapping(data, where)
     _exact_keys(data, EXECUTION_CREATE_KEYS, where)
     session_token = _text_field(data, "session_token", where)
-    operation = _enum_field(data, "operation", where, CAPABILITIES)
+    operation = _enum_field(data, "operation", where, EXECUTION_OPERATIONS)
     input_ = parse_execution_input(_required(data, "input", where), f"{where}.input")
     parameters = _parse_parameters(operation, _required(data, "parameters", where), f"{where}.parameters")
     idempotency_key = _bounded_text_field(data, "idempotency_key", where, max_bytes=IDEMPOTENCY_KEY_MAX_LENGTH)
@@ -985,7 +990,7 @@ def schema_document() -> dict:
             "oneOf": [{"required": ["inline"]}, {"required": ["blob"]}],
         },
     }
-    for operation in sorted(CAPABILITIES):
+    for operation in sorted(EXECUTION_OPERATIONS):
         defs[f"Parameters_{operation}"] = _parameters_schema(operation)
     defs["ExecutionCreateRequest"] = {
         "type": "object",
@@ -993,7 +998,7 @@ def schema_document() -> dict:
         "required": ["session_token", "operation", "input", "parameters", "idempotency_key"],
         "properties": {
             "session_token": {"type": "string", "minLength": 1},
-            "operation": {"enum": sorted(CAPABILITIES)},
+            "operation": {"enum": sorted(EXECUTION_OPERATIONS)},
             "input": {"$ref": "#/$defs/ExecutionInput"},
             "parameters": {"type": "object"},
             "idempotency_key": {"type": "string", "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
@@ -1003,7 +1008,7 @@ def schema_document() -> dict:
                 "if": {"required": ["operation"], "properties": {"operation": {"const": operation}}},
                 "then": {"properties": {"parameters": {"$ref": f"#/$defs/Parameters_{operation}"}}},
             }
-            for operation in sorted(CAPABILITIES)
+            for operation in sorted(EXECUTION_OPERATIONS)
         ],
     }
     defs["ExecutionView"] = {
@@ -1052,7 +1057,7 @@ def schema_document() -> dict:
             "correlation_id_max_length": CORRELATION_ID_MAX_LENGTH,
             "request_id_max_length": REQUEST_ID_MAX_LENGTH,
         },
-        "capabilities": {operation: sorted(PARAMETER_RULES[operation]) for operation in sorted(CAPABILITIES)},
+        "capabilities": {operation: sorted(PARAMETER_RULES[operation]) for operation in sorted(EXECUTION_OPERATIONS)},
         "errors": {
             code: {"status": status, "retryable": retryable}
             for code, (status, retryable) in sorted(_ERROR_TABLE.items())

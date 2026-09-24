@@ -40,12 +40,16 @@ DEFAULT_MAX_BATCH = 256  # embeddings batch cap until a candidate binds a measur
 DEFAULT_MAX_DOCUMENTS = 256  # rerank document cap until a candidate binds a measured one
 
 # The input shape each capability consumes (C06). A production candidate needs
-# a fixture for every capability it turns on.
+# a fixture for every capability it turns on. tools/thinking (TC01/CT03) are chat
+# features: they arrive through the same messages, and tools additionally carries
+# the tool definitions.
 CAPABILITY_INPUT_KEYS: Mapping[str, frozenset[str]] = {
     "chat": frozenset({"messages"}),
     "vision": frozenset({"messages"}),
     "embeddings": frozenset({"input"}),
     "rerank": frozenset({"query", "documents"}),
+    "tools": frozenset({"messages", "tools"}),
+    "thinking": frozenset({"messages"}),
 }
 
 TokenCounter = Callable[[list[Any], int], Awaitable[int]]

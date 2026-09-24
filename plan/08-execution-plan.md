@@ -100,6 +100,12 @@ RP01 起的 `$PY` 使用它并在每条验证记录里写明实际版本。
 - `assets` 是逐文件表，按 `path` 唯一；同一 role 可有多文件以支持分片。
   adapter profile 规定角色基数：首个 GGUF profile 恰一 model，vision 恰一 projector；HF 分片格式可登记，
   未有 profile/fixture/实测时不得启动或宣称支持。路径检查须涵盖所有父目录、TOCTOU、regular file 和挂载身份。
+- 模型能力闭集与 operation 闭集是两个集合：`contracts_v2.MODEL_CAPABILITIES` 为
+  `chat|vision|embeddings|rerank|tools|thinking`，control protocol v1 的 operation 闭集
+  `control_protocol_v1.EXECUTION_OPERATIONS` 仍为 `chat|vision|embeddings|rerank`。
+  `tools`/`thinking` 是 chat 兼容面特性（资产仍为 model、protocol 为 openai-chat，注册时必须同时声明 chat），
+  不新增 control 参数或 operation；控制面出现这两个名字是契约错误。可启动/可服务仍由 profile 与 flag 门禁决定
+  （工具/思考的启动支持见 CT06；v1 配置不开放新能力）。
 - 当前可执行 capability 闭集：`chat|vision|embeddings|rerank`。audio、Torch、ORT 是后续扩展，
   新增前必须补自己的 M00、profile、DTO、fixture、evaluator 和 B 场景；不能因接受 runtime_id 就宣称任意 runtime 可用。
 - 每个 RuntimeSpec 新增必填 `profile_id`；profile 是代码注册的有限集合，绑定程序/镜像入口、允许参数、

@@ -110,6 +110,16 @@ def test_loads_strict_v1_lab_config(tmp_path: Path) -> None:
     assert config.models["embedding"].capabilities == frozenset({"embeddings"})
 
 
+def test_v1_capability_set_stays_closed_to_the_new_model_capabilities(tmp_path: Path) -> None:
+    # TC01: schema-v1 has no envelope and keeps its own closed set, so the new
+    # model capabilities (and vision) are not registrable there.
+    for capability in ("tools", "thinking", "vision"):
+        text = VALID.replace("capabilities: [chat]", f"capabilities: [chat, {capability}]")
+        assert f"chat, {capability}" in text
+        with pytest.raises(ConfigError, match="capabilities"):
+            load_config(write_config(tmp_path, text))
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [

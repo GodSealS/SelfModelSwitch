@@ -99,6 +99,20 @@ CAPABILITY_MATRIX: Mapping[str, CapabilitySpec] = {
     "vision": CapabilitySpec("vision", ("model", "projector"), "openai-chat-media"),
     "embeddings": CapabilitySpec("embeddings", ("model",), "openai-embeddings"),
     "rerank": CapabilitySpec("rerank", ("model",), "llama-rerank"),
+    # TC01: tools and thinking are chat features over the registered GGUF asset,
+    # never separate execution operations of the control protocol.
+    "tools": CapabilitySpec("tools", ("model",), "openai-chat"),
+    "thinking": CapabilitySpec("thinking", ("model",), "openai-chat"),
+}
+
+#: The model capability set (TC01). It is exactly the matrix keys.
+MODEL_CAPABILITIES = frozenset(CAPABILITY_MATRIX)
+
+#: Capabilities that only exist as a refinement of another one: a registration
+#: declaring the key must also declare everything in its value (TC01).
+CAPABILITY_DEPENDENCIES: Mapping[str, frozenset[str]] = {
+    "tools": frozenset({"chat"}),
+    "thinking": frozenset({"chat"}),
 }
 
 GGUF_PROFILE = "llama-cpp-gguf-v1"
@@ -511,6 +525,11 @@ def _parse_capabilities(data: Mapping, where: str) -> tuple[str, ...]:
             raise ContractError(f"{where}: duplicate capability {item!r}")
         seen.add(item)
         result.append(item)
+    declared = set(result)
+    for capability in sorted(CAPABILITY_DEPENDENCIES):
+        if capability in declared and not CAPABILITY_DEPENDENCIES[capability] <= declared:
+            missing = sorted(CAPABILITY_DEPENDENCIES[capability] - declared)
+            raise ContractError(f"{where}: capability {capability!r} requires {', '.join(missing)}")
     return tuple(result)
 
 

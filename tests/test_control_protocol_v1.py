@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from model_scheduler import control_protocol_v1 as cp
+from model_scheduler.contracts_v2 import MODEL_CAPABILITIES
 
 
 def _error_document() -> dict:
@@ -313,6 +314,26 @@ def test_execution_create_request_is_strict():
         mutate(data)
         with pytest.raises(cp.ContractError):
             cp.parse_execution_create_request(data)
+
+
+def test_control_operations_are_the_closed_execution_set():
+    # TC01: the protocol's operation set is its own closed set; it is never
+    # re-derived from the model capability matrix that also carries tools/thinking.
+    assert cp.EXECUTION_OPERATIONS == frozenset({"chat", "vision", "embeddings", "rerank"})
+    assert cp.CAPABILITIES == cp.EXECUTION_OPERATIONS
+    assert set(cp.PARAMETER_RULES) == set(cp.EXECUTION_OPERATIONS)
+
+    assert {"tools", "thinking"} <= MODEL_CAPABILITIES
+    assert not ({"tools", "thinking"} & cp.EXECUTION_OPERATIONS)
+
+
+def test_tools_and_thinking_are_not_execution_operations():
+    # A model capability must not leak into the control protocol as an operation:
+    # the request is refused with the existing contract error, never a KeyError.
+    for operation in ("tools", "thinking"):
+        with pytest.raises(cp.ContractError) as refused:
+            cp.parse_execution_create_request(_execution_create(operation=operation))
+        assert "operation" in str(refused.value)
 
 
 def test_execution_input_inline_or_blob_is_exclusive():

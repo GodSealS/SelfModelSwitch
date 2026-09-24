@@ -84,11 +84,20 @@ def _vision_messages(raw: bytes, media: str = "image/png") -> list[dict]:
                                          {"type": "image_url", "image_url": {"url": _data_url(media, raw)}}]}]
 
 
+def _tool_definitions() -> list[dict]:
+    return [{"type": "function", "function": {"name": "get_weather",
+                                              "parameters": {"type": "object", "properties": {}}}}]
+
+
 CAPABILITY_FIXTURES: dict[str, dict] = {
     "chat": {"messages": _chat_messages()},
     "vision": {"messages": _vision_messages(_png(64, 64))},
     "embeddings": {"input": ["one", "two"]},
     "rerank": {"query": "q", "documents": ["one", "two"]},
+    # TC01: tools/thinking are consumed through the same chat messages; tools
+    # additionally carries the tool definitions.
+    "tools": {"messages": _chat_messages(), "tools": _tool_definitions()},
+    "thinking": {"messages": _chat_messages()},
 }
 
 

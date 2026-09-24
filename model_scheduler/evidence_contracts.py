@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable, Mapping
 
 from .contracts_v2 import (
-    CAPABILITY_MATRIX,
+    MODEL_CAPABILITIES,
     ContractError,
     ModelSpec,
     RuntimeSpec,
@@ -57,7 +57,9 @@ MAX_TIMEOUT_RATE = 0.1
 REPORT_VALIDITY_SECONDS = 7 * 86_400
 REPORT_FUTURE_TOLERANCE_SECONDS = 300
 
-CAPABILITIES = frozenset(CAPABILITY_MATRIX)
+# TC01: capability cases follow the *model* capability set, which includes
+# tools/thinking; the control protocol's execution operations are smaller.
+CAPABILITIES = MODEL_CAPABILITIES
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?")

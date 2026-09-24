@@ -13,8 +13,10 @@ status 展示实际 boot_id、模型状态、execution 数、预留字节和 rea
 兼容 chat/vision 请求先经 `envelope_validator.prepare_chat` 规范化并生成唯一派发体（原 payload 不被修改），
 预算缺省补 `min(4096, envelope.max_output_tokens)`、显式支持的别名字段保留原名并裁剪到封套上限、
 多个预算字段/非正整数/`n≠1` 一律 422 `contract_violation`；计数与网关消费同一字节体，见 TC02。
-模型能力与internal operation分离、工具/思考字段规则仍为待实施规范，
-控制协议v1不因此增加工具operation。
+模型能力与 internal operation 的分离已由 CT03 交付：模型能力闭集（`contracts_v2.MODEL_CAPABILITIES`）为
+`chat|vision|embeddings|rerank|tools|thinking`（`tools`/`thinking` 依赖 chat、资产仍为 model），
+而 control protocol v1 的 operation 闭集（`control_protocol_v1.EXECUTION_OPERATIONS`）
+保持 `chat|vision|embeddings|rerank`；控制协议不因此增加工具 operation，工具/思考字段规则仍为待实施规范。
 
 ## 2. 拟议通用控制接口
 

@@ -284,6 +284,34 @@ def test_capability_matrix_requires_roles():
         cv2.parse_deployment(data)
 
 
+def test_model_capabilities_cover_tools_and_thinking_over_chat():
+    # TC01: the model capability set is the matrix; tools/thinking are chat
+    # features with a model asset and the openai-chat protocol, nothing more.
+    assert cv2.MODEL_CAPABILITIES == frozenset(cv2.CAPABILITY_MATRIX)
+    assert {"chat", "vision", "embeddings", "rerank", "tools", "thinking"} == cv2.MODEL_CAPABILITIES
+    for capability in ("tools", "thinking"):
+        spec = cv2.CAPABILITY_MATRIX[capability]
+        assert spec.required_asset_roles == ("model",)
+        assert spec.protocol == "openai-chat"
+
+
+def test_tools_and_thinking_register_against_the_same_model_asset():
+    data = _valid_deployment()
+    data["models"][0]["capabilities"] = ["chat", "vision", "tools", "thinking"]
+    deployment = cv2.parse_deployment(data)
+    assert deployment.models[0].capabilities == ("chat", "vision", "tools", "thinking")
+
+
+def test_tools_or_thinking_without_chat_is_refused():
+    for capability in ("tools", "thinking"):
+        data = _valid_deployment()
+        # vision keeps the projector asset valid, so the only refusal left is the
+        # missing chat dependency of the new capability.
+        data["models"][0]["capabilities"] = ["vision", capability]
+        with pytest.raises(cv2.ContractError, match="requires chat"):
+            cv2.parse_deployment(data)
+
+
 def test_unknown_capability_is_rejected():
     data = _valid_deployment()
     data["models"][0]["capabilities"] = ["chat", "video"]
