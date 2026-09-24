@@ -616,7 +616,7 @@ def _owner_context(tmp_path, *, recovery=None):
         document["control"]["allowed_uids"] = [os.getuid()]  # the allow list is the connection layer
 
     config = _v2_config(tmp_path, mutate=for_this_machine)
-    ports = {"control": object(), "resources": None,
+    ports = {"control": object(), "resources": None, "chat_policies": {},
              "recovery": recovery if recovery is not None else DeploymentRecovery("orin-lab", docker=_quiet_docker),
              "observers": {mid: _StoppedObserver() for mid in config.models},
              "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}

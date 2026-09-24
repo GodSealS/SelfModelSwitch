@@ -204,11 +204,18 @@ def build_v2_context(config: AppConfigV2, *, config_sha256: str, env=None, ports
         expected_instances=expected_instances,
         launch_records=launch_records,
     )
+    # TC05: the versioned chat policies are a composition boundary like the others:
+    # a fixture may inject its own, and the default is the registry, resolved here so
+    # an unknown runtime/model combination refuses the startup instead of guessing.
+    chat_policies = ports.get("chat_policies")
+    if chat_policies is None:
+        chat_policies = _v2_chat_policies(config)
     return RunContextV2(boot_id=boot_id, scheduler=runtime.scheduler, service=runtime.service,
                          lifecycle=runtime.lifecycle, book=book, blobs=blobs, tokens=tokens,
                          recovery=recovery, observers=dict(observers), config=config,
                          extras={"runtime": runtime, "clients": clients, "idempotency": idempotency,
-                                 "control": control, "launch_records": launch_records})
+                                 "control": control, "launch_records": launch_records,
+                                 "chat_policies": chat_policies})
 
 
 def _execution_stats(context: RunContextV2):
@@ -266,18 +273,20 @@ def v2_health_checks(context: RunContextV2):
     return checks
 
 
-def _v2_chat_policies(context: RunContextV2) -> dict:
+def _v2_chat_policies(config) -> dict:
     """One versioned policy per registered model, resolved through the registry (TC01/TC05).
 
-    The key is the registration itself — `(profile_id, image_digest, model_sha256)`
-    — so a model whose combination has no registered policy is a refused startup
-    (exit 78), never a guessed one.
+    The key is the registration itself — `(profile_id, image_digest, model_sha256)`.
+    A model whose combination has no registered policy stays absent from the
+    mapping: the compat route and the counter then refuse that model per request
+    (503), and a policy is never guessed. A fixture may inject
+    `ports["chat_policies"]` instead, exactly like every other composition boundary.
     """
     from model_scheduler.chat_counting import ChatCountingError, resolve_policy
 
     policies: dict = {}
-    for model_id, model in context.config.models.items():
-        runtime = context.config.runtimes.get(model.runtime_id)
+    for model_id, model in config.models.items():
+        runtime = config.runtimes.get(model.runtime_id)
         if runtime is None:
             raise RuntimeCompositionError(f"model {model_id!r} is registered without its runtime")
         asset = next((item for item in model.assets if item.role == "model"), None)
@@ -286,8 +295,8 @@ def _v2_chat_policies(context: RunContextV2) -> dict:
         try:
             policies[model_id] = resolve_policy(profile_id=runtime.profile_id, image_digest=runtime.image_digest,
                                                 model_sha256=asset.sha256)
-        except ChatCountingError as exc:
-            raise RuntimeCompositionError(f"model {model_id!r}: {exc}") from exc
+        except ChatCountingError:
+            continue  # fail-closed per request, never a guessed policy
     return policies
 
 
@@ -326,7 +335,9 @@ def build_v2_tcp_app(context: RunContextV2, *, policies: dict | None = None):
     """
     from app import create_app
 
-    policies = _v2_chat_policies(context) if policies is None else policies
+    policies = policies if policies is not None else context.extras.get("chat_policies")
+    if policies is None:
+        policies = _v2_chat_policies(context.config)
     return create_app(config=context.config, scheduler=context.scheduler, gateway=None,
                       boot_id=context.boot_id, execution_stats=_execution_stats(context),
                       health_checks=v2_health_checks(context), chat_policy=policies,
