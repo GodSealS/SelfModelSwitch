@@ -349,6 +349,41 @@ def test_only_an_exhausted_budget_enters_the_supported_set(tmp_path):
     assert case["actual"]["per_model"]["qwen36-27b"]["max_tokens-32"]["exhausted"] is True
 
 
+def test_the_unbudgeted_default_is_sent_after_every_other_case(tmp_path):
+    def handler(method: str, url: str, body: bytes | None) -> HttpResponse:
+        if url.endswith("/props"):
+            return HttpResponse(404, {}, b"{}")
+        if url.endswith("/apply-template"):
+            return HttpResponse(200, {}, json.dumps({"prompt": "prompt"}).encode())
+        if url.endswith("/tokenize"):
+            return HttpResponse(200, {}, json.dumps({"tokens": list(range(11))}).encode())
+        return HttpResponse(200, {}, _completion(finish_reason="length", completion_tokens=32))
+
+    http = FakeHttp(handler)
+    probe, _ = _build(tmp_path, http=http)
+    probe.probe()
+    chats = [json.loads(body.decode("utf-8")) for method, url, body in http.calls if body and "chat/completions" in url]
+    unbudgeted = [payload for payload in chats
+                  if not any(field in payload for field in probe_module.BUDGET_FIELDS)]
+    assert len(unbudgeted) == len(probe.site.models)
+    assert chats[-len(unbudgeted):] == unbudgeted  # nothing follows an unbounded request
+
+
+def test_a_model_nobody_could_serve_is_not_a_failed_verdict(tmp_path):
+    def handler(method: str, url: str, body: bytes | None) -> HttpResponse:
+        if url.endswith("/props"):
+            return HttpResponse(404, {}, b"{}")
+        return HttpResponse(503, {}, json.dumps({"error": {"code": "service_unavailable",
+                                                           "message": "Service is not ready"}}).encode())
+
+    probe, _ = _build(tmp_path, http=FakeHttp(handler))
+    report = probe.probe()
+    for case_id in ("D03", "D06"):
+        case = next(row for row in report["cases"] if row["id"] == case_id)
+        assert case["status"] == "not_run", (case_id, case["status"])
+        assert case["reason"] == "the deployment could not serve the model during this case"
+
+
 def test_send_chat_stops_at_the_request_limit(tmp_path):
     probe, _ = _build(tmp_path, http=_always_200(), request_limit=1)
     context = CaseContext(case_id="D02", out=probe.out, probe=probe)

@@ -666,7 +666,36 @@ class ChatProbe:
         self.observation_files: list[str] = []
         self.cases: list[CaseRow] = []
         self.helpers: dict[str, Any] = {}
+        self.pending_defaults = False
+        self._default_statuses: list[str] = []
+        self._default_reason: str | None = None
+        self._default_observations: dict[str, Any] = {}
         self._auth: str | None = (os.environ.get(site.auth_env) if site.auth_env else None)
+
+    def run_deferred_defaults(self) -> None:
+        """The unbudgeted requests, sent once every other case has its material."""
+        if not self.pending_defaults:
+            return
+        context = CaseContext(case_id="D02", out=self.out, probe=self)
+        for model_id in self.site.models:
+            payload: dict[str, Any] = {"model": model_id,
+                                       "messages": [{"role": "user", "content": BUDGET_PROMPT}]}
+            if self.helpers.get("image", {}).get("flags", {}).get("--ignore-eos"):
+                payload["ignore_eos"] = True
+            answer = context.chat(f"{model_id}-none-default", model_id, payload)
+            if answer is None:
+                self._default_observations[model_id] = {"status": None, "reason": "request_limit"}
+                self._default_statuses.append(STATUS_NOT_RUN)
+                continue
+            observation = _summarise_completion(answer)
+            self._default_observations[model_id] = observation
+            bounded = observation["http_status"] == 200 and observation["finish_reason"] is not None
+            if bounded:
+                self._default_statuses.append(STATUS_PASSED)
+            else:
+                # CT02 is what gives the compat surface an effective default budget.
+                self._default_statuses.append(STATUS_NEEDS_CANDIDATE)
+                self._default_reason = "the unbudgeted default is not bounded by this deployment (CT02)"
 
     # -- request budget ----------------------------------------------------
 
@@ -981,6 +1010,18 @@ class ChatProbe:
             row.observation_files = [path for path in self.observation_files if f"/{case_id}/" in path]
             row.ended_at_utc = _stamp(self.clock.utc_now())
             self.cases.append(row)
+        self.run_deferred_defaults()
+        budget_row = next((row for row in self.cases if row.case_id == "D02"), None)
+        if budget_row is not None and self._default_statuses:
+            budget_row.status = _worst([budget_row.status, *self._default_statuses])
+            budget_row.reason = budget_row.reason or self._default_reason
+            budget_row.actual.setdefault("per_model", {})
+            for model_id, observation in self._default_observations.items():
+                budget_row.actual["per_model"].setdefault(model_id, {})["none-default"] = observation
+            budget_row.request_files = [path for path in self.request_files if "/D02/" in path]
+            budget_row.response_files = [path for path in self.response_files if "/D02/" in path]
+            budget_row.observation_files = [path for path in self.observation_files if "/D02/" in path]
+            budget_row.ended_at_utc = _stamp(self.clock.utc_now())
         report = {"schema_version": PROBE_SCHEMA_VERSION, "site_sha256": self.site.sha256, "phase": self.phase,
                   "code_sha": git_state["head"]["stdout"].strip(),
                   "requests_used": self.requests_used, "request_limit": self.site.request_limit,
@@ -1082,23 +1123,11 @@ class ChatProbe:
                         statuses.append(STATUS_FAILED)  # a short answer does not prove the budget
                         observation["not_proven"] = True
             per_field[model_id] = model_report
-        # The unbudgeted default runs last: nothing is left to collect that a runtime
-        # generating without a bound could disturb.
-        for model_id in self.site.models:
-            payload: dict[str, Any] = {"model": model_id,
-                                       "messages": [{"role": "user", "content": BUDGET_PROMPT}]}
-            if ignore_eos:
-                payload["ignore_eos"] = True
-            answer = ctx.chat(f"{model_id}-none-default", model_id, payload)
-            observation = ({"status": None, "reason": "request_limit"} if answer is None
-                           else _summarise_completion(answer))
-            per_field[model_id]["none-default"] = observation
-            if answer is None:
-                statuses.append(STATUS_NOT_RUN)
-            else:
-                statuses.append(STATUS_PASSED if observation["http_status"] == 200 else STATUS_FAILED)
         ctx.observe("budget", per_field)
         self.helpers["supported_output_fields"] = supported
+        # The unbudgeted default is deferred to the end of the whole run: a runtime
+        # generating without a bound must not disturb the cases that follow.
+        self.pending_defaults = True
         actual = {"per_model": per_field, "supported_output_fields": sorted(supported),
                   "recognized_output_fields": list(BUDGET_FIELDS)}
         status = _worst(statuses)
@@ -1158,9 +1187,12 @@ class ChatProbe:
                     statuses.append(STATUS_PASSED if not calls else STATUS_FAILED)
                 else:
                     statuses.append(STATUS_PASSED)  # auto: calling or not calling are both legal
+            if _all_unavailable(model_detail):
+                statuses.append(STATUS_NOT_RUN)
+                model_detail["verdict_note"] = "the deployment could not serve the model during this case"
             detail[model_id] = {"registered": registered, "variants": model_detail}
         ctx.observe("tool_choice", detail)
-        return _worst(statuses), {"per_model": detail}, None
+        return _worst(statuses), {"per_model": detail}, _unavailable_reason(detail)
 
     def _case_tool_template(self, ctx: CaseContext) -> tuple[str, dict[str, Any], str | None]:
         targets = self.capability_targets("tools")
@@ -1201,9 +1233,12 @@ class ChatProbe:
             counts = {label: entry.get("projected_input_tokens") for label, entry in model_detail.items()}
             if counts.get("no_tools") is not None and counts.get("no_tools") == counts.get("short_tools"):
                 statuses.append(STATUS_FAILED)  # the tool definitions are not reaching the template
+            if _all_unavailable(model_detail):
+                statuses.append(STATUS_NOT_RUN)
+                model_detail["verdict_note"] = "the deployment could not serve the model during this case"
             detail[model_id] = {"registered": registered, "variants": model_detail}
         ctx.observe("tool_template", detail)
-        return _worst(statuses), {"per_model": detail}, None
+        return _worst(statuses), {"per_model": detail}, _unavailable_reason(detail)
 
     def _case_history_count(self, ctx: CaseContext) -> tuple[str, dict[str, Any], str | None]:
         targets = self.capability_targets("tools")
@@ -1238,9 +1273,15 @@ class ChatProbe:
                 projected = _projected_tokens(ctx, model_id, payload)
                 usage["projected_input_tokens"] = projected
                 model_detail[label] = usage
-                if projected is None:
-                    statuses.append(STATUS_NEEDS_CANDIDATE if not registered else STATUS_FAILED)
-                elif projected != usage["prompt_tokens"]:
+                if projected is None and not registered:
+                    # No counting endpoint to compare against: the runtime cannot show
+                    # what it charges until the candidate exposes it.
+                    statuses.append(STATUS_NEEDS_CANDIDATE)
+                elif usage["http_status"] != 200 and not registered:
+                    # This deployment refuses tool-call history outright, so the charge
+                    # cannot be judged here; CT04/CT06 are what teach it the shape.
+                    statuses.append(STATUS_NEEDS_CANDIDATE)
+                elif usage["http_status"] != 200 or projected != usage["prompt_tokens"]:
                     statuses.append(STATUS_FAILED)
                 else:
                     statuses.append(STATUS_PASSED)
@@ -1248,9 +1289,12 @@ class ChatProbe:
             large = model_detail.get("large", {}).get("projected_input_tokens")
             if small is not None and large is not None and large <= small:
                 statuses.append(STATUS_FAILED)  # the longer arguments are not being charged
+            if _all_unavailable(model_detail):
+                statuses.append(STATUS_NOT_RUN)
+                model_detail["verdict_note"] = "the deployment could not serve the model during this case"
             detail[model_id] = {"registered": registered, "variants": model_detail}
         ctx.observe("history_count", detail)
-        return _worst(statuses), {"per_model": detail}, None
+        return _worst(statuses), {"per_model": detail}, _unavailable_reason(detail)
 
     def _case_thinking(self, ctx: CaseContext) -> tuple[str, dict[str, Any], str | None]:
         targets = self.capability_targets("thinking")
@@ -1298,10 +1342,14 @@ class ChatProbe:
                     statuses.append(STATUS_NEEDS_CANDIDATE)
                 else:
                     statuses.append(STATUS_FAILED)
+            if _all_unavailable(model_detail):
+                statuses.append(STATUS_NOT_RUN)
+                model_detail["verdict_note"] = "the deployment could not serve the model during this case"
             detail[model_id] = {"registered": registered, "variants": model_detail}
         ctx.observe("thinking", detail)
         self.helpers["effort_values"] = accepted
-        return _worst(statuses), {"per_model": detail, "accepted_effort_values": sorted(accepted)}, None
+        return (_worst(statuses), {"per_model": detail, "accepted_effort_values": sorted(accepted)},
+                _unavailable_reason(detail))
 
     def _case_vision(self, ctx: CaseContext) -> tuple[str, dict[str, Any], str | None]:
         statuses: list[str] = []
@@ -1356,8 +1404,13 @@ class ChatProbe:
             statuses.append(STATUS_PASSED if summary["http_status"] == 200 and summary["content"]
                             else STATUS_NEEDS_CANDIDATE
                             if "tools" not in self.site.models[model_id].capabilities else STATUS_FAILED)
+        served = {key: entry for key, entry in detail.items()
+                  if isinstance(entry, dict) and "http_status" in entry}
+        if _all_unavailable(served):
+            statuses.append(STATUS_NOT_RUN)
+            detail["verdict_note"] = "the deployment could not serve the models during this case"
         ctx.observe("vision", detail)
-        return _worst(statuses), {"per_model": detail}, None
+        return _worst(statuses), {"per_model": detail}, _unavailable_reason(detail)
 
     def _case_service_history(self, ctx: CaseContext) -> tuple[str, dict[str, Any], str | None]:
         """Synthetic histories through the compat surface; the baseline only records them."""
@@ -1501,6 +1554,26 @@ def _tool_calls(message: Mapping[str, Any]) -> list[dict[str, Any]]:
                 arguments = raw
         extracted.append({"id": call.get("id"), "name": function.get("name"), "arguments": arguments})
     return extracted
+
+
+def _unavailable_reason(detail: Mapping[str, Any]) -> str | None:
+    """The note a case left when the deployment could not serve the model at all."""
+    for entry in detail.values():
+        if not isinstance(entry, dict):
+            continue
+        note = entry.get("verdict_note")
+        if note:
+            return note
+        variants = entry.get("variants")
+        if isinstance(variants, dict) and variants.get("verdict_note"):
+            return variants["verdict_note"]
+    return None
+
+
+def _all_unavailable(variants: Mapping[str, Any]) -> bool:
+    """True when every observation of a case is the deployment refusing to serve the model."""
+    entries = [entry for entry in variants.values() if isinstance(entry, dict)]
+    return bool(entries) and all(entry.get("http_status") == 503 for entry in entries)
 
 
 def _summarise_tool_call(answer: HttpResponse) -> dict[str, Any]:
