@@ -216,8 +216,30 @@ class LlamaCppAdapter:
         return text_tokens + image_tokens
 
     async def count_chat_input(self, messages: list[Any], image_count: int, deadline: float) -> int:
-        """The runtime's own token count for one chat body (C06; the compatibility API injects this, P20)."""
+        """The runtime's own token count for one chat body (C06; the internal path keeps this)."""
         return await self._count_chat_tokens(messages, image_count, deadline)
+
+    async def count_template(self, template: Mapping, *, tokenize_options: Mapping | None = None,
+                             deadline: float) -> int:
+        """One template request, then its prompt tokenized with the policy's own options (TC05).
+
+        The compatibility counter sends exactly the projected template request and the
+        policy's tokenize options, so special tokens and the generation prefix are the
+        runtime tokenizer's answer — never a local estimate. The internal execution
+        path keeps `_count_chat_tokens` and is not affected.
+        """
+        status, templated = await self._json("POST", self._endpoint("apply_template"), deadline=deadline,
+                                             json_body=dict(template))
+        if status != 200 or not isinstance(templated, dict) or not isinstance(templated.get("prompt"), str):
+            raise AdapterError("chat template counting failed", "backend_failed")
+        tokenize_body = {"content": templated["prompt"]}
+        tokenize_body.update(dict(tokenize_options or {}))
+        status, tokenized = await self._json("POST", self._endpoint("tokenize"), deadline=deadline,
+                                             json_body=tokenize_body)
+        tokens = tokenized.get("tokens") if isinstance(tokenized, dict) else None
+        if status != 200 or not isinstance(tokens, list):
+            raise AdapterError("tokenize counting failed", "backend_failed")
+        return len(tokens)
 
     def _chat_payload(self, messages: list[Any], parameters: Mapping) -> dict[str, Any]:
         try:

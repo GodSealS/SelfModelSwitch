@@ -266,40 +266,71 @@ def v2_health_checks(context: RunContextV2):
     return checks
 
 
-def _v2_token_counter(context: RunContextV2):
-    """The compatibility API's token counter: the model adapter's own runtime count (C06/P20).
+def _v2_chat_policies(context: RunContextV2) -> dict:
+    """One versioned policy per registered model, resolved through the registry (TC01/TC05).
 
-    C06 forbids estimating tokens from characters, so the compat route counts
-    through the same `/apply-template` + `/tokenize` path the adapter uses. A
-    model without a counter refuses (503) instead of being dispatched blind.
+    The key is the registration itself — `(profile_id, image_digest, model_sha256)`
+    — so a model whose combination has no registered policy is a refused startup
+    (exit 78), never a guessed one.
     """
+    from model_scheduler.chat_counting import ChatCountingError, resolve_policy
 
-    async def counter(model_id: str, messages: list, image_count: int) -> int:
-        runtime = context.extras.get("runtime")
-        adapters = getattr(runtime, "adapters", None)
-        adapter = adapters.get(model_id) if isinstance(adapters, dict) else None
-        count = getattr(adapter, "count_chat_input", None)
-        if not callable(count):
-            raise RuntimeCompositionError(f"no runtime token counter is available for {model_id!r}")
-        return await count(messages, image_count,
-                           monotonic() + context.config.gateway.inference_timeout_seconds)
+    policies: dict = {}
+    for model_id, model in context.config.models.items():
+        runtime = context.config.runtimes.get(model.runtime_id)
+        if runtime is None:
+            raise RuntimeCompositionError(f"model {model_id!r} is registered without its runtime")
+        asset = next((item for item in model.assets if item.role == "model"), None)
+        if asset is None:
+            raise RuntimeCompositionError(f"model {model_id!r} has no model asset to bind its policy to")
+        try:
+            policies[model_id] = resolve_policy(profile_id=runtime.profile_id, image_digest=runtime.image_digest,
+                                                model_sha256=asset.sha256)
+        except ChatCountingError as exc:
+            raise RuntimeCompositionError(f"model {model_id!r}: {exc}") from exc
+    return policies
 
-    return counter
+
+def _v2_chat_counter(context: RunContextV2, policies: dict):
+    """The compat route's counter (TC05): the same lease, the same body, no retry.
+
+    The count runs through the model's own adapter, and every identity it binds —
+    the accepted instance and the generation — is read from the book, which stays
+    the single owner of what was accepted.
+    """
+    from model_scheduler.chat_counting import RuntimeChatCounter
+
+    runtime = context.extras.get("runtime")
+    adapters = getattr(runtime, "adapters", None) or {}
+    missing = sorted(set(context.config.models) - set(adapters))
+    if missing:
+        raise RuntimeCompositionError(f"the managed composition has no adapter for {missing}")
+    return RuntimeChatCounter(
+        policies=policies,
+        templates=dict(adapters),
+        envelopes={model_id: model.envelope for model_id, model in context.config.models.items()},
+        accepted_identity=context.lifecycle.instance,
+        generation=lambda model_id: context.book.runtime[model_id].generation,
+    )
 
 
-def build_v2_tcp_app(context: RunContextV2):
+def build_v2_tcp_app(context: RunContextV2, *, policies: dict | None = None):
     """The TCP listener of the v2 process (P19): the legacy surface over the managed runtime.
 
     The control routes stay on the Unix socket: this app never registers
     `/internal/*`, so the TCP side answers 404 by construction (C08), and
     /api/status reports this process's own boot id. A v2 registration also
-    brings its C06 envelope and the runtime token counter (P20).
+    brings its C06 envelope, its versioned chat policies and the lease-bound
+    counter (P20/TC05). `policies` overrides the registry lookup, so a fixture
+    (or a deliberately policy-less process) can bind its own models.
     """
     from app import create_app
 
+    policies = _v2_chat_policies(context) if policies is None else policies
     return create_app(config=context.config, scheduler=context.scheduler, gateway=None,
                       boot_id=context.boot_id, execution_stats=_execution_stats(context),
-                      health_checks=v2_health_checks(context), token_counter=_v2_token_counter(context))
+                      health_checks=v2_health_checks(context), chat_policy=policies,
+                      chat_counter=_v2_chat_counter(context, policies))
 
 
 def _bind_tcp_socket(host: str, port: int) -> socket.socket:

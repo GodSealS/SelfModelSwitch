@@ -419,7 +419,14 @@ retryable 表示状态可能恢复；只有确认 not_started 或查询原幂等
   计数与网关消费同一份 `body_json`（唯一派发输入，原请求对象不被修改）；预算缺省补
   `min(4096, envelope.max_output_tokens)`，显式支持的别名保留原字段名并裁剪到 `max_output_tokens`，
   多个预算字段、非正整数或 `n≠1` 返回 422 `contract_violation`；规范化不改写采样等无关字段。
-  CT02 已交付该预算例外；持租约的完整模板投影与同租约计数仍由 TC05 任务接管。
+  CT02 已交付该预算例外。
+- 兼容 chat/vision 的 token 计数在 **同一 lease 下、生成之前**完成（TC05/TC06 顺序）：
+  本地形状/交叉字段/历史与预算检查发生在 `acquire` **之前**（零 I/O、零 acquire/计数/派发，TC03/TC04）；
+  `acquire` 负责冷加载并给出 lease；计数器按策略的 `template_request_fields` + 固定常量投影模板请求，
+  经运行时自己的 `/apply-template` 与 `/tokenize`（`tokenize_options_json`，特殊 token 与生成前缀计入）
+  取得 token 数，`CountReceipt` 绑定 body hash、策略、lease 代数、已接受实例与模板 hash；
+  复核绑定（`validate_binding`）通过后才 `gateway.open`。计数失败/计数超时/超限/身份变化分别返回
+  503/504/422/503，并按 ABORTED/REJECTED 释放租约；不降级、不重试、不估算，取得 lease 只表示预留。
 - embeddings inline=`input`（非空字符串或非空字符串数组）；rerank=`query,documents`（非空字符串数组）。
   batch/document 上限作为能力 profile 必填正整数，绑定 candidate；没有实测值不得生产开放该能力。
 - 文本 token 包含 chat template、特殊 token、全部消息及视觉 token；必须用同 runtime tokenizer/template

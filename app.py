@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import struct
 from time import monotonic
+from typing import Mapping
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -25,12 +26,13 @@ from pydantic import BaseModel, ValidationError
 import httpx
 
 from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequest
+from model_scheduler.chat_counting import ChatCountPort, ChatCountingError
 from model_scheduler.config import AppConfig, ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.envelope_validator import (
     DEFAULT_OUTPUT_POLICY,
     EnvelopeError,
-    check_chat_input,
+    check_chat_budget,
     check_embeddings_input,
     check_rerank_input,
     prepare_chat,
@@ -43,6 +45,17 @@ from model_scheduler.scheduler import ModelUnavailable, QueueFull
 # C06 input refusals onto HTTP: an over-limit request is 422 (m00-envelope §3),
 # an unsupported image media type is 415.
 _ENVELOPE_STATUS = {"unsupported_media_type": 415}
+
+# TC06: a count that cannot be proven is a service problem, an elapsed deadline is
+# a timeout — never a silently skipped budget.
+_COUNTING_STATUS = {"inference_timeout": 504, "service_unavailable": 503}
+
+
+def _chat_policy_for(chat_policy, model_id: str):
+    """One chat policy per request: a mapping is looked up, a single policy serves every model."""
+    if isinstance(chat_policy, Mapping):
+        return chat_policy.get(model_id)
+    return chat_policy
 
 
 class BodyError(ValueError):
@@ -324,7 +337,7 @@ async def application_lifespan(app: FastAPI):
             await app.state.owned_client.aclose()
 
 
-def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, token_counter=None, chat_policy=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, chat_counter: ChatCountPort | None = None, chat_policy=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover.
 
     The same surface serves schema v2 (plan/08 P19): the catalog derives the
@@ -333,9 +346,13 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
     back to the memory-reclaim timeout because v2 has no llama-swap section.
 
     A v2 registration also carries the measured C06 envelope, so chat/vision,
-    embeddings and rerank bodies are checked BEFORE any dispatch (P20):
-    `token_counter(model_id, messages, image_count)` supplies the runtime's own
-    token count (never a character estimate) when the deployment wires one.
+    embeddings and rerank bodies are checked BEFORE any dispatch (P20). The chat
+    route follows TC06 exactly: `prepare_chat` decides every local rule and the
+    budget without I/O, `acquire` owns the cold load, and only then does the
+    `chat_counter` count under that same lease — the receipt's identity is
+    re-validated before the gateway sees the prepared body. A v2 model whose
+    deployment provides no counter or no policy is refused (503), never dispatched
+    with a skipped budget. `chat_policy` may be one policy or a per-model mapping.
     """
     if not preload_retry_delays or any(delay <= 0 for delay in preload_retry_delays):
         raise ValueError("preload_retry_delays must contain positive values")
@@ -364,9 +381,11 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
     app.state.health_checks = health_checks
     app.state.boot_id = boot_id
     app.state.execution_stats = execution_stats
-    app.state.token_counter = token_counter
-    # The output-budget policy the compat route prepares bodies with (TC02). It is
-    # injected so a test can pin it, and defaults to the fixed image's own policy.
+    # The one counting path (TC05): a protocol object, never an optional callable.
+    app.state.chat_counter = chat_counter
+    # The policy the compat route prepares bodies with (TC02/TC04): one object, or
+    # one per model. It is injected so a test can pin it, and defaults to the fixed
+    # image's own policy.
     app.state.chat_policy = DEFAULT_OUTPUT_POLICY if chat_policy is None else chat_policy
     app.state.preload_retry_delays = preload_retry_delays  # the named lifespan reads it from state
 
@@ -524,49 +543,51 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
             return _error(503, "service_unavailable", "Service is not ready", request_id)
         deadline = monotonic() + config.gateway.inference_timeout_seconds
         dispatch_payload = payload
+        prepared = None
         if model.envelope is not None:
-            counter = app.state.token_counter
-            # The budget is decided once, here: the same prepared body is what the
-            # counter sees and what the gateway dispatches (TC02). The incoming
-            # payload is never modified.
+            # Every local rule and the output budget are decided once, here, with no
+            # I/O (TC02/TC03/TC04). A v2 model without a counter or a policy is a
+            # refusal, never a dispatch with a skipped budget (TC05).
+            policy = _chat_policy_for(app.state.chat_policy, body.model)
+            if policy is None or app.state.chat_counter is None:
+                return _error(503, "service_unavailable",
+                              "The input could not be counted against the envelope", request_id)
             try:
                 prepared = prepare_chat(payload, capabilities=model.capabilities, envelope=model.envelope,
-                                        policy=app.state.chat_policy)
+                                        policy=policy)
             except EnvelopeError as exc:
                 return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
-            dispatch_payload = prepared.decoded_body()
-
-            async def _count(messages, image_count):
-                return await counter(body.model, messages, image_count)
-
-            async def _check() -> None:
-                await check_chat_input(dispatch_payload, capabilities=model.capabilities, envelope=model.envelope,
-                                       token_counter=_count if counter is not None else None)
-
-            try:
-                await _check()
-            except EnvelopeError as exc:
-                return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
-            except Exception:
-                # The counter needs the runtime's own tokenizer and a cold model has
-                # none, so a cold deployment could never be counted and therefore
-                # never be loaded. Loading is not a dispatch: warm the model, then
-                # count again, and only refuse if compliance is still unproven (C06).
-                try:
-                    await app.state.scheduler.warm(body.model, deadline)
-                except Exception:
-                    return _error(503, "service_unavailable",
-                                  "The input could not be counted against the envelope", request_id)
-                try:
-                    await _check()
-                except EnvelopeError as exc:
-                    return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
-                except Exception:
-                    return _error(503, "service_unavailable",
-                                  "The input could not be counted against the envelope", request_id)
         lease = None
         try:
+            # acquire owns the cold load: the count needs the runtime's own tokenizer,
+            # and the very same lease protects the counted instance until the dispatch
+            # (TC06). A lease is a reservation, never a dispatch.
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
+            if prepared is not None:
+                try:
+                    receipt = await app.state.chat_counter.count(lease, prepared, deadline=deadline)
+                except ChatCountingError as exc:
+                    await app.state.scheduler.release(lease, Outcome.ABORTED)
+                    lease = None
+                    return _error(_COUNTING_STATUS.get(exc.code, 503), exc.code,
+                                  "The input could not be counted against the envelope", request_id)
+                try:
+                    # the counted input plus the prepared output must fit the envelope
+                    check_chat_budget(receipt.charged_input_tokens, prepared.output_tokens, model.envelope)
+                except EnvelopeError as exc:
+                    await app.state.scheduler.release(lease, Outcome.REJECTED)
+                    lease = None
+                    return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
+                try:
+                    await app.state.chat_counter.validate_binding(lease, receipt, deadline=deadline)
+                except ChatCountingError:
+                    # the accepted instance changed after the count: this is a refusal,
+                    # never an automatic retry on another instance
+                    await app.state.scheduler.release(lease, Outcome.ABORTED)
+                    lease = None
+                    return _error(503, "service_unavailable",
+                                  "The input could not be counted against the envelope", request_id)
+                dispatch_payload = prepared.decoded_body()
             opened = await app.state.gateway.open(lease, Capability.CHAT, dispatch_payload, deadline)
             if body.stream:
                 if opened.status_code != 200 or _media_type(opened.headers) != "text/event-stream":

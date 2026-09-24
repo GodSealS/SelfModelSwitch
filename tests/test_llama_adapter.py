@@ -460,6 +460,45 @@ async def test_a_dispatch_that_outlives_the_deadline_is_a_timeout_not_a_backend_
 
 
 @pytest.mark.asyncio
+async def test_count_template_sends_the_projection_and_the_policy_tokenize_options() -> None:
+    """TC05: the compat counter sends exactly its projection, and the policy's tokenize options."""
+    seen: list[dict] = []
+
+    def apply_template(request: httpx.Request) -> httpx.Response:
+        seen.append({"path": "/apply-template", "body": json.loads(request.content)})
+        return httpx.Response(200, json={"prompt": "hello world"})
+
+    def tokenize(request: httpx.Request) -> httpx.Response:
+        seen.append({"path": "/tokenize", "body": json.loads(request.content)})
+        return httpx.Response(200, json={"tokens": [1, 2, 3]})
+
+    client, _transport = _client({"/apply-template": apply_template, "/tokenize": tokenize})
+    adapter = _adapter(client)
+
+    tokens = await adapter.count_template(
+        {"messages": [{"role": "user", "content": "hello"}], "tools": []},
+        tokenize_options={"add_special": True}, deadline=_deadline())
+
+    assert tokens == 3
+    assert seen[0]["body"] == {"messages": [{"role": "user", "content": "hello"}], "tools": []}
+    assert seen[1]["body"] == {"content": "hello world", "add_special": True}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_count_template_refuses_a_bad_template_or_tokenize_answer() -> None:
+    def broken_template(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"not_a_prompt": True})
+
+    client, _transport = _client({"/apply-template": broken_template, "/tokenize": _tokenize_by_words})
+    adapter = _adapter(client)
+    with pytest.raises(Exception) as error:
+        await adapter.count_template({"messages": [{"role": "user", "content": "hello"}]}, deadline=_deadline())
+    assert getattr(error.value, "code", None) == "backend_failed"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_token_counting_failure_refuses_dispatch() -> None:
     dispatched: list[str] = []
 

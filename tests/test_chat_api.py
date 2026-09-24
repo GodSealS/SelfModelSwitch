@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app import BodyError, _read_json, create_app
+from model_scheduler.chat_counting import ChatCountingError, CountReceipt
 from model_scheduler.contracts import GatewayError, Lease, Outcome
+from model_scheduler.control_protocol_v1 import InstanceIdentity
 from model_scheduler.envelope_validator import FixedOutputBudgetPolicy
 from model_scheduler.scheduler import QueueFull
 
@@ -304,7 +306,8 @@ def _load_v2_config(tmp_path: Path):
 def test_a_v2_registration_drives_the_same_chat_surface(tmp_path) -> None:
     config = _load_v2_config(tmp_path)
     scheduler = Scheduler()
-    app = create_app(config=config, scheduler=scheduler, gateway=Gateway())
+    app = create_app(config=config, scheduler=scheduler, gateway=Gateway(),
+                     chat_counter=StubCounter(), chat_policy=SYNTHETIC_POLICY)
 
     with TestClient(app) as client:
         unknown = client.post("/v1/chat/completions", json={"model": "missing", "messages": []})
@@ -360,6 +363,33 @@ class RecordingGateway:
         return StreamOpened() if payload.get("stream") else Opened()
 
 
+def _instance(model_id: str) -> InstanceIdentity:
+    return InstanceIdentity(container_id="container-1", started_at="2026-09-24T00:00:00Z", deployment_id="orin-lab",
+                            model_id=model_id, runtime_id="llama-cpp-1", candidate_digest="c" * 64,
+                            image_digest="sms-llama-cpp@sha256:" + "a" * 64)
+
+
+class StubCounter:
+    """A minimal ChatCountPort (TC05): one receipt for the prepared request."""
+
+    def __init__(self, *, tokens: int = 8, failure: Exception | None = None) -> None:
+        self.tokens, self.failure = tokens, failure
+        self.counted: list[str] = []
+        self.bindings: list[str] = []
+
+    async def count(self, lease, request, *, deadline):
+        self.counted.append(lease.model_id)
+        if self.failure is not None:
+            raise self.failure
+        return CountReceipt(body_sha256=request.body_sha256, policy_id=request.policy_id,
+                            generation=lease.generation, instance=_instance(lease.model_id),
+                            template_sha256="a" * 64, template_tokens=self.tokens, image_charge=0,
+                            charged_input_tokens=self.tokens)
+
+    async def validate_binding(self, lease, receipt, *, deadline):
+        self.bindings.append(lease.model_id)
+
+
 def _post_budget(tmp_path: Path, payload: dict, gateway: RecordingGateway):
     """One request through the extension's public software fixture: envelope 8192 / 4096 / 1024."""
     import importlib.util
@@ -372,12 +402,8 @@ def _post_budget(tmp_path: Path, payload: dict, gateway: RecordingGateway):
     from model_scheduler.config import load_config
 
     scheduler = Scheduler()
-
-    async def counter(model_id, messages, image_count):
-        return 8
-
     app = create_app(config=load_config(path), scheduler=scheduler, gateway=gateway,
-                     token_counter=counter, chat_policy=SYNTHETIC_POLICY)
+                     chat_counter=StubCounter(), chat_policy=SYNTHETIC_POLICY)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=payload)
     return response, scheduler, gateway
@@ -524,26 +550,20 @@ def _contract_fixture(tmp_path: Path, *, new_capabilities: bool) -> Path:
     return path
 
 
-def _post_contract(tmp_path: Path, payload: dict, *, new_capabilities: bool = False, counter=8):
-    """One request through the fixture, with every runtime call counted."""
+def _post_contract(tmp_path: Path, payload: dict, *, new_capabilities: bool = False, counter: StubCounter | None = None):
+    """One request through the fixture, with every method call counted."""
     from model_scheduler.config import load_config
 
     gateway = RecordingGateway()
     scheduler = RecordingScheduler()
-    calls = {"counter": 0}
-
-    async def counting_counter(model_id, messages, image_count):
-        calls["counter"] += 1
-        if counter is None:
-            raise RuntimeError("the runtime cannot tokenize yet")
-        return counter
+    counter = counter or StubCounter()
 
     app = create_app(config=load_config(_contract_fixture(tmp_path, new_capabilities=new_capabilities)),
-                     scheduler=scheduler, gateway=gateway, token_counter=counting_counter,
+                     scheduler=scheduler, gateway=gateway, chat_counter=counter,
                      chat_policy=CONTRACT_POLICY)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=payload)
-    return response, scheduler, gateway, calls
+    return response, scheduler, gateway, counter
 
 
 _USER = {"role": "user", "content": "hi"}
@@ -573,7 +593,7 @@ LOCAL_REFUSALS = [
 
 @pytest.mark.parametrize("name,extra,code,param", LOCAL_REFUSALS, ids=[case[0] for case in LOCAL_REFUSALS])
 def test_a03_a04_a06_local_refusals_are_422_and_make_no_runtime_call(tmp_path, name, extra, code, param) -> None:
-    response, scheduler, gateway, calls = _post_contract(
+    response, scheduler, gateway, counter = _post_contract(
         tmp_path, {"model": "qwen-small", "messages": [_USER], **extra}, new_capabilities=True)
 
     assert response.status_code == 422, response.text
@@ -581,7 +601,7 @@ def test_a03_a04_a06_local_refusals_are_422_and_make_no_runtime_call(tmp_path, n
     assert error["code"] == code and error["param"] == param
     # the refusal is local: not a lease, a warm-up, a token count or a dispatch
     assert scheduler.acquired == [] and scheduler.warmed == [] and scheduler.releases == []
-    assert calls["counter"] == 0 and gateway.payloads == []
+    assert counter.counted == [] and gateway.payloads == []
 
 
 @pytest.mark.parametrize("extra,param", [
@@ -590,33 +610,33 @@ def test_a03_a04_a06_local_refusals_are_422_and_make_no_runtime_call(tmp_path, n
     ({"messages": [_USER, {"role": "assistant", "content": "42", "reasoning_content": "why"}]}, "messages"),
 ])
 def test_a04_a06_a_model_without_the_new_capabilities_is_refused_before_any_call(tmp_path, extra, param) -> None:
-    response, scheduler, gateway, calls = _post_contract(
+    response, scheduler, gateway, counter = _post_contract(
         tmp_path, {"model": "qwen-small", "messages": [_USER], **extra})
 
     assert response.status_code == 422, response.text
     error = response.json()["error"]
     assert error["code"] == "capability_mismatch" and error["param"] == param
     assert scheduler.acquired == [] and scheduler.warmed == []
-    assert calls["counter"] == 0 and gateway.payloads == []
+    assert counter.counted == [] and gateway.payloads == []
 
 
 @pytest.mark.parametrize("field", ["chat_template", "chat_template_kwargs", "reasoning_format",
                                    "parse_tool_calls", "generation_prompt"])
 def test_a06_local_a_new_capability_model_refuses_template_overrides(tmp_path, field) -> None:
-    response, scheduler, gateway, calls = _post_contract(
+    response, scheduler, gateway, counter = _post_contract(
         tmp_path, {"model": "qwen-small", "messages": [_USER], field: None}, new_capabilities=True)
 
     assert response.status_code == 422, response.text
     error = response.json()["error"]
     assert error["code"] == "contract_violation" and error["param"] == field
-    assert scheduler.acquired == [] and gateway.payloads == [] and calls["counter"] == 0
+    assert scheduler.acquired == [] and gateway.payloads == [] and counter.counted == []
 
 
 def test_a03_the_accepted_tool_fields_reach_the_upstream_unchanged(tmp_path) -> None:
     tool_choice = {"type": "function", "function": {"name": "get_weather"}}
     sent = {"model": "qwen-small", "messages": [_USER], "tools": [_tool()], "tool_choice": tool_choice,
             "parallel_tool_calls": False, "max_tokens": 64, "reasoning_effort": "low"}
-    response, scheduler, gateway, calls = _post_contract(tmp_path, sent, new_capabilities=True)
+    response, scheduler, gateway, counter = _post_contract(tmp_path, sent, new_capabilities=True)
 
     assert response.status_code == 200, response.text
     dispatched = gateway.payloads[0]
@@ -624,13 +644,13 @@ def test_a03_the_accepted_tool_fields_reach_the_upstream_unchanged(tmp_path) -> 
     assert dispatched["parallel_tool_calls"] is False and dispatched["reasoning_effort"] == "low"
     assert dispatched["max_tokens"] == 64 and "max_completion_tokens" not in dispatched
     assert scheduler.acquired == ["qwen-small"] and scheduler.releases == [Outcome.SUCCESS]
-    assert calls["counter"] == 1
+    assert counter.counted == ["qwen-small"] and counter.bindings == ["qwen-small"]
 
 
 def test_a04_a_closed_history_reaches_the_upstream_with_its_ids(tmp_path) -> None:
     messages = [_USER, {"role": "assistant", "tool_calls": [_call()]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "{\"marker\":\"OK\"}"}]
-    response, scheduler, gateway, calls = _post_contract(
+    response, scheduler, gateway, counter = _post_contract(
         tmp_path, {"model": "qwen-small", "messages": messages, "max_tokens": 64}, new_capabilities=True)
 
     assert response.status_code == 200, response.text
@@ -638,4 +658,56 @@ def test_a04_a_closed_history_reaches_the_upstream_with_its_ids(tmp_path) -> Non
     assert dispatched[1]["tool_calls"][0]["id"] == "call_1"
     assert dispatched[1]["tool_calls"][0]["function"]["arguments"] == "{}"
     assert dispatched[2]["tool_call_id"] == "call_1"
-    assert scheduler.acquired == ["qwen-small"] and calls["counter"] == 1
+    assert scheduler.acquired == ["qwen-small"] and counter.counted == ["qwen-small"]
+
+
+# --------------------------------------------------------------------------- TC05/TC06: the lease-bound count
+
+
+def test_a05_a_count_that_cannot_be_proven_is_503_and_aborts_the_lease(tmp_path) -> None:
+    counter = StubCounter(failure=ChatCountingError("service_unavailable", "the runtime is gone"))
+    response, scheduler, gateway, counter = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": [_USER]}, counter=counter)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert scheduler.acquired == ["qwen-small"] and scheduler.releases == [Outcome.ABORTED]
+    assert gateway.payloads == []
+
+
+def test_a05_an_expired_count_is_504_and_aborts_the_lease(tmp_path) -> None:
+    counter = StubCounter(failure=ChatCountingError("inference_timeout", "the deadline elapsed"))
+    response, scheduler, gateway, counter = _post_contract(
+        tmp_path, {"model": "qwen-small", "messages": [_USER]}, counter=counter)
+
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["code"] == "inference_timeout"
+    assert scheduler.releases == [Outcome.ABORTED] and gateway.payloads == []
+
+
+def test_a05_an_unbound_counter_is_refused_before_any_lease(tmp_path) -> None:
+    # a v2 envelope without a counter must refuse (503), never dispatch with a skipped budget
+    from model_scheduler.config import load_config
+
+    scheduler, gateway = RecordingScheduler(), RecordingGateway()
+    app = create_app(config=load_config(_contract_fixture(tmp_path, new_capabilities=False)),
+                     scheduler=scheduler, gateway=gateway, chat_counter=None, chat_policy=CONTRACT_POLICY)
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [_USER]})
+
+    assert response.status_code == 503 and response.json()["error"]["code"] == "service_unavailable"
+    assert scheduler.acquired == [] and gateway.payloads == []
+
+
+def test_a05_an_unbound_policy_is_refused_before_any_lease(tmp_path) -> None:
+    from model_scheduler.config import load_config
+
+    scheduler, gateway = RecordingScheduler(), RecordingGateway()
+    app = create_app(config=load_config(_contract_fixture(tmp_path, new_capabilities=False)),
+                     scheduler=scheduler, gateway=gateway, chat_counter=StubCounter(), chat_policy={})
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "qwen-small", "messages": [_USER]})
+
+    assert response.status_code == 503 and scheduler.acquired == [] and gateway.payloads == []

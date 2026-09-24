@@ -18,8 +18,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app import create_app
+from model_scheduler.chat_counting import ChatCountingError, CountReceipt
 from model_scheduler.contracts import Lease, Outcome
 from model_scheduler.contracts_v2 import Envelope
+from model_scheduler.control_protocol_v1 import InstanceIdentity
 from model_scheduler.envelope_validator import (
     CAPABILITY_INPUT_KEYS,
     DEFAULT_MAX_BATCH,
@@ -260,23 +262,24 @@ class _Opened:
 
 
 class _Scheduler:
-    def __init__(self, *, warm_error: Exception | None = None) -> None:
+    def __init__(self) -> None:
         self.leases: list[str] = []
         self.outcomes: list[Outcome] = []
         self.warmed: list[str] = []
-        self._warm_error = warm_error
+        self.acquire_deadlines: list[float] = []
 
     async def acquire(self, model_id, request_id, deadline):
         self.leases.append(model_id)
+        self.acquire_deadlines.append(deadline)
         return Lease("lease", request_id, model_id, 1)
 
     async def release(self, lease, outcome, tokens=None):
         self.outcomes.append(outcome)
 
     async def warm(self, model_id, deadline):
+        # TC05: acquire owns the load; nothing may warm outside it any more.
         self.warmed.append(model_id)
-        if self._warm_error is not None:
-            raise self._warm_error
+        raise AssertionError("the compat route must not warm outside acquire")
 
 
 class _Gateway:
@@ -288,21 +291,46 @@ class _Gateway:
         return _Opened()
 
 
-def _compat_app(config, *, counter_value: int):
+def _instance(model_id: str) -> InstanceIdentity:
+    return InstanceIdentity(container_id="container-1", started_at="2026-09-24T00:00:00Z", deployment_id="orin-lab",
+                            model_id=model_id, runtime_id="llama-cpp-1", candidate_digest="c" * 64,
+                            image_digest="sms-llama-cpp@sha256:" + "a" * 64)
+
+
+class _CountingStub:
+    """A minimal ChatCountPort: one receipt for the prepared request (TC05)."""
+
+    def __init__(self, *, tokens: int, image_charge: int = 0, failure: Exception | None = None) -> None:
+        self.tokens, self.image_charge, self.failure = tokens, image_charge, failure
+        self.counted: list[tuple[str, str, float]] = []
+        self.bindings: list[str] = []
+
+    async def count(self, lease, request, *, deadline):
+        self.counted.append((lease.model_id, request.body_sha256, deadline))
+        if self.failure is not None:
+            raise self.failure
+        return CountReceipt(body_sha256=request.body_sha256, policy_id=request.policy_id,
+                            generation=lease.generation, instance=_instance(lease.model_id),
+                            template_sha256="a" * 64, template_tokens=self.tokens,
+                            image_charge=self.image_charge,
+                            charged_input_tokens=self.tokens + self.image_charge)
+
+    async def validate_binding(self, lease, receipt, *, deadline):
+        self.bindings.append(lease.model_id)
+
+
+def _compat_app(config, *, counter_value: int, counter: _CountingStub | None = None):
     scheduler, gateway = _Scheduler(), _Gateway()
-
-    async def counter(model_id, messages, image_count):
-        assert model_id == "qwen-small" and messages and image_count == 0  # the fixture reached the runtime counter
-        return counter_value
-
-    app = create_app(config=config, scheduler=scheduler, gateway=gateway, token_counter=counter)
-    return app, scheduler, gateway
+    counter = counter or _CountingStub(tokens=counter_value)
+    app = create_app(config=config, scheduler=scheduler, gateway=gateway, chat_counter=counter,
+                     chat_policy=SYNTHETIC_POLICY)
+    return app, scheduler, gateway, counter
 
 
 def test_the_compat_chat_route_passes_exactly_at_the_token_budget(tmp_path) -> None:
     config = _load_v2_config(tmp_path)
     boundary = config.models["qwen-small"].envelope.max_input_tokens
-    app, scheduler, gateway = _compat_app(config, counter_value=boundary)
+    app, scheduler, gateway, counter = _compat_app(config, counter_value=boundary)
 
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions",
@@ -310,66 +338,58 @@ def test_the_compat_chat_route_passes_exactly_at_the_token_budget(tmp_path) -> N
 
     assert response.status_code == 200, response.text
     assert gateway.opened == 1 and scheduler.outcomes == [Outcome.SUCCESS]
+    # the count ran under the acquired lease and under the request's own deadline
+    assert [model_id for model_id, _, _ in counter.counted] == ["qwen-small"]
+    assert counter.counted[0][2] == scheduler.acquire_deadlines[0]
+    assert counter.bindings == ["qwen-small"]
 
 
-def test_one_token_over_the_budget_is_422_and_never_reaches_lease_or_gateway(tmp_path) -> None:
+def test_one_token_over_the_budget_is_422_and_never_dispatches(tmp_path) -> None:
     config = _load_v2_config(tmp_path)
     boundary = config.models["qwen-small"].envelope.max_input_tokens
-    app, scheduler, gateway = _compat_app(config, counter_value=boundary + 1)
+    app, scheduler, gateway, counter = _compat_app(config, counter_value=boundary + 1)
 
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions",
                                json={"model": "qwen-small", "messages": _chat_messages()})
 
     assert response.status_code == 422 and response.json()["error"]["code"] == "envelope_exceeded"
-    assert scheduler.leases == [] and gateway.opened == 0  # no dispatch happened at all
+    # the model may already be loaded (the count needs it), but nothing was dispatched
+    assert gateway.opened == 0 and scheduler.outcomes == [Outcome.REJECTED]
 
 
 def test_the_compat_chat_route_refuses_an_image_for_a_model_without_vision(tmp_path) -> None:
     config = _load_v2_config(tmp_path)
-    app, scheduler, gateway = _compat_app(config, counter_value=1)
+    app, scheduler, gateway, counter = _compat_app(config, counter_value=1)
 
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions",
                                json={"model": "qwen-small", "messages": _vision_messages(_png(64, 64))})
 
     assert response.status_code == 422 and response.json()["error"]["code"] == "capability_mismatch"
-    assert scheduler.leases == [] and gateway.opened == 0
+    assert scheduler.leases == [] and counter.counted == [] and gateway.opened == 0
 
 
-def test_a_cold_counter_warms_the_model_then_counts_again(tmp_path) -> None:
-    """A cold model has no tokenizer, so the count can never succeed before a load."""
+def test_the_count_runs_under_the_acquired_lease_and_never_warms(tmp_path) -> None:
+    """TC05/TC06: acquire owns the cold load; the count is one step under the lease."""
     config = _load_v2_config(tmp_path)
     boundary = config.models["qwen-small"].envelope.max_input_tokens
-    calls = {"n": 0}
-
-    async def counter(model_id, messages, image_count):
-        calls["n"] += 1
-        if calls["n"] == 1:  # the model is cold, so the runtime cannot tokenize yet
-            raise RuntimeError("upstream is not loaded")
-        return boundary
-
-    scheduler, gateway = _Scheduler(), _Gateway()
-    app = create_app(config=config, scheduler=scheduler, gateway=gateway, token_counter=counter)
+    app, scheduler, gateway, counter = _compat_app(config, counter_value=boundary)
 
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions",
                                json={"model": "qwen-small", "messages": _chat_messages()})
 
     assert response.status_code == 200, response.text
-    assert scheduler.warmed == ["qwen-small"]  # loading happened, and only once
-    assert calls["n"] == 2 and gateway.opened == 1
+    assert scheduler.warmed == [] and scheduler.leases == ["qwen-small"]
+    assert len(counter.counted) == 1 and gateway.opened == 1
+    assert scheduler.outcomes == [Outcome.SUCCESS]
 
 
-def test_a_model_that_cannot_be_warmed_is_still_refused(tmp_path) -> None:
+def test_a_count_that_cannot_be_proven_is_refused_and_aborts_the_lease(tmp_path) -> None:
     config = _load_v2_config(tmp_path)
-    scheduler = _Scheduler(warm_error=RuntimeError("the disk is gone"))
-    gateway = _Gateway()
-
-    async def counter(model_id, messages, image_count):
-        raise RuntimeError("upstream is not loaded")
-
-    app = create_app(config=config, scheduler=scheduler, gateway=gateway, token_counter=counter)
+    counter = _CountingStub(tokens=1, failure=ChatCountingError("service_unavailable", "the runtime is gone"))
+    app, scheduler, gateway, counter = _compat_app(config, counter_value=1, counter=counter)
 
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions",
@@ -377,7 +397,7 @@ def test_a_model_that_cannot_be_warmed_is_still_refused(tmp_path) -> None:
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "service_unavailable"
-    assert scheduler.leases == [] and gateway.opened == 0  # compliance is still unproven
+    assert gateway.opened == 0 and scheduler.outcomes == [Outcome.ABORTED]  # compliance is still unproven
 
 
 def test_no_audio_or_video_route_exists_on_the_compatibility_surface() -> None:

@@ -462,7 +462,10 @@ def test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes(sdir)
                   "observers": {mid: object() for mid in config.models},
                   "clients": {mid: httpx.AsyncClient(base_url="http://127.0.0.1:1") for mid in config.models}}
     context = run_module.build_v2_context(config, config_sha256="a" * 64, env={run_module._V2_DEPLOYMENT_ENV: "orin-lab"}, ports=fake_ports)
-    app = run_module.build_v2_tcp_app(context)
+    # No versioned policy is bound to these fixture models, so the compat chat
+    # must refuse (503) rather than dispatch with a skipped budget — which is
+    # exactly the assertion below (TC05).
+    app = run_module.build_v2_tcp_app(context, policies={})
 
     with _TestClient(app) as client:
         assert client.get("/live").status_code == 200
