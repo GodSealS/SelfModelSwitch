@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00 已执行（基线材料已核实），CT01—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00、CT01 已执行（CT01 含未补齐的 27B 材料，见下），CT02—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -45,7 +45,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | ID | 任务 | 依赖 | 状态 | 实际SHA / 证据 |
 |---|---|---|---|---|
 | CT00 | 基线、硬件与部署输入确认 | 无 | done | `854f39e1…`；目标证据 `ct00-tool-calling-baseline-20260924T040501Z/`，`site_input_sha256=51b970e2…` |
-| CT01 | 固定镜像探测工具与基线材料 | CT00 | pending | — |
+| CT01 | 固定镜像探测工具与基线材料 | CT00 | done | `7f1fdf78…`；目标证据 `ct01-baseline-20260924T050824Z/`：`inspect-a`（exit 0、missing 0）、`probe-e`（38/64）；D01/D04 passed |
 | CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | pending | — |
 | CT03 | 模型能力与execution operation分离 | CT02 | pending | — |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | pending | — |
@@ -123,6 +123,47 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：`$SMS_PY -m pytest tests/test_chat_probe.py -q`；假HTTP测试证明未知字段200不等于支持、失败不能写passed；
   按AGENTS提交/同步工具后执行baseline probe。通过条件是记录真实完整，非要求基线已经支持新能力。
 - 文档：回填D项状态与源版本；不得用master文档作为固定镜像的唯一证据。
+
+### CT01 探测工具与基线材料（2026-09-24 已执行）
+
+- 交付：`model_scheduler/acceptance/chat_probe.py`（`inspect` / `probe` 两个子命令）与 `tests/test_chat_probe.py`；
+  分支 `feature/ct01-chat-probe`，目标 checkout 同步到 `7f1fdf78d369de7bbd3b05001f1eed2d9938782e`（干净）。
+- 目标材料：`/home/jtzn/self-model-switch-evidence/ct01-baseline-20260924T050824Z/`
+  - `site/site-input.json`（`site_sha256=6b1baf519eb676f7665c9582967270fb09fbd8b54a79c745bc9dae78932598c4`，
+    `expected_sha=7f1fdf78…`，phase baseline，硬件与模型 hash 沿用 CT00 已核实值）。
+  - `inspect-a/`（exit 0、`missing=0`）：镜像 `version: 0.4.1-dev (build 1, commit 4bc272f)`、help 全量、
+    两个模型的 GGUF 模板字节与 hash、逐资产 sha256、git 状态、硬件原始记录、容器 argv。
+  - `probe-e/`（最终跑，38/64 请求，未发无预算请求）：`probe.json`、`policy-candidates.json`、逐请求/响应/观测原始文件。
+- D 项结论（`probe-e`，逐项均带原始材料）：
+
+| 项 | 状态 | 实测结论 |
+|---|---|---|
+| D01 身份 | passed | 镜像 digest、`Id` 与登记一致；版本/commit `4bc272f`；模板可读；四个资产 hash 一致；checkout 干净且等于 `expected_sha` |
+| D02 预算 | needs_candidate | `max_tokens`、`max_completion_tokens`、`n_predict` 在 7B 与 27B 上均被**耗尽证明**限制输出（32→32、64→64、finish_reason=length）；无预算缺省**未在基线测量**（见下） |
+| D03 工具选择 | needs_candidate | 基线未登记 tools：五个 tool_choice 变体均未产生工具调用 |
+| D04 工具模板计数 | passed | apply-template+tokenize 与 chat `prompt_tokens` 一致；工具定义变化影响计数 |
+| D05 历史计数 | needs_candidate | 服务以 422 `message content must be a string or part list` 拒绝带 `tool_calls` 的 assistant；CT04 负责该形状 |
+| D06 thinking | not_run | 27B 在本用例期间无法服务（见下）；**effort 允许集未取得，不可当作空集结论** |
+| D07 图片组合 | failed | 7B vision 通过且图片被计费（53 > 23）；27B vision 502、27B 组合 422，同因于 27B 被置 error |
+| D08 服务合成历史 | needs_candidate | 基线仅记录三个合成历史的 HTTP 码与失败阶段 |
+| D09 参数覆盖 | needs_candidate | 五个模板/解析覆盖字段与一个未知字段全部被转发（200），基线不执行拒绝策略；未知字段 200 未被当作支持证据 |
+
+- 策略候选（`probe-e/policy-candidates.json`，供 CT06 登记，仍是待验证候选）：
+  `source_revision=4bc272f`；help 中存在 `--jinja`、`--reasoning-format`、`--reasoning-effort`、`--reasoning-budget`、
+  `--ignore-eos`、`--chat-template-kwargs`（存在≠已启用，实际 argv 未含 `--jinja`/`--reasoning-format`）；
+  recognized/supported 输出预算字段均含 `max_tokens,max_completion_tokens,n_predict`；
+  模板 hash `qwen25vl-7b=a0bc6f6f…`、`qwen36-27b=e84f32a2…`；`effort_values` 未取得。
+- **部署行为发现（对 CT05/CT06/CT10 有直接影响）**：
+  1. 任一请求在上游失败（502）后，调度器把该模型置为 `State.ERROR` + `admission_blocked=true`，
+     此后该模型的请求一律 503 "Service is not ready"，**只有重启调度器才能清除**（`/api/recover` 与
+     `/api/models/{id}/unload` 均不能，unload 返回 409 `model_busy`）。本轮三次触发、三次以同配置重启恢复。
+  2. 基线不发送无预算请求：实测该类请求会无界生成、以 abort 结束并把模型留在 error 状态。
+     probe 仅在 **candidate** 相位发送它（CT02 给出有效缺省后才是安全的），基线记为
+     `needs_candidate` + `not_measured`。
+  3. 恢复后 smoke 显示 27B **默认就产生 `reasoning_content`**（TC07 "默认生成可提取思考" 的候选证据，
+     但那是 smoke 观测，不是 D06 用例结果）。
+- 未完成项（不得当作已验证）：27B 的 D06/D07 材料未取得，CT10 候选阶段必须补齐；
+  thinking、27B vision 与工具+思考组合**未经验证**；`effort_values` 未取得，CT06 不得按"空集"登记。
 
 ### CT02 输出预算纵向修复
 

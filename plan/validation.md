@@ -1915,3 +1915,38 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 最终部署状态：未变更（llama-swap pid 16492 + 调度器 pid 290846 继续运行；LAN 网关 pid 10061 仍在 0.0.0.0:8091）。
 - 未完成项：CT01—CT12 未执行；`template_sha256` 待 CT01 inspect 提取；目标 `origin` 为本地镜像而非 GitHub 的偏差未消除，
   CT01 起按 README CT00 节第 1 条的守卫口径执行（不修改目标 git 配置）。
+
+### CT01 探测工具与基线材料（2026-09-24，交付分支 `feature/ct01-chat-probe`）
+
+- Python/环境：本地 `.venv` Python 3.13.5（仓库依赖齐备；发布解释器 3.12 仅在目标 `venv312` 使用，
+  目标为 Python 3.12.14）。目标命令一律用 `/home/jtzn/self-model-switch-build/venv312/bin/python3`。
+- 软件交付与检查（exit 均为 0）：
+  - `.venv/bin/python -m pytest tests/test_chat_probe.py -q` → **23 passed**（含：未知字段 200 不写 passed、
+    短答案不证明预算、限额预检退 2、非空输出退 2、未知参数退 2、site 输入闭集与类型拒绝、
+    GGUF 数组对齐、无预算请求延后/基线不发、502/503 记为 not_run、镜像 digest 两种形式等价）。
+  - `.venv/bin/python -m pytest tests -m 'not thor' -q` → **1054 passed、1 skipped、1 deselected**（交付前全量）。
+  - `.venv/bin/python -m ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+  - 提交链（同一分支，逐次 push 到 GitHub **与**目标镜像 `ssh://jtzn@192.168.55.1/home/jtzn/git/SelfModelSwitch.git`，
+    两端 ref 每次核对相同）：`c105e84`（工具首版）→ `b774ca8`（GGUF 数组对齐）→ `9fc3a97`
+    （digest 比对、total 超时、无预算延后）→ `a79a3a5`（not_run 判定）→ `be096c7`（基线不发无预算请求）
+    → `7f1fdf78d369de7bbd3b05001f1eed2d9938782e`（502/503 判定，最终）。
+- 目标同步：每次 push 后 `git pull --ff-only`，`git status --porcelain --untracked-files=all` 为空且
+  HEAD 等于预期提交；最终 `verified_target_sha=7f1fdf78…`。
+- 目标执行（UTC 起止 2026-09-24T05:08Z—09:20Z，证据目录 `ct01-baseline-20260924T050824Z/`）：
+  - `chat_probe inspect --site …/site/site-input.json --output …/inspect-a` → **exit 0**，`missing=0`，
+    取到镜像版本 `0.4.1-dev (build 1, commit 4bc272f)`、两个模型 GGUF 模板字节/hash、四个资产 hash 一致。
+  - `chat_probe probe --phase baseline` 共四次：`probe-a`（暴露 digest 比对 bug 与 60s 读超时切掉冷加载）、
+    `probe-b`（D01 转 passed）、`probe-c`（暴露无预算请求把两个模型留在 error）、`probe-e`（最终，
+    **38/64 请求、未发无预算请求**，exit 0 表示采集完整）。
+  - D 项状态与结论见 `plan/tool-calling-and-reasoning/README.md` 的 CT01 节；`probe-e/probe.json`
+    与 `probe-e/policy-candidates.json` 是唯一结论来源。
+- 部署影响与恢复（如实记录）：三次因上游失败把模型置 `State.ERROR`+`admission_blocked`，
+  均以同一身份与配置重启调度器恢复（`SELFMODEL_SWITCH_DEPLOYMENT_ID=sms-orin-lab2`、
+  `SELFMODEL_SWITCH_SWAP_CONTROL_URL=http://127.0.0.1:8080`、`deploy2/scheduler-v2.json`）。
+  最终状态（证据 `post-run-state.txt`）：pid 320716 运行于 `7f1fdf78…`，`/live` 200，
+  **7B 与 27B 均 `ready`、无 blocked、无 last_error**，两个模型的有界 smoke 均 200
+  （7B 回 `OK`；27B 返回时带非空 `reasoning_content`）。llama-swap（pid 16492）与 LAN 网关（pid 10061）本轮未改动。
+- 失败材料：`probe-a`、`probe-b`、`probe-c`、`probe-d` 四份原始材料**全部保留**，未被覆盖或删除；
+  其中 `probe-c` 是无预算请求破坏部署的直接证据。
+- 未完成项：27B 的 D06/D07 材料未取得（受上述部署行为影响），CT10 候选阶段补齐；
+  `effort_values` 未取得，CT06 不得按空集登记；thinking 与工具+思考组合未验证。
