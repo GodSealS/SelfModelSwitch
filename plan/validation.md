@@ -2021,3 +2021,32 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 既有慢用例（非本轮引入，已单独复现）：`tests/integration/test_control_socket.py::test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes`
   等待兼容 chat 路由的 900 s deadline 后按断言返回 503，`1 passed in 900.55 s`；全量套件耗时约 942 s 主要来自该用例。
 - 未完成项：可启动/可服务（新 profile 与 flag 门禁）属 CT06；本任务无硬件行为变更，不宣称真机能力通过。
+
+### CT04 兼容 chat 字段契约、历史状态机与能力检查（2026-09-24，交付分支 `feature/ct04-request-contract`）
+
+- Python/环境：本地 `/Users/monster/.local/share/selfmodelswitch/venv312` 3.12.11；目标 3.12.14。
+- 软件交付与检查（exit 均为 0）：
+  - RED：新增 A03/A04/A06-local 用例先失败（`FixedOutputBudgetPolicy` 缺 `effort_values`/`denied_template_fields`
+    → 收集错误；形状/上限/历史用例因校验缺失而放行）。
+  - GREEN：`pytest tests/test_envelopes.py tests/test_chat_api.py -q` → **127 passed**；
+    相邻受影响 8 文件（config/contracts_v2/control_protocol_v1/evidence_contracts/llama_adapter/software_cases/
+    embedding_rerank_api/backend_cases）→ **197 passed**；全量 `pytest tests -m 'not thor' -q`
+    → **1156 passed、1 skipped、1 deselected**（944.16 s）；`ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+  - 矩阵覆盖：A03（名称 1/64 与 65/点号/末尾换行、可选字段省略但不可 null、strict 缺省/false 与 true/null、
+    tools 32/33、单对象 8192/8193、数组 65536/65537、tool_choice 结构、parallel 非 false 拒绝）；
+    A04（assistant content 缺省/null/空串、tool_calls null/[]、arguments 非字符串、id 64/65、arguments 262144/262145、
+    每条 32/33 调用、孤立/重复/未完成结果、串行与乱序批次、无当前 tools 仍判能力、reasoning 仅 assistant 且
+    null 占位≠空串）；A06-local（effort 缺省/空串/非空、未列值 422、五个模板覆盖字段在新能力模型上拒绝、
+    无新能力模型保持透传、tool_choice↔tools 关联矩阵）。
+  - 零调用证据：HTTP 级用例断言 422 时 `acquire`/`warm`/`release` 均未发生、counter 调用数为 0、gateway 未打开。
+  - 提交：`4b7303b14217c35bd5ab20f77c5e6efef8363902`；push 到 GitHub 与目标镜像后两端 ref 相同。
+- 目标同步与同 SHA 复跑（证据 `ct04-contract-20260924T144322Z/`）：checkout 起始于
+  `feature/ct03-capability-operations`@`a90494e`（干净）→ 守卫流程（状态为空、fetch、switch、`pull --ff-only`）
+  → `verified_target_sha=4b7303b1…`、状态仍为空、镜像 ref 相同。
+  - 受影响八文件 → **297 passed**（14.08 s）；`import ok`；`DEFAULT_OUTPUT_POLICY` 字段核对
+    （`effort_values=[]`、denied 五字段）。
+- 部署影响：**未重启调度器**（pid 322176 仍为 CT02 代码）。CT04 对当前 chat/vision 注册的普通请求行为不变，
+  仅新增“工具/思考类字段的本地拒绝”；该路径的切换在 CT10 候选部署时生效。
+- 既有慢用例（非本轮引入）：`test_v2_tcp_app_…` 等待 900 s deadline，全量套件耗时约 944 s。
+- 未完成项：A03/A04/A06 的真机列属 CT10 候选阶段；`effort_values` 待 CT06 用探测结果登记，
+  当前空集为 fail-closed 默认而非镜像语义声明。

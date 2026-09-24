@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT03 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证；CT03 为纯软件契约任务，目标同 SHA 复跑通过），CT04—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT04 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证；CT03/CT04 为纯软件契约任务，目标同 SHA 复跑通过），CT05—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -48,7 +48,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT01 | 固定镜像探测工具与基线材料 | CT00 | done | `7f1fdf78…`；目标证据 `ct01-baseline-20260924T050824Z/`：`inspect-a`（exit 0、missing 0）、`probe-e`（38/64）；D01/D04 passed |
 | CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | done | `29a894f5…`；目标证据 `ct02-budget-20260924T105148Z/`：显式/别名预算 7B、27B 均耗尽 32→32，缺省上限 7B=4096、27B=1024 精确耗尽；本地 1080 passed |
 | CT03 | 模型能力与execution operation分离 | CT02 | done | `a90494e0…`；本地 1087 passed、目标同 SHA 149 passed；schema 字节一致；证据 `ct03-contract-20260924T121318Z/` |
-| CT04 | 工具/思考预检与历史状态机 | CT03 | pending | — |
+| CT04 | 工具/思考预检与历史状态机 | CT03 | done | `4b7303b1…`；本地 1156 passed、目标同 SHA 297 passed；A03/A04/A06-local 全矩阵 + 本地零调用断言；证据 `ct04-contract-20260924T144322Z/` |
 | CT05 | 持租约完整计数与错误清理 | CT04 | pending | — |
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | pending | — |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | pending | — |
@@ -245,6 +245,29 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：A03/A04/A06-local全矩阵；无能力但历史含tool调用、null/缺省assistant、重复/孤立id、可选字段、UTF-8字节边界。
   本地拒绝必须观察acquire/warm/counter/gateway调用数全部为0，不能只看HTTP422。
 - 文档：03字段/错误指向TC03，禁止把全部未知顶层extra收紧。
+
+### CT04 字段校验、历史状态机与能力检查（2026-09-24 已执行）
+
+- 交付：`4b7303b14217c35bd5ab20f77c5e6efef8363902`（分支 `feature/ct04-request-contract`，基于 `1137bed`）。
+  `envelope_validator.prepare_chat` 成为唯一的本地判定入口，按 TC03 的固定阶段执行：
+  ①输出预算与 `n`（TC02）；②新字段形状（`tools`/`tool_choice`/`parallel_tool_calls`/`reasoning_effort`/messages 新字段）；
+  ③字节与计数上限（tools ≤32 项、单对象 ≤8192 B、数组 ≤65536 B，每条 assistant ≤32 调用，
+  历史 arguments 合计 ≤262144 B，call id ≤64 B）；④整请求能力需求（tools/thinking→chat）与新能力模型的模板覆盖拒绝；
+  ⑤`effort` 允许值、`tool_choice`↔`tools` 关联、TC04 工具历史状态机与既有图片检查。
+  `EnvelopeError` 携带具体 `param`；`FixedOutputBudgetPolicy` 增 `effort_values`/`denied_template_fields`
+  （denied 取 CT01 D09 清单；`effort_values` 空集是 fail-closed 默认，D06 未取证，CT06 必须补测后登记）；
+  `collect_image_sizes` 允许带 `tool_calls` 的 assistant 省略 content。
+- 验证（RED→GREEN）：新增用例先失败（策略字段不存在、校验缺失、CT02 的投影用例按新语义重写）；
+  实现后定向 `pytest tests/test_envelopes.py tests/test_chat_api.py -q` → **127 passed**；
+  相邻受影响 8 文件 → **197 passed**；全量 `pytest tests -m 'not thor' -q` → **1156 passed、1 skipped、1 deselected**（944.16 s）；
+  `ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+- 关键语义：本地拒绝发生在 `acquire` 之前——HTTP 级断言 acquire/warm/release 未发生、counter 调用数 0、gateway 未打开；
+  结构合法但缺能力优先 `capability_mismatch`（tools→`tools`，effort→`reasoning_effort`，历史→`messages`）；
+  无 tools/thinking 的模型保留原模板透传；顶层未知 extra 仍透传（`03-api.md` 已注明不得收紧）。
+- 目标同 SHA（`4b7303b1…`，干净；Python 3.12.14；证据 `ct04-contract-20260924T144322Z/`）：
+  受影响八文件 **297 passed**（14.08 s）；导入与 `DEFAULT_OUTPUT_POLICY` 字段核对通过；
+  未改运行部署（调度器仍以 CT02 代码在线、`/live` 200；CT04 对当前 chat/vision 注册的普通请求行为不变）。
+- 边界：A03/A04/A06 的真机列（tool_choice 实际生效、false 单调用、真实两轮 id/arguments/reasoning）属 CT10 候选阶段。
 
 ### CT05 同租约计数与清理
 
