@@ -1877,3 +1877,41 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 目标机终态：checkout 停在 `4f84c88`（干净），lab2 调度器由该 SHA 运行并在 8090 服务。复验证据：
 `retest-scheduler.log`、`retest-scenario.log`、`retest-chat1.json`、`retest-unload.json`、`retest-chat2.json`、
 `injection/`（第二实例日志与配置）、`rp17-retest.sh`、`rp17-injections.sh`。
+
+## Tool calling / thinking 扩展（plan/tool-calling-and-reasoning）
+
+### CT00 基线与部署输入确认（2026-09-24，源码 `854f39e1bb34ec3ce8678010d9b363a8021c6854`）
+
+- Python/环境：开发机仓库根；目标 `/home/jtzn/self-model-switch-build/venv312/bin/python3` = Python 3.12.14。
+- 命令与 exit（全部实际执行）：
+  - `ssh … jtzn@192.168.55.1 'hostname; uname -a; cat /etc/nv_tegra_release'` → exit 0（`jtzn-desktop`，`5.15.148-tegra aarch64`，R36.4.7）。
+  - `ssh … 'cd /home/jtzn/SelfModelSwitch && git status --short && git branch -vv && git remote -v && git rev-parse HEAD'` → exit 0；
+    `git status --porcelain --untracked-files=all | wc -l` = 0（干净，无 divergence），HEAD=`854f39e1bb34ec3ce8678010d9b363a8021c6854`。
+  - `ssh … 'sha256sum <4 个模型/projector 文件>'` → exit 0；四行 hash 与登记逐一相同
+    （7B `3f451333…`/`d1c7588c…`，27B `f1e1b337…`/`053533475…`）。
+  - `ssh … 'docker images --digests'`、`docker inspect sms-llama-cpp:4bc272f` → exit 0；
+    `sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8`。
+  - `ssh … 'curl /live /health /v1/models /api/status'` → exit 0；`/live` 200、`/v1/models` 200、`/health` 503
+    （`checks.preload=false`，其余 true），`/api/status` 两模型 `state=ready`、`in_flight=0`、能力 `chat,vision`。
+  - `ssh … 'timeout 5 tegrastats'`、`nvidia-smi`、`df -h`、`mount | grep sandisk` → exit 0。
+  - `ssh … 'sha256sum deploy2/scheduler-v2.json deploy2/manifest.json llama-swap.lab4.json config.yaml'` → exit 0；
+    `scheduler-v2.json` 与 `config.yaml` 均为 `3a966deb2cae2b2118aa9221774dca6848a47defde0de256984d41300c203824`，
+    等于 manifest 与容器标签的 `config_sha256`（部署输入完整性自证）。
+  - `GIT_SSH_COMMAND='ssh -i ~/.ssh/selfmodelswitch-target-agent …' git ls-remote ssh://jtzn@192.168.55.1/home/jtzn/git/SelfModelSwitch.git`
+    → exit 0（refs 与 GitHub 一致）；默认密钥 `git ls-remote` 失败（Permission denied），必须显式指定该密钥。
+  - site-input 结构/字段校验脚本（acceptance §2 闭集、类型、路径、hash 与磁盘实测比对）→ `validation_problems: none`。
+- UTC 起止：2026-09-24T04:05:01Z — 2026-09-24T04:11:14Z。
+- remote/branch：共享远端 `https://github.com/GodSealS/SelfModelSwitch.git`；已部署交付分支
+  `chore/verify-v3-review-20260922`；开发分支 `chore/tool-reasoning-execution-plan-20260924`（HEAD `17fe9a1`，本轮仅文档、未推送）。
+- 目标 SHA 与干净树：前后均为 `854f39e1…`、`git status --porcelain --untracked-files=all` 计数 0；未改目标 tracked 文件、
+  未启动新 GPU 进程、未拉取镜像、未加载模型（7B/27B 容器均为 exited/none）。
+- site/policy/fixture 摘要：`site-input.json` sha256 `51b970e2da18f30c667c62fba9a40d57bc0d6c0c947096232316280a92407ce2`；
+  `policy_source_sha256`/`fixture_set_sha256`/`template_sha256`/`rollback_sha` 为 null（按 §2 允许，CT01/CT06/CT09 冻结）；
+  `request_limit=64`；`timeouts` 5/60/900。
+- 软件结论：无代码/配置变更，不适用软件测试；本轮只做输入核实与校验脚本（一次性，未落库）。
+- 硬件结论：身份匹配 Jetson（L4T R36.4.7、JetPack 6.2.1+b38、Driver 540.4.0 / CUDA 12.6.11）；四个模型/projector 文件
+  hash 与登记一致；在线部署 `sms-orin-lab2`/`mode=lab` 可服务（`/live`、`/v1/models` 200）。**不等于任何新能力通过**。
+- 失败材料：无失败；`/health` 的 `preload=false` 已作为注意项记录（probe 就绪检查不得依赖该项）。
+- 最终部署状态：未变更（llama-swap pid 16492 + 调度器 pid 290846 继续运行；LAN 网关 pid 10061 仍在 0.0.0.0:8091）。
+- 未完成项：CT01—CT12 未执行；`template_sha256` 待 CT01 inspect 提取；目标 `origin` 为本地镜像而非 GitHub 的偏差未消除，
+  CT01 起按 README CT00 节第 1 条的守卫口径执行（不修改目标 git 配置）。

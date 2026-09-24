@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**仅计划已交付，CT00—CT12 均未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00 已执行（基线材料已核实），CT01—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -44,7 +44,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 
 | ID | 任务 | 依赖 | 状态 | 实际SHA / 证据 |
 |---|---|---|---|---|
-| CT00 | 基线、硬件与部署输入确认 | 无 | pending | — |
+| CT00 | 基线、硬件与部署输入确认 | 无 | done | `854f39e1…`；目标证据 `ct00-tool-calling-baseline-20260924T040501Z/`，`site_input_sha256=51b970e2…` |
 | CT01 | 固定镜像探测工具与基线材料 | CT00 | pending | — |
 | CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | pending | — |
 | CT03 | 模型能力与execution operation分离 | CT02 | pending | — |
@@ -76,6 +76,42 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：`hostname; uname -a; cat /etc/nv_tegra_release`及挂载/磁盘检查，模型hash核对；记录完整命令与exit。
 - 完成：必填项无占位值，硬件匹配，目标干净且无divergence。无法连接/dirty/硬件不符即blocked。
 - 文件/文档：不改运行代码；本页记录材料位置，validation只记实际发生的核实。
+
+### CT00 基线材料与已核实输入（2026-09-24 已执行）
+
+- 证据目录（目标外部证据根）：`/home/jtzn/self-model-switch-evidence/ct00-tool-calling-baseline-20260924T040501Z/`；
+  `site-input.json`（sha256 `51b970e2da18f30c667c62fba9a40d57bc0d6c0c947096232316280a92407ce2`）、`hardware-raw.txt`、
+  `model-sha256.txt`、`materials.json`（11 项 path/bytes/sha256，校验 `validation_problems=none`）。
+- 分支与路径：开发分支 `chore/tool-reasoning-execution-plan-20260924`（HEAD `17fe9a1`，本轮仅文档、未推送）；
+  已部署交付分支 `chore/verify-v3-review-20260922` @ `854f39e1bb34ec3ce8678010d9b363a8021c6854`；
+  共享远端 `https://github.com/GodSealS/SelfModelSwitch.git`；目标 checkout `/home/jtzn/SelfModelSwitch`（干净、无 divergence）。
+- 三个地址：service `http://127.0.0.1:8090`（`/live` 200、`/v1/models` 200）；模型上游 7B `http://127.0.0.1:10002`、
+  27B `http://127.0.0.1:10003`，llama-swap 控制面 `http://127.0.0.1:8080`；LAN 网关 `deploy/gateway.py` 监听
+  `0.0.0.0:8091`（CT11 才填 `gateway_base_url`，基线为 null）。
+- 部署身份：`deployment_id=sms-orin-lab2`、`mode=lab`、`config_sha256=3a966deb…`（与 `deploy2/scheduler-v2.json`、
+  `config.yaml` 实测 hash 相同）；镜像 `sms-llama-cpp@sha256:8e572bb99c19…`（本机固定镜像，不 pull）；
+  runtime `llama-cpp-1` / profile `llama-cpp-gguf-v1`；7B 与 27B 共用同一 runtime_id，能力均为 `chat,vision`
+  （基线无 tools/thinking，CT06 负责 27B 独立 runtime 与能力登记）。
+- 模型与 projector：四个文件实测 sha256 与登记完全一致（`model-sha256.txt`）；模型盘 `/media/jtzn/sandisk-ext4`
+  （`/dev/sda1`，ext4，可用 340G）；未下载、未写入、未修复挂载。
+- 硬件/运行时：`jtzn-desktop`，`Linux 5.15.148-tegra aarch64`，L4T R36.4.7、JetPack 6.2.1+b38、
+  Driver 540.4.0 / CUDA 12.6.11；Python 3.12.14（`/home/jtzn/self-model-switch-build/venv312`）。
+- 冻结输入：`timeouts` connect 5 / read_idle 60 / total 900（与网关及模型 `timeout_seconds` 一致）；`request_limit=64`；
+  `policy_source_sha256`、`fixture_set_sha256`、`template_sha256`、`rollback_sha` 按 acceptance §2 暂为 null，
+  分别由 CT01（策略/模板）、CT06/CT07（fixture）、CT09/CT11 冻结。
+- 已知偏差与注意（不自行放松，CT01 起按此实现）：
+  1. 目标 checkout 的 `origin` 是本地镜像 `/home/jtzn/git/SelfModelSwitch.git`（非 GitHub），当前 refs 与 GitHub 一致
+     （main `142746c`、`chore/verify-v3-review-20260922` `854f39e`）。交付路径为 dev→GitHub **且**
+     dev→镜像（`GIT_SSH_COMMAND='ssh -i ~/.ssh/selfmodelswitch-target-agent -o IdentitiesOnly=yes'`
+     推送 `ssh://jtzn@192.168.55.1/home/jtzn/git/SelfModelSwitch.git`）→ 目标 ff-only；CT01 的 remote 守卫必须把
+     “镜像与 GitHub 对同一分支 ref 相同且等于 `expected_sha`”作为通过条件，只比对其一不算通过。
+  2. 在线服务不是 systemd 单元：llama-swap（pid 16492，`llama-swap.lab4.json`）与调度器（pid 290846，
+     `deploy2/scheduler-v2.json`）为手工进程；`rollback_input` 取 `deploy2/manifest.json`（完整渲染组合），
+     并在 `materials.json` 同行记录 `scheduler-v2.json`/`llama-swap.lab4.json`/`config.yaml` 的 hash。
+  3. 在线 `llama-swap.lab4.json` 与渲染产物 `deploy2/llama-swap.yaml` 的差异仅为 `--publish` 端口占位符实例化
+     与 JSON 化（`proxy`/`ttl`）；argv 与 manifest 的 `argv`/`argv_sha256` 一致。
+  4. `/health` 当前 503（`checks.preload=false`，其余四项 true），`/live` 与 `/v1/models` 200；probe 的就绪检查
+     不得依赖 `/health` 的 preload 项。
 
 ### CT01 探测工具与基线材料
 
