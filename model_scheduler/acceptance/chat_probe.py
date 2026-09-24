@@ -1591,9 +1591,14 @@ def _unavailable_reason(detail: Mapping[str, Any]) -> str | None:
 
 
 def _all_unavailable(variants: Mapping[str, Any]) -> bool:
-    """True when every observation of a case is the deployment refusing to serve the model."""
+    """True when every observation is the deployment failing to serve the model.
+
+    503 is the scheduler refusing a model it has already marked unusable; 502 is
+    the same failure seen one hop earlier, at the upstream. Neither is a verdict
+    about the capability the case exists to measure.
+    """
     entries = [entry for entry in variants.values() if isinstance(entry, dict)]
-    return bool(entries) and all(entry.get("http_status") == 503 for entry in entries)
+    return bool(entries) and all(entry.get("http_status") in (502, 503) for entry in entries)
 
 
 def _summarise_tool_call(answer: HttpResponse) -> dict[str, Any]:
