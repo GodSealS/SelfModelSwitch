@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT02 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证），CT03—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT03 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证；CT03 为纯软件契约任务，目标同 SHA 复跑通过），CT04—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -47,7 +47,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT00 | 基线、硬件与部署输入确认 | 无 | done | `854f39e1…`；目标证据 `ct00-tool-calling-baseline-20260924T040501Z/`，`site_input_sha256=51b970e2…` |
 | CT01 | 固定镜像探测工具与基线材料 | CT00 | done | `7f1fdf78…`；目标证据 `ct01-baseline-20260924T050824Z/`：`inspect-a`（exit 0、missing 0）、`probe-e`（38/64）；D01/D04 passed |
 | CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | done | `29a894f5…`；目标证据 `ct02-budget-20260924T105148Z/`：显式/别名预算 7B、27B 均耗尽 32→32，缺省上限 7B=4096、27B=1024 精确耗尽；本地 1080 passed |
-| CT03 | 模型能力与execution operation分离 | CT02 | pending | — |
+| CT03 | 模型能力与execution operation分离 | CT02 | done | `a90494e0…`；本地 1087 passed、目标同 SHA 149 passed；schema 字节一致；证据 `ct03-contract-20260924T121318Z/` |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | pending | — |
 | CT05 | 持租约完整计数与错误清理 | CT04 | pending | — |
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | pending | — |
@@ -214,6 +214,29 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：模块可导入；合法能力组合解析、缺chat拒绝；internal operation=tools/thinking返回既有契约错误而非KeyError/500。
   导出的control-v1 schema与原文件字节相同；若不相同说明边界外溢，必须修复后继续。
 - 文档：08 C01和03区分模型能力与execution operation；无真实模型注册变更。
+
+### CT03 能力与operation分离（2026-09-24 已执行）
+
+- 交付：`a90494e0cf1c9442e51fcc22b13c5604e260fcf5`（分支 `feature/ct03-capability-operations`，基于 `c10efd8`）。
+  `contracts_v2`：能力矩阵新增 `tools`/`thinking`（`required_asset_roles=("model",)`、protocol `openai-chat`），
+  导出 `MODEL_CAPABILITIES`（即矩阵键集合）与 `CAPABILITY_DEPENDENCIES`（两者依赖 chat，注册解析时校验）。
+  `control_protocol_v1`：新增 `EXECUTION_OPERATIONS=chat|vision|embeddings|rerank`，`CAPABILITIES` 仅作兼容别名；
+  operation 解析、PARAMETER_RULES 断言与 schema 导出统一使用该集合，不再从全局矩阵派生。
+  `envelope_validator.CAPABILITY_INPUT_KEYS` 增 `tools: {messages, tools}`、`thinking: {messages}`；
+  `evidence_contracts` 的能力用例校验与注册覆盖改用 `MODEL_CAPABILITIES`。
+- 验证（RED→GREEN）：新增用例先失败（`MODEL_CAPABILITIES`/`EXECUTION_OPERATIONS` 不存在、`chat+tools+thinking` 注册被拒、
+  `cap:tools` 未识别、fixture 覆盖断言不平衡）；实现后开发机定向 **149 passed**，
+  全量 `pytest tests -m 'not thor' -q` → **1087 passed、1 skipped、1 deselected**（942.13 s）；
+  `ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+- 契约检查：模块导入正常（导入期 operation/参数表断言未触发）；`export-schema` 与 `schemas/control-v1.json` **字节相同**；
+  internal `operation=tools|thinking` 返回既有 `contract_violation`（非 KeyError/500）；`chat+tools+thinking` 合法注册、缺 chat 拒绝；
+  v1 配置闭集仍拒绝新能力；候选用例派生包含 `B:<model>:cap:tools|thinking`。
+- 目标同 SHA（`a90494e…`，干净；Python 3.12.14；证据 `ct03-contract-20260924T121318Z/`）：
+  受影响五文件 **149 passed**（2.41 s）、`import ok`、`schema_byte_identical=yes`；
+  未改运行部署（调度器仍以 CT02 代码在线、`/live` 200，CT03 不改变当前注册的运行路径）。
+- 已知慢用例（非本轮引入）：`tests/integration/test_control_socket.py::test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes`
+  等待兼容 chat 路由的 900 s deadline 后按断言返回 503，单独复跑 `1 passed in 900.55 s`，整套耗时因此约 942 s。
+- 边界：可启动/可服务仍由 profile 与 flag 门禁决定，`tools`/`thinking` 的启动支持属 CT06。
 
 ### CT04 字段校验、历史状态机与能力检查
 

@@ -1995,3 +1995,29 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   能力集未变（仍为 chat/vision）；llama-swap 与 LAN 网关未改动。
 - 未完成项：并发/批量预算边界（A10）不在本任务；`DEFAULT_OUTPUT_POLICY` 待 CT06 按 runtime 绑定；
   本轮不改变 06 的生产门禁结论。
+
+### CT03 模型能力与 execution operation 分离（2026-09-24，交付分支 `feature/ct03-capability-operations`）
+
+- Python/环境：本地 `/Users/monster/.local/share/selfmodelswitch/venv312` 3.12.11；
+  目标 `/home/jtzn/self-model-switch-build/venv312` 3.12.14。
+- 软件交付与检查（exit 均为 0）：
+  - RED（实现前）：`contracts_v2.MODEL_CAPABILITIES` 不存在（收集期 ImportError）、`chat+tools+thinking` 注册被拒、
+    `cap:tools` 用例 id 未识别、能力 fixture 覆盖断言不平衡、`EXECUTION_OPERATIONS` 不存在 —— 共 6 失败 + 1 收集错误。
+  - GREEN：`pytest tests/test_config.py tests/test_contracts_v2.py tests/test_control_protocol_v1.py tests/test_envelopes.py tests/test_evidence_contracts.py -q`
+    → **149 passed**；全量 `pytest tests -m 'not thor' -q` → **1087 passed、1 skipped、1 deselected**（942.13 s）；
+    `ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+  - 契约：四个模块 `import` 正常；`python -m model_scheduler.control_protocol_v1 export-schema --output …` 与
+    `schemas/control-v1.json` **字节相同**；`parse_execution_create_request(operation="tools"|"thinking")` →
+    `ContractError`（含 `operation`），非 `KeyError`；`chat+tools+thinking` 合法、缺 chat 拒绝；v1 配置仍拒绝新能力。
+  - 提交：`a90494e0cf1c9442e51fcc22b13c5604e260fcf5`；push 到 GitHub 与目标镜像后两端 ref 均为该 SHA
+    （开发机与目标 `git ls-remote` 一致）。
+- 目标同步与同 SHA 复跑（remote/branch/SHA；证据 `ct03-contract-20260924T121318Z/`）：
+  checkout `/home/jtzn/SelfModelSwitch` 起始于 `feature/ct02-output-budget`@`29a894f`（干净）；守卫流程
+  `status --porcelain -uall` 为空 → fetch → `switch --track -c feature/ct03-capability-operations` → `pull --ff-only`
+  → `verified_target_sha=a90494e…`、状态仍为空、镜像 ref 相同（`target-state.txt`）。
+  - 受影响五文件 → **149 passed**（2.41 s）；`import ok`；`schema_byte_identical=yes`（`schema-diff.txt`）。
+- 部署影响：**未重启调度器**——CT03 不改变当前 chat/vision 注册的运行路径；pid 322176 仍以 CT02 代码在线，
+  `/live` 200（`service-state.txt`）。下次重启装载 CT03 代码，对当前注册行为不变。
+- 既有慢用例（非本轮引入，已单独复现）：`tests/integration/test_control_socket.py::test_v2_tcp_app_serves_the_legacy_surface_and_never_the_control_routes`
+  等待兼容 chat 路由的 900 s deadline 后按断言返回 503，`1 passed in 900.55 s`；全量套件耗时约 942 s 主要来自该用例。
+- 未完成项：可启动/可服务（新 profile 与 flag 门禁）属 CT06；本任务无硬件行为变更，不宣称真机能力通过。
