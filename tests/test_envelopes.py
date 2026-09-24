@@ -8,6 +8,7 @@ an over-limit request never reaches a lease or a gateway call.
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import struct
 import zlib
@@ -24,6 +25,7 @@ from model_scheduler.envelope_validator import (
     DEFAULT_MAX_BATCH,
     DEFAULT_MAX_DOCUMENTS,
     EnvelopeError,
+    FixedOutputBudgetPolicy,
     check_chat_budget,
     check_chat_input,
     check_embeddings_input,
@@ -32,11 +34,25 @@ from model_scheduler.envelope_validator import (
     collect_image_sizes,
     effective_max_tokens,
     fixture_coverage,
+    normalize_output,
+    prepare_chat,
 )
 
 # The first candidate's measured envelope (plan/m00-envelope.md §3).
 ENVELOPE = Envelope(ctx_size=32768, max_input_tokens=28672, max_output_tokens=4096, max_parallel=2,
                     max_image_tokens=1280, max_image_edge_pixels=1024, max_images=1)
+
+# The tool-calling extension's public software fixture (acceptance §4).
+CHAT_ENVELOPE = Envelope(ctx_size=8192, max_input_tokens=4096, max_output_tokens=1024, max_parallel=1,
+                         max_image_tokens=1280, max_image_edge_pixels=1024, max_images=1)
+
+#: Recognises every alias, supports two of them: unit tests must be able to tell
+#: "recognised" from "supported" apart (acceptance §4).
+SYNTHETIC_POLICY = FixedOutputBudgetPolicy(
+    policy_id="synthetic-unit-policy",
+    recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+    supported_output_fields=frozenset({"max_tokens", "max_completion_tokens"}),
+)
 
 
 def _png(width: int, height: int) -> bytes:
@@ -355,3 +371,78 @@ def test_no_audio_or_video_route_exists_on_the_compatibility_surface() -> None:
     paths = {getattr(route, "path", "") for route in app.routes}
 
     assert not any("audio" in path or "video" in path for path in paths)
+
+
+# --------------------------------------------------------------------------- TC02: PreparedChat
+
+
+def test_a01_the_prepared_body_is_one_canonical_byte_string() -> None:
+    payload = {"model": "qwen-small", "messages": _chat_messages(), "max_tokens": 64,
+               "extra": {"b": 1, "a": "ü"}}
+    prepared = prepare_chat(payload, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY)
+
+    assert prepared.output_field == "max_tokens" and prepared.output_tokens == 64
+    assert prepared.image_count == 0 and prepared.model_id == "qwen-small"
+    assert prepared.policy_id == SYNTHETIC_POLICY.policy_id
+    assert prepared.body_sha256 == hashlib.sha256(prepared.body_json).hexdigest()
+    # sorted keys, compact separators, real UTF-8: one body, one digest (TC02)
+    assert prepared.body_json == (
+        b'{"extra":{"a":"\xc3\xbc","b":1},"max_tokens":64,'
+        b'"messages":[{"content":"hello","role":"user"}],"model":"qwen-small"}'
+    )
+    assert prepared.decoded_body()["max_tokens"] == 64
+
+
+def test_a01_prepare_chat_leaves_the_caller_payload_untouched() -> None:
+    payload = {"model": "qwen-small", "messages": _chat_messages("hello"), "max_tokens": 999_999}
+    prepared = prepare_chat(payload, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY)
+
+    assert payload["max_tokens"] == 999_999  # the request the caller sent is never rewritten
+    assert prepared.decoded_body()["max_tokens"] == CHAT_ENVELOPE.max_output_tokens
+    prepared.decoded_body()["messages"].append({"role": "user", "content": "injected"})
+    assert payload["messages"] == _chat_messages("hello")  # decoding gives a private copy too
+
+
+def test_a01_an_unbudgeted_request_uses_the_envelope_output_cap() -> None:
+    body, field, tokens = normalize_output({"model": "m", "messages": _chat_messages()}, CHAT_ENVELOPE,
+                                           SYNTHETIC_POLICY)
+    assert field == "max_tokens" and tokens == 1024 and body["max_tokens"] == 1024
+
+
+def test_a02_a_recognised_but_unsupported_alias_is_refused_not_ignored() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        normalize_output({"model": "m", "messages": [], "n_predict": 64}, CHAT_ENVELOPE, SYNTHETIC_POLICY)
+    assert refused.value.code == "contract_violation" and refused.value.param == "n_predict"
+
+
+def test_a02_two_budget_fields_are_refused_even_when_they_agree() -> None:
+    with pytest.raises(EnvelopeError) as refused:
+        normalize_output({"model": "m", "messages": [], "max_tokens": 64, "max_completion_tokens": 64},
+                         CHAT_ENVELOPE, SYNTHETIC_POLICY)
+    assert refused.value.param == "max_completion_tokens"  # the first sorted alias names the conflict
+
+
+def test_a02_n_may_be_one_or_absent_and_nothing_else() -> None:
+    body, _, _ = normalize_output({"model": "m", "messages": [], "n": 1}, CHAT_ENVELOPE, SYNTHETIC_POLICY)
+    assert body["n"] == 1
+    for value in (0, 2, True, None, "1"):
+        with pytest.raises(EnvelopeError) as refused:
+            normalize_output({"model": "m", "messages": [], "n": value}, CHAT_ENVELOPE, SYNTHETIC_POLICY)
+        assert refused.value.param == "n"
+
+
+def test_a01_prepare_chat_projects_the_capability_demand_without_refusing_it() -> None:
+    tools = {"model": "m", "messages": _chat_messages(), "tools": [{"type": "function"}]}
+    history = {"model": "m", "messages": [{"role": "tool", "tool_call_id": "call-1", "content": "{}"}]}
+    thinking = {"model": "m", "messages": [{"role": "assistant", "content": "42", "reasoning_content": "why"}]}
+
+    assert prepare_chat(tools, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY).requires_tools
+    assert prepare_chat(history, capabilities={"chat"}, envelope=CHAT_ENVELOPE, policy=SYNTHETIC_POLICY).requires_tools
+    assert not prepare_chat(_chat_body(), capabilities={"chat"}, envelope=CHAT_ENVELOPE,
+                            policy=SYNTHETIC_POLICY).requires_tools
+    assert prepare_chat(thinking, capabilities={"chat"}, envelope=CHAT_ENVELOPE,
+                        policy=SYNTHETIC_POLICY).requires_thinking
+
+
+def _chat_body() -> dict:
+    return {"model": "qwen-small", "messages": _chat_messages()}

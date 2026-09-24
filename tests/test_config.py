@@ -164,6 +164,90 @@ def test_model_specs_preserve_capabilities_and_preload_intent(tmp_path: Path) ->
     assert specs["qwen-small"].capabilities == frozenset({"chat"})
 
 
+# The tool-calling extension's public software fixture (plan/tool-calling-and-reasoning
+# acceptance §4): the same v2 shape, with the envelope the A-cases pin —
+# ctx 8192, input 4096, output 1024, one image. Existing behaviour is untouched:
+# this constant is additive, `V2` keeps the envelope its own tests were written for.
+V2_CHAT_FIXTURE = """
+schema_version: 2
+registration:
+  runtimes:
+    - runtime_id: llama-cpp-1
+      profile_id: llama-cpp-gguf-v1
+      image_digest: registry.example/sms-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      adapter_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      lock_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      startup_args: ["--no-webui", "--host", "--port", "--ctx-size"]
+  models:
+    - model_id: qwen-small
+      runtime_id: llama-cpp-1
+      capabilities: [chat, vision]
+      assets:
+        - {role: model, path: qwen-small.gguf, sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, size_bytes: 2000000000}
+        - {role: projector, path: mmproj.gguf, sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff, size_bytes: 1000000}
+      port: 10002
+      envelope: {ctx_size: 8192, max_input_tokens: 4096, max_output_tokens: 1024, max_parallel: 1, max_image_tokens: 1280, max_image_edge_pixels: 1024, max_images: 1}
+      timeout_seconds: 900
+      reserved_bytes: 6106148045
+      measured: false
+      measurement_ref: null
+      physical_resident_peak_bytes: null
+server:
+  host: 127.0.0.1
+  port: 8099
+  workers: 1
+  max_request_body_bytes: 4194304
+  body_timeout_seconds: 10
+  shutdown_grace_seconds: 5
+blobs:
+  root: /tmp/sms-blobs
+  chunk_reserve_bytes: 1048576
+  input_ttl_seconds: 60
+  output_ttl_seconds: 60
+  max_blob_bytes: 1048576
+  min_free_disk_bytes: 1048576
+  owner_quota_bytes: 1048576
+  total_quota_bytes: 1048576
+control:
+  allowed_uids: [1000]
+  peer_group: null
+  socket_path: /tmp/sms-control/control.sock
+gateway:
+  connect_timeout_seconds: 5
+  read_idle_timeout_seconds: 5
+  write_idle_timeout_seconds: 5
+  pool_timeout_seconds: 5
+  inference_timeout_seconds: 60
+  max_response_body_bytes: 1048576
+  max_sse_event_bytes: 65536
+  close_timeout_seconds: 5
+resources:
+  provider: psutil
+  sample_interval_seconds: 1
+  sample_max_age_seconds: 2
+  system_reserve_bytes: 1048576
+  model_budget_bytes: 1048576
+scheduler:
+  poll_interval_seconds: 1
+  queue_capacity: 4
+  request_queue_timeout_seconds: 30
+  max_evictions_per_request: 1
+  memory_reclaim_timeout_seconds: 5
+  min_free_memory_bytes: 1048576
+  resource_safety_margin: 0.1
+  switch_drain_timeout_seconds: 5
+  switch_retry_seconds: 5
+  priority_aging_seconds: 30
+  heat: {half_life_seconds: 60, request_weight: 1.0, token_weight: 0.0001}
+  thrash: {switch_window_seconds: 10, max_switches_in_window: 3, cooldown_seconds: 5}
+  sessions: {queue_capacity: 4, queue_timeout_seconds: 30, ttl_seconds: 30, heartbeat_seconds: 5, prepare_limit_seconds: 30, hard_timeout_seconds: 60, cleanup_limit_seconds: 10, stop_grace_seconds: 5}
+storage:
+  mount_path: /tmp/sms-models
+  model_directory: /tmp/sms-models/models
+  filesystem: ext4
+  expected_uuid: 11111111-2222-3333-4444-555555555555
+"""
+
 V2 = """
 schema_version: 2
 registration:

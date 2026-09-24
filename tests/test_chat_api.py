@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ import pytest
 
 from app import BodyError, _read_json, create_app
 from model_scheduler.contracts import GatewayError, Lease, Outcome
+from model_scheduler.envelope_validator import FixedOutputBudgetPolicy
 from model_scheduler.scheduler import QueueFull
 
 
@@ -335,3 +337,138 @@ def test_the_legacy_chat_body_still_passes_unknown_fields_through() -> None:
     assert response.status_code == 200
     assert seen["temperature"] == 0.3  # C05's strict unknown-field rule belongs to /internal only
     assert seen["custom_extension"] == {"nested": [1, 2]}
+
+
+# --------------------------------------------------------------------------- TC02: the budget that actually reaches the upstream
+
+
+SYNTHETIC_POLICY = FixedOutputBudgetPolicy(
+    policy_id="synthetic-unit-policy",
+    recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+    supported_output_fields=frozenset({"max_tokens", "max_completion_tokens"}),
+)
+
+
+class RecordingGateway:
+    """Keeps the body that reaches the upstream, which is the only proof that matters."""
+
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    async def open(self, lease, capability, payload, deadline):
+        self.payloads.append(copy.deepcopy(payload))
+        return StreamOpened() if payload.get("stream") else Opened()
+
+
+def _post_budget(tmp_path: Path, payload: dict, gateway: RecordingGateway):
+    """One request through the extension's public software fixture: envelope 8192 / 4096 / 1024."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sms_v2_chat_fixture", Path(__file__).resolve().parent / "test_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "budget-config.yaml"
+    path.write_text(module.V2_CHAT_FIXTURE, encoding="utf-8")
+    from model_scheduler.config import load_config
+
+    scheduler = Scheduler()
+
+    async def counter(model_id, messages, image_count):
+        return 8
+
+    app = create_app(config=load_config(path), scheduler=scheduler, gateway=gateway,
+                     token_counter=counter, chat_policy=SYNTHETIC_POLICY)
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=payload)
+    return response, scheduler, gateway
+
+
+@pytest.mark.parametrize("extra,expected", [({}, 1024), ({"max_tokens": 4096}, 1024), ({"max_tokens": 64}, 64)])
+def test_a01_budget_reaches_upstream(tmp_path, extra, expected) -> None:
+    gateway = RecordingGateway()
+    sent = {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], **extra}
+    response, scheduler, gateway = _post_budget(tmp_path, sent, gateway)
+
+    assert response.status_code == 200, response.text
+    assert gateway.payloads[0]["max_tokens"] == expected  # clipped, defaulted or kept
+    assert scheduler.releases == [Outcome.SUCCESS]
+    assert sent == {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], **extra}
+
+
+@pytest.mark.parametrize("value", [0, -1, None, True, 1.5, "64"])
+def test_a01_a_budget_that_is_not_a_positive_integer_is_422(tmp_path, value) -> None:
+    gateway = RecordingGateway()
+    response, scheduler, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], "max_tokens": value},
+        gateway)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "contract_violation"
+    assert response.json()["error"]["param"] == "max_tokens"
+    assert gateway.payloads == [] and scheduler.releases == []  # nothing was dispatched
+
+
+def test_a01_both_stream_values_dispatch_the_same_budget(tmp_path) -> None:
+    for stream in (False, True):
+        gateway = RecordingGateway()
+        response, scheduler, gateway = _post_budget(
+            tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}],
+                       "max_tokens": 64, "stream": stream}, gateway)
+        assert response.status_code == 200, response.text
+        assert gateway.payloads[0]["max_tokens"] == 64 and gateway.payloads[0]["stream"] is stream
+
+
+def test_a02_max_completion_tokens_is_clipped_and_keeps_its_own_name(tmp_path) -> None:
+    gateway = RecordingGateway()
+    response, _, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}],
+                   "max_completion_tokens": 4096}, gateway)
+
+    assert response.status_code == 200, response.text
+    assert gateway.payloads[0]["max_completion_tokens"] == 1024
+    assert "max_tokens" not in gateway.payloads[0]  # an explicit alias is not renamed
+
+
+def test_a02_two_budget_fields_are_refused_even_when_equal(tmp_path) -> None:
+    gateway = RecordingGateway()
+    response, scheduler, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}],
+                   "max_tokens": 64, "max_completion_tokens": 64}, gateway)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["param"] == "max_completion_tokens"
+    assert gateway.payloads == [] and scheduler.releases == []
+
+
+def test_a02_a_recognised_but_unsupported_alias_is_refused_before_dispatch(tmp_path) -> None:
+    gateway = RecordingGateway()
+    response, scheduler, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], "n_predict": 64},
+        gateway)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["param"] == "n_predict"
+    assert gateway.payloads == [] and scheduler.releases == []
+
+
+@pytest.mark.parametrize("value", [0, 2, True, None])
+def test_a02_only_n_equals_one_is_accepted(tmp_path, value) -> None:
+    gateway = RecordingGateway()
+    response, scheduler, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], "n": value}, gateway)
+
+    assert response.status_code == 422 and response.json()["error"]["param"] == "n"
+    assert gateway.payloads == []
+
+
+def test_a02_n_one_and_sampling_extras_survive_the_prepared_body(tmp_path) -> None:
+    gateway = RecordingGateway()
+    response, _, gateway = _post_budget(
+        tmp_path, {"model": "qwen-small", "messages": [{"role": "user", "content": "hi"}], "n": 1,
+                   "temperature": 0.25, "custom_extension": {"keep": [1, 2]}, "max_tokens": 64}, gateway)
+
+    assert response.status_code == 200, response.text
+    dispatched = gateway.payloads[0]
+    assert dispatched["n"] == 1 and dispatched["temperature"] == 0.25
+    assert dispatched["custom_extension"] == {"keep": [1, 2]}
+    assert dispatched["max_tokens"] == 64

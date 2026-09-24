@@ -28,10 +28,12 @@ from model_scheduler.api_models import ChatRequest, EmbeddingRequest, RerankRequ
 from model_scheduler.config import AppConfig, ConfigError, load_config
 from model_scheduler.contracts import Capability, GatewayError, Outcome
 from model_scheduler.envelope_validator import (
+    DEFAULT_OUTPUT_POLICY,
     EnvelopeError,
     check_chat_input,
     check_embeddings_input,
     check_rerank_input,
+    prepare_chat,
 )
 from model_scheduler.model_registry import Conflict
 from model_scheduler.gateway import DirectInferenceGateway
@@ -322,7 +324,7 @@ async def application_lifespan(app: FastAPI):
             await app.state.owned_client.aclose()
 
 
-def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, token_counter=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
+def create_app(config_path: str | Path | None = None, *, config: AppConfig | None = None, scheduler=None, gateway=None, health_checks=None, backend=None, resources=None, storage_guard=None, recovery=None, boot_id: str | None = None, execution_stats=None, token_counter=None, chat_policy=None, preload_retry_delays: tuple[float, ...] = (5, 10, 20, 30)) -> FastAPI:
     """Create a listener that remains diagnostically live while dependencies recover.
 
     The same surface serves schema v2 (plan/08 P19): the catalog derives the
@@ -363,6 +365,9 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
     app.state.boot_id = boot_id
     app.state.execution_stats = execution_stats
     app.state.token_counter = token_counter
+    # The output-budget policy the compat route prepares bodies with (TC02). It is
+    # injected so a test can pin it, and defaults to the fixed image's own policy.
+    app.state.chat_policy = DEFAULT_OUTPUT_POLICY if chat_policy is None else chat_policy
     app.state.preload_retry_delays = preload_retry_delays  # the named lifespan reads it from state
 
     async def close_and_release(opened, lease, outcome: Outcome, tokens: int | None = None) -> None:
@@ -518,20 +523,30 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
         if app.state.scheduler is None or app.state.gateway is None:
             return _error(503, "service_unavailable", "Service is not ready", request_id)
         deadline = monotonic() + config.gateway.inference_timeout_seconds
+        dispatch_payload = payload
         if model.envelope is not None:
             counter = app.state.token_counter
+            # The budget is decided once, here: the same prepared body is what the
+            # counter sees and what the gateway dispatches (TC02). The incoming
+            # payload is never modified.
+            try:
+                prepared = prepare_chat(payload, capabilities=model.capabilities, envelope=model.envelope,
+                                        policy=app.state.chat_policy)
+            except EnvelopeError as exc:
+                return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
+            dispatch_payload = prepared.decoded_body()
 
             async def _count(messages, image_count):
                 return await counter(body.model, messages, image_count)
 
             async def _check() -> None:
-                await check_chat_input(payload, capabilities=model.capabilities, envelope=model.envelope,
+                await check_chat_input(dispatch_payload, capabilities=model.capabilities, envelope=model.envelope,
                                        token_counter=_count if counter is not None else None)
 
             try:
                 await _check()
             except EnvelopeError as exc:
-                return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "messages")
+                return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
             except Exception:
                 # The counter needs the runtime's own tokenizer and a cold model has
                 # none, so a cold deployment could never be counted and therefore
@@ -545,14 +560,14 @@ def create_app(config_path: str | Path | None = None, *, config: AppConfig | Non
                 try:
                     await _check()
                 except EnvelopeError as exc:
-                    return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, "messages")
+                    return _error(_ENVELOPE_STATUS.get(exc.code, 422), exc.code, str(exc), request_id, exc.param)
                 except Exception:
                     return _error(503, "service_unavailable",
                                   "The input could not be counted against the envelope", request_id)
         lease = None
         try:
             lease = await app.state.scheduler.acquire(body.model, request_id, deadline)
-            opened = await app.state.gateway.open(lease, Capability.CHAT, payload, deadline)
+            opened = await app.state.gateway.open(lease, Capability.CHAT, dispatch_payload, deadline)
             if body.stream:
                 if opened.status_code != 200 or _media_type(opened.headers) != "text/event-stream":
                     await close_and_release(opened, lease, Outcome.ABORTED)

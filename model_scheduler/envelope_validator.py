@@ -29,7 +29,11 @@ from __future__ import annotations
 
 import base64
 import binascii
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+import copy
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
 ALLOWED_IMAGE_MEDIA = frozenset({"image/png", "image/jpeg"})
 DEFAULT_MAX_BATCH = 256  # embeddings batch cap until a candidate binds a measured one
@@ -47,12 +51,23 @@ CAPABILITY_INPUT_KEYS: Mapping[str, frozenset[str]] = {
 TokenCounter = Callable[[list[Any], int], Awaitable[int]]
 
 
+DEFAULT_OUTPUT_BUDGET = 4096  # what an unbudgeted request may consume at most (TC02)
+
+
 class EnvelopeError(ValueError):
     """A refused input carrying a C05 code; the routes map it to a status."""
 
-    def __init__(self, message: str, code: str = "contract_violation") -> None:
+    def __init__(self, message: str, code: str = "contract_violation", param: str = "messages") -> None:
         super().__init__(message)
         self.code = code
+        self.param = param
+
+
+class ChatContractError(EnvelopeError):
+    """A TC02/TC03 contract refusal: one code, one field path, no prose about the payload."""
+
+    def __init__(self, code: str, param: str, message: str) -> None:
+        super().__init__(message, code=code, param=param)
 
 
 def _json_object(value: Any, where: str) -> dict:
@@ -163,9 +178,137 @@ def check_images(sizes: list[tuple[int, int]], *, capabilities: Iterable[str], o
             raise EnvelopeError("image edge exceeds envelope.max_image_edge_pixels", "envelope_exceeded")
 
 
+class OutputBudgetPolicy(Protocol):
+    """What `prepare_chat` needs from a runtime policy (TC01's RuntimeChatPolicy satisfies it)."""
+
+    policy_id: str
+    recognized_output_fields: frozenset[str]
+    supported_output_fields: frozenset[str]
+
+
+@dataclass(frozen=True)
+class FixedOutputBudgetPolicy:
+    """The one runtime policy CT02 knows; CT06 keys it per runtime (TC01)."""
+
+    policy_id: str
+    recognized_output_fields: frozenset[str]
+    supported_output_fields: frozenset[str]
+
+
+#: Recognised and supported come from CT01's probe-e material: on image
+#: `4bc272f` each of the three aliases was proven to bound the output (the run
+#: exhausted the budget and reported `finish_reason=length`). Until CT06 binds
+#: the policy to `(profile_id, image_digest, model_sha256)`, this is the fixed
+#: image's own policy and no other runtime may be assumed to share it.
+DEFAULT_OUTPUT_POLICY = FixedOutputBudgetPolicy(
+    policy_id="llama-cpp-4bc272f-baseline",
+    recognized_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+    supported_output_fields=frozenset({"max_tokens", "max_completion_tokens", "n_predict"}),
+)
+
+
+@dataclass(frozen=True)
+class PreparedChat:
+    """The one body the compat route counts and dispatches (TC02).
+
+    `body_json` is frozen bytes: nothing may change between the count that
+    admitted the request and the dispatch that spends the budget, and every
+    consumer gets the body by decoding these bytes.
+    """
+
+    body_json: bytes
+    body_sha256: str
+    model_id: str
+    image_count: int
+    output_field: str
+    output_tokens: int
+    requires_tools: bool
+    requires_thinking: bool
+    policy_id: str
+
+    def decoded_body(self) -> dict:
+        """The only way to obtain the dispatchable body (TC02)."""
+        return json.loads(self.body_json.decode("utf-8"))
+
+
+def canonical_json_bytes(document: Mapping[str, Any]) -> bytes:
+    """UTF-8, sorted keys, compact separators, no NaN: one body, one digest (TC02)."""
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
+def normalize_output(payload: Mapping, envelope, policy: OutputBudgetPolicy) -> tuple[dict, str, int]:
+    """Clip the one output-budget field a request may carry; never touch the caller's payload."""
+    body = copy.deepcopy(dict(payload))
+    keys = sorted(set(body) & policy.recognized_output_fields)
+    if len(keys) > 1:
+        raise ChatContractError("contract_violation", keys[0], "multiple output budget fields")
+    field = keys[0] if keys else "max_tokens"
+    if field not in policy.supported_output_fields:
+        raise ChatContractError("contract_violation", field, "unsupported output budget field")
+    value = body[field] if keys else min(DEFAULT_OUTPUT_BUDGET, envelope.max_output_tokens)
+    if type(value) is not int or value < 1:
+        raise ChatContractError("contract_violation", field, "expected a positive integer")
+    if "n" in body and (type(body["n"]) is not int or body["n"] != 1):
+        raise ChatContractError("contract_violation", "n", "only n=1 is supported")
+    effective = min(value, envelope.max_output_tokens)
+    body[field] = effective
+    return body, field, effective
+
+
+def _requires_tools(payload: Mapping) -> bool:
+    """Projection only: TC04 owns the authoritative rule and the capability refusal."""
+    if payload.get("tools"):
+        return True
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(isinstance(message, Mapping) and (message.get("tool_calls") or message.get("role") == "tool")
+               for message in messages)
+
+
+def _requires_thinking(payload: Mapping) -> bool:
+    if "reasoning_effort" in payload:
+        return True
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(isinstance(message, Mapping) and message.get("reasoning_content") is not None
+               for message in messages)
+
+
+def prepare_chat(payload: Mapping, *, capabilities: Iterable[str], envelope,
+                 policy: OutputBudgetPolicy) -> PreparedChat:
+    """Prepare one compat chat/vision body: the budget is decided here or nowhere (TC02).
+
+    Pure: no I/O, no counting, no capability refusal beyond what the shape gives.
+    The caller's payload is never modified — the prepared body is a deep copy, so
+    the count and the dispatch can be compared byte for byte later.
+    """
+    if not isinstance(payload, Mapping):
+        raise EnvelopeError("chat input requires an object")
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise EnvelopeError("chat input requires a non-empty messages list")
+    image_count = len(collect_image_sizes(messages))
+    body, field, output_tokens = normalize_output(payload, envelope, policy)
+    body_json = canonical_json_bytes(body)
+    # `capabilities` is part of the contract: TC04's stage 4 turns it into the
+    # capability refusal. CT02 only projects the body, so it is unused here.
+    return PreparedChat(body_json=body_json,
+                        body_sha256=hashlib.sha256(body_json).hexdigest(),
+                        model_id=str(payload.get("model") or ""),
+                        image_count=image_count,
+                        output_field=field,
+                        output_tokens=output_tokens,
+                        requires_tools=_requires_tools(body),
+                        requires_thinking=_requires_thinking(body),
+                        policy_id=policy.policy_id)
+
+
 def effective_max_tokens(parameters: Mapping | None, envelope) -> int:
     """The output budget the request will actually use, clipped to the envelope."""
-    requested = (parameters or {}).get("max_tokens", min(4096, envelope.max_output_tokens))
+    requested = (parameters or {}).get("max_tokens", min(DEFAULT_OUTPUT_BUDGET, envelope.max_output_tokens))
     if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
         raise EnvelopeError("max_tokens must be a positive integer")
     return min(requested, envelope.max_output_tokens)
