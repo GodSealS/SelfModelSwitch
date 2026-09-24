@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT04 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的本地检查与 lab 真机预算上限均已验证；CT03/CT04 为纯软件契约任务，目标同 SHA 复跑通过），CT05—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT05 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过），CT06—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -49,7 +49,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT02 | 输出预算有效请求纵向修复 | CT01的预算字段清单 | done | `29a894f5…`；目标证据 `ct02-budget-20260924T105148Z/`：显式/别名预算 7B、27B 均耗尽 32→32，缺省上限 7B=4096、27B=1024 精确耗尽；本地 1080 passed |
 | CT03 | 模型能力与execution operation分离 | CT02 | done | `a90494e0…`；本地 1087 passed、目标同 SHA 149 passed；schema 字节一致；证据 `ct03-contract-20260924T121318Z/` |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | done | `4b7303b1…`；本地 1156 passed、目标同 SHA 297 passed；A03/A04/A06-local 全矩阵 + 本地零调用断言；证据 `ct04-contract-20260924T144322Z/` |
-| CT05 | 持租约完整计数与错误清理 | CT04 | pending | — |
+| CT05 | 持租约完整计数与错误清理 | CT04 | done | `3f60bc2…`；本地 1175 passed、目标同 SHA 普通 chat/vision 回归 3/3 200；证据 `ct05-chat-regression-20260924T160538Z/` |
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | pending | — |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | pending | — |
 | CT08 | SSE、evaluator及证据反篡改 | CT07 | pending | — |
@@ -280,6 +280,29 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：A05/A09-cleanup，注入切换、deadline消耗、计数4xx/5xx、断连、取消；每个已取得lease恰释放一次。
   本地全量后目标普通chat/vision回归；新能力真实计数在CT10验收。
 - 文档：08 C06明确“本地检查在acquire前，token检查在同lease下且生成前”；取得lease不构成生成派发。
+
+### CT05 同租约计数与清理（2026-09-24 已执行）
+
+- 交付：`3f60bc2`（分支 `feature/ct05-lease-bound-count`，含 `b39467f` 与策略解析修复）。
+  新增 `model_scheduler/chat_counting.py`：`RuntimeChatPolicy`（TC01 全字段 + 校验）、按
+  `(profile_id,image_digest,model_sha256)` 的 `POLICY_REGISTRY`/`resolve_policy`（含 CT01 材料的两个 lab 条目）、
+  `CountReceipt` + `validate_receipt`、`ChatCountPort` 协议与 `RuntimeChatCounter`（模板投影 +
+  同租约计数 + 入口/复检身份 + `validate_binding`）。适配器新增 `count_template`（投影请求 + 策略
+  tokenize 选项，内部执行路径不变）；`app.py` 改为 `chat_counter` 端口注入并按 TC06 顺序接线
+  （prepare_chat → acquire → count → check_chat_budget → validate_binding → gateway.open），
+  删除“任意异常→warm→重试”，计数/超限/绑定失败分别 503/422/503 且 ABORTED/REJECTED 恰释放一次；
+  `run.py` 从注册表解析每模型策略并从 Book 读取身份/代数。
+- 验证（RED→GREEN）：`tests/test_chat_counting.py` 13 项（投影、常量重叠拒绝、receipt 矩阵、图片计费、
+  入口/复检身份、切换不重试、deadline 映射、绑定复核）；HTTP 级零调用/释放断言与 `count_template` 单测同批更新；
+  定向 185 passed、相邻受影响一致；全量 `pytest tests -m 'not thor' -q` → **1175 passed、1 skipped、1 deselected**（69.27 s）；
+  `ruff`、`run.py --check-config`、`git diff --check` 通过。
+- 目标同 SHA（`3f60bc2`，干净；证据 `ct05-chat-regression-20260924T160538Z/`）：以该 SHA 重启调度器后，
+  三个普通用例全部 200——7B `Reply with exactly OK.`（stop、prompt 24/completion 3、"OK."）、
+  7B vision（1×1 PNG，stop、41/3、"Red."）、27B chat（length、15/16、reasoning 62 字符）；
+  7B/27B 均 `ready`、无 blocked/last_error、queue 0，调度器日志无错误行。
+- 文档：`08-execution-plan.md` C06 增“本地检查在 acquire 前、token 检查在同 lease 下且生成前；取得 lease 只表示预留”。
+- 边界：`effort_values` 仍为 fail-closed 空集（CT06 补测）；未注册策略的模型按请求 503（失败封闭，不猜默认值）；
+  新能力真实计数与 A05/A09 真机项归 CT10。
 
 ### CT06 启动策略与回滚产物
 

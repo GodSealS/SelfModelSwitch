@@ -2050,3 +2050,27 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 既有慢用例（非本轮引入）：`test_v2_tcp_app_…` 等待 900 s deadline，全量套件耗时约 944 s。
 - 未完成项：A03/A04/A06 的真机列属 CT10 候选阶段；`effort_values` 待 CT06 用探测结果登记，
   当前空集为 fail-closed 默认而非镜像语义声明。
+
+### CT05 同租约计数与错误清理（2026-09-24，交付分支 `feature/ct05-lease-bound-count`）
+
+- Python/环境：本地 `venv312` 3.12.11；目标 3.12.14。
+- 软件交付与检查（exit 均为 0）：
+  - 交付：`model_scheduler/chat_counting.py`（策略/注册表/`CountReceipt`/`ChatCountPort`/`RuntimeChatCounter`）、
+    适配器 `count_template`、`app.py` 的 `chat_counter` 端口与 TC06 生命周期、`run.py` 的策略解析与 Book 身份接线；
+    提交 `b39467f`、`3f60bc2`（后者修正“未注册模型不应拒绝整个启动，而应按请求 503 失败封闭”）。
+  - RED→GREEN：`tests/test_chat_counting.py` 13 项（模板投影与常量重叠拒绝、receipt 类型/hash/generation/模板/身份/
+    算术矩阵、图片按封套计费、入口与复检身份、切换不重试、计数失败 503/504 映射、绑定复核）；
+    `tests/test_chat_api.py`（HTTP 零调用、503/504 与 ABORTED、422 与 REJECTED、成功单次 release 且派发体一致）、
+    `tests/test_envelopes.py`（同 lease、同 deadline、不再 warm）、`tests/test_llama_adapter.py`（`count_template`）、
+    `tests/integration/test_control_socket.py`（fixture 注入 `chat_policies`）。
+  - 全量 `pytest tests -m 'not thor' -q` → **1175 passed、1 skipped、1 deselected**（69.27 s；
+    计数拒绝改为按请求失败后，原先 900 s 的 `test_v2_tcp_app_…` 用例即时返回，套件从 942 s 降到 69 s）；
+    `ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+  - 提交推送：GitHub 与目标镜像 `feature/ct05-lease-bound-count` 均为 `3f60bc2…`。
+- 目标同步与同 SHA 回归（证据 `ct05-chat-regression-20260924T160538Z/`）：守卫流程 → `verified_target_sha=3f60bc2…`、
+  状态为空、镜像 ref 相同；**以该 SHA 重启调度器**（pid 326877；旧进程 326130 优雅停止），随后三个普通用例：
+  7B chat（200、stop、prompt 24/completion 3、"OK."）、7B vision（200、stop、41/3、"Red."）、
+  27B chat（200、length、15/16、reasoning 62 字符）；7B/27B `ready`、无 blocked/last_error、queue 0、日志无错误。
+- 部署影响：目标部署现运行 CT05 代码（`3f60bc2`）；llama-swap 与 LAN 网关未改动。
+- 未完成项：`effort_values` 空集为 fail-closed 默认（CT06 补测后登记）；未注册策略的模型按请求 503；
+  A05/A09 的真机列（工具/历史/图片/思考组合计数与 usage 证据）归 CT10。
