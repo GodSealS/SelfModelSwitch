@@ -404,6 +404,22 @@ def test_inspect_reads_the_template_from_the_immutable_gguf_metadata(tmp_path):
     target = tmp_path / "model.gguf"
     target.write_bytes(_gguf_bytes("{{ messages }}"))
     assert read_gguf_chat_template(target) == b"{{ messages }}"
+
+    # A model-units string array before the template: skipping fewer elements
+    # than the array declares would misalign every following key.
+    tokens = [b"a", b"bb", b"ccc"]
+
+    def kv(key: bytes, type_id: int, payload: bytes) -> bytes:
+        return struct.pack("<Q", len(key)) + key + struct.pack("<I", type_id) + payload
+
+    def string(value: bytes) -> bytes:
+        return struct.pack("<Q", len(value)) + value
+
+    array = struct.pack("<IQ", 8, len(tokens)) + b"".join(string(token) for token in tokens)
+    body = kv(b"tokenizer.ggml.tokens", 9, array) + kv(b"tokenizer.chat_template", 8, string(b"{% raw %}"))
+    packed = tmp_path / "array.gguf"
+    packed.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 2) + body)
+    assert read_gguf_chat_template(packed) == b"{% raw %}"
     empty = tmp_path / "empty.gguf"
     empty.write_bytes(_gguf_bytes(None))
     assert read_gguf_chat_template(empty) is None

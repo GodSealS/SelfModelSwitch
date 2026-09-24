@@ -73,6 +73,8 @@ DENIED_TEMPLATE_FIELDS: tuple[str, ...] = ("chat_template", "chat_template_kwarg
 TEMPLATE_REQUEST_FIELDS: tuple[str, ...] = ("messages", "tools", "tool_choice", "parallel_tool_calls",
                                             "reasoning_effort")
 UNKNOWN_FIELD = "sms_probe_unknown_field"
+MAX_ARRAY_ELEMENTS = 20_000_000
+MAX_STRING_BYTES = 64 * 1024 * 1024
 EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
@@ -521,23 +523,36 @@ def read_gguf_chat_template(path: str | Path) -> bytes | None:
                     raw_value = handle.read(8)
                     if len(raw_value) < 8:
                         return None
-                    value = handle.read(struct.unpack("<Q", raw_value)[0])
+                    length = struct.unpack("<Q", raw_value)[0]
+                    if length > MAX_STRING_BYTES:
+                        return None
+                    value = handle.read(length)
                     if key == b"tokenizer.chat_template":
                         return value
                     continue
-                if value_type == 9:  # array: type, count, then the elements
+                if value_type == 9:  # array: type, count, then every element
                     raw_array = handle.read(12)
                     if len(raw_array) < 12:
                         return None
                     element_type, count = struct.unpack("<IQ", raw_array)
+                    if count > MAX_ARRAY_ELEMENTS:
+                        return None
                     if element_type == 8:
-                        for _ in range(min(count, 100000)):
+                        # Skipping fewer elements than the array holds would leave the
+                        # reader misaligned, so the whole array is walked.
+                        for _ in range(count):
                             raw_value = handle.read(8)
                             if len(raw_value) < 8:
                                 return None
-                            handle.read(struct.unpack("<Q", raw_value)[0])
+                            length = struct.unpack("<Q", raw_value)[0]
+                            if length > MAX_STRING_BYTES:
+                                return None
+                            handle.read(length)
                     elif element_type in sizes:
-                        handle.read(sizes[element_type] * min(count, 1000000))
+                        span = sizes[element_type] * count
+                        if span > limit:
+                            return None
+                        handle.read(span)
                     else:
                         return None
                     continue
