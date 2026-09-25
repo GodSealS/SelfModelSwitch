@@ -19,6 +19,7 @@ from model_scheduler.acceptance import chat_compat as cc
 from model_scheduler.acceptance import fixtures as fx
 from model_scheduler.acceptance import materials as ms
 from model_scheduler.contracts_v2 import Envelope
+from model_scheduler.evidence_contracts import ContractError
 
 MODEL_ID = "qwen36-27b"
 ENVELOPE = Envelope(ctx_size=32768, max_input_tokens=28672, max_output_tokens=1024, max_parallel=2,
@@ -303,6 +304,21 @@ def test_a08_the_case_specs_are_derived_from_the_declared_capabilities() -> None
         cc.CaseSpec(case_id="L:alt:cap:tools", variant="json-hot", scenario=_tools_scenario())
 
 
+def test_a08_the_derived_case_set_covers_every_declared_capability() -> None:
+    """Coverage comes from the registration: a new capability adds its case id."""
+    from model_scheduler.contracts_v2 import MODEL_CAPABILITIES
+    from model_scheduler.evidence_contracts import CAPABILITIES, parse_case_id
+
+    assert CAPABILITIES >= MODEL_CAPABILITIES
+    for capability in cc.COMPAT_CAPABILITIES:
+        assert parse_case_id(f"B:{MODEL_ID}:cap:{capability}") == f"B:{MODEL_ID}:cap:{capability}"
+    with pytest.raises(ContractError):
+        parse_case_id(f"B:{MODEL_ID}:cap:audio")
+
+    specs = cc.case_specs_for(MODEL_ID, ("chat", "tools"), ENVELOPE, deadline_seconds=DEADLINE)
+    assert {spec.case_id for spec in specs} == {f"B:{MODEL_ID}:cap:tools"}  # thinking is not derived when undeclared
+
+
 def test_a08_the_internal_execution_surface_is_unchanged() -> None:
     """The compat route adds nothing to the internal execution DTO or its schema."""
     from model_scheduler.control_protocol_v1 import EXECUTION_OPERATIONS, render_schema_text, schema_document
@@ -418,3 +434,206 @@ def test_a08_a_compat_case_the_runner_cannot_prove_is_not_a_pass(tmp_path: Path)
 
     attempt = {attempt.case_id: attempt for attempt in attempts}[f"B:{MODEL_ID}:cap:thinking"]
     assert attempt.status == "unknown" and "unresolved problems" in " ".join(attempt.problems)
+
+
+# ---------------------------------------------------------------------------
+# CT08: the SSE aggregator and the independent evaluator (TC08, A08/A09).
+# ---------------------------------------------------------------------------
+
+
+def _sse(stream_id: str = "call_fixture_1") -> bytes:
+    """The raw SSE fixture of acceptance §6: fragments, usage-only, one DONE."""
+    events = [
+        '{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"查询天气"},"finish_reason":null}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"' + stream_id + '","type":"function",'
+        '"function":{"name":"get_weather","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}',
+        '{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Beijing\\"}"}}]},'
+        '"finish_reason":null}]}',
+        '{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        '{"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"total_tokens":168}}',
+    ]
+    return ("\n\n".join(f"data: {event}" for event in events) + "\n\ndata: [DONE]\n\n").encode("utf-8")
+
+
+def _per_byte(raw: bytes) -> cc.SseAggregator:
+    aggregator = cc.SseAggregator()
+    for index in range(len(raw)):
+        aggregator.feed(raw[index : index + 1])
+    return aggregator
+
+
+def test_a09_the_aggregator_reassembles_a_stream_that_was_cut_at_every_byte() -> None:
+    body = _per_byte(_sse()).finish()
+
+    message = body["choices"][0]["message"]
+    assert message["reasoning_content"] == "查询天气"
+    assert message["tool_calls"][0]["id"] == "call_fixture_1"
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "Beijing"}
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert body["usage"] == {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168}
+    assert cc.SseAggregator().aggregate(_sse()) == body  # the whole-buffer path agrees
+
+
+def test_a09_non_ascii_survives_a_boundary_inside_one_character() -> None:
+    raw = ('data: {"choices":[{"index":0,"delta":{"reasoning_content":"查询天"},"finish_reason":null}]}\n\n'
+           'data: {"choices":[{"index":0,"delta":{"reasoning_content":"气"},"finish_reason":"stop"}]}\n\n'
+           'data: [DONE]\n\n').encode("utf-8")
+    split = raw.index("天".encode("utf-8")) + 1  # cuts a multi-byte character in half
+
+    aggregator = cc.SseAggregator()
+    aggregator.feed(raw[:split])
+    aggregator.feed(raw[split:])
+    body = aggregator.finish()
+
+    assert body["choices"][0]["message"]["reasoning_content"] == "查询天气"
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a09_only_the_first_fragment_has_to_carry_the_id_and_name() -> None:
+    raw = ('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function",'
+           '"function":{"name":"get_weather","arguments":"{\\"c"}}]},"finish_reason":null}]}\n\n'
+           'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ity\\":\\"B"}}]},'
+           '"finish_reason":null}]}\n\n'
+           'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"eijing\\"}"}}]},'
+           '"finish_reason":"tool_calls"}]}\n\n'
+           'data: [DONE]\n\n').encode("utf-8")
+
+    call = cc.SseAggregator().aggregate(raw)["choices"][0]["message"]["tool_calls"][0]
+    assert call["id"] == "call_a" and call["type"] == "function"
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Beijing"}
+
+    conflicting = raw.replace(b'{"index":0,"function":{"arguments":"eijing',
+                              b'{"index":0,"id":"call_b","function":{"arguments":"eijing')
+    with pytest.raises(cc.CompatError, match="id"):
+        cc.SseAggregator().aggregate(conflicting)
+
+
+def test_a09_usage_only_chunks_and_null_deltas_are_not_errors() -> None:
+    raw = ('data: {"choices":[{"index":0,"delta":{"content":null,"reasoning_content":null},'
+           '"finish_reason":null}]}\n\n'
+           'data: {"choices":[{"index":0,"delta":{"content":"SMS_WEATHER_OK_27"},"finish_reason":"stop"}]}\n\n'
+           'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}\n\n'
+           'data: [DONE]\n\n').encode("utf-8")
+
+    body = cc.SseAggregator().aggregate(raw)
+    assert body["choices"][0]["message"]["content"] == "SMS_WEATHER_OK_27"
+    assert body["usage"]["total_tokens"] == 11
+
+
+def test_a09_a_broken_stream_is_refused_not_approximated() -> None:
+    broken = {
+        "bad json": b'data: {"choices":[{"index":0,\n\ndata: [DONE]\n\n',
+        "index type": b'data: {"choices":[{"index":"0","delta":{},"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+        "two indexes": b'data: {"choices":[{"index":0,"delta":{},"finish_reason":null},{"index":1,"delta":{},'
+                       b'"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+        "missing DONE": b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        "duplicate DONE": b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                          b'data: [DONE]\n\ndata: [DONE]\n\n',
+        "data after DONE": b'data: [DONE]\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        "no finish reason": b'data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}\n\n'
+                            b'data: [DONE]\n\n',
+        "empty call id": b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","type":"function",'
+                         b'"function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+                         b'data: [DONE]\n\n',
+    }
+    for label, raw in broken.items():
+        with pytest.raises(cc.CompatError) as refused:
+            cc.SseAggregator().aggregate(raw)
+        assert str(refused.value), label
+
+    with pytest.raises(cc.CompatError, match="event"):
+        cc.SseAggregator(event_limit=2).aggregate(_sse())
+
+
+def test_a08_a_streamed_scenario_runs_through_the_aggregator(tmp_path: Path) -> None:
+    second = ('data: {"choices":[{"index":0,"delta":{"reasoning_content":"已取到",'
+              '"content":"SMS_WEATHER"},"finish_reason":null}]}\n\n'
+              'data: {"choices":[{"index":0,"delta":{"content":"_OK_27"},"finish_reason":"stop"}]}\n\n'
+              'data: [DONE]\n\n').encode("utf-8")
+    transport = FakeTransport(_sse("call_streamed_1"), second)
+    driver = cc.CompatDriver(transport, aggregator=cc.SseAggregator)  # one fresh aggregator per round
+    spec = cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:tools", variant="sse-hot", scenario=_tools_scenario(stream=True))
+
+    run = driver.run(spec, tmp_path / "tools-sse-hot")
+
+    assert run.tool_call_id == "call_streamed_1" and run.final_content == "SMS_WEATHER_OK_27"
+    assert run.first_reasoning == "查询天气"
+    assert json.loads(transport.sent[1])["messages"][-1]["tool_call_id"] == "call_streamed_1"
+    assert (tmp_path / "tools-sse-hot" / "round-1" / cc.RESPONSE_FILE).read_bytes() == _sse("call_streamed_1")
+    assert cc.evaluate_case(tmp_path / "tools-sse-hot")["problems"] == []
+
+
+def _completed(tmp_path: Path, name: str, *, first: bytes = TOOLS_ROUND_ONE,
+               second: bytes = TOOLS_ROUND_TWO, capability: str = "tools") -> Path:
+    target = tmp_path / name
+    scenario = _tools_scenario() if capability == "tools" else _thinking_scenario()
+    bodies = (THINKING_ROUND_ONE, THINKING_ROUND_TWO) if capability == "thinking" else (first, second)
+    cc.CompatDriver(FakeTransport(*bodies)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:{capability}", variant="json-hot", scenario=scenario), target)
+    return target
+
+
+def test_a08_the_evaluator_recomputes_and_refuses_the_tampered_material(tmp_path: Path) -> None:
+    target = _completed(tmp_path, "clean")
+    assert cc.evaluate_case(target)["problems"] == []
+
+    facts = json.loads((target / cc.COMPAT_FILE).read_text(encoding="utf-8"))
+    facts["status"] = "passed"  # a stored verdict is never an input
+
+    for path in sorted((target / "round-2").rglob("*"), reverse=True):
+        path.unlink()
+    (target / "round-2").rmdir()
+    with pytest.raises(cc.CompatError):
+        cc.evaluate_case(target, facts)
+
+    forged = _completed(tmp_path, "forged")
+    request = json.loads((forged / "round-2" / cc.REQUEST_FILE).read_text(encoding="utf-8"))
+    request["messages"][1]["tool_calls"][0]["id"] = "call_forged"
+    request["messages"][-1]["tool_call_id"] = "call_forged"
+    (forged / "round-2" / cc.REQUEST_FILE).write_bytes(cc.canonical_json_bytes(request))
+    forged_facts = json.loads((forged / cc.COMPAT_FILE).read_text(encoding="utf-8"))
+    forged_facts["material"] = [{"relative_path": path, "sha256": digest}
+                                for path, digest in cc.compat_material_refs(forged) if path != cc.COMPAT_FILE]
+    assert any("tool_call_id" in problem for problem in cc.evaluate_case(forged, forged_facts)["problems"])
+
+
+def test_a08_the_evaluator_checks_the_markers_and_never_accepts_length(tmp_path: Path) -> None:
+    truncated = json.dumps({"choices": [{"index": 0, "finish_reason": "length", "message": {
+        "role": "assistant", "content": "SMS_WEATHER_OK_27"}}], "usage": {}}, ensure_ascii=False).encode("utf-8")
+    target = _completed(tmp_path, "length", second=truncated)
+    assert any("finish_reason" in problem for problem in cc.evaluate_case(target)["problems"])
+
+    without_marker = json.dumps({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+        "role": "assistant", "content": "the weather is fine"}}], "usage": {}}, ensure_ascii=False).encode("utf-8")
+    target = _completed(tmp_path, "no-marker", second=without_marker)
+    assert any("marker" in problem for problem in cc.evaluate_case(target)["problems"])
+
+    no_reasoning = THINKING_ROUND_ONE.replace('"reasoning_content": "先算乘法"'.encode("utf-8"),
+                                              b'"reasoning_content": ""')
+    target = tmp_path / "no-reasoning"
+    cc.CompatDriver(FakeTransport(no_reasoning, THINKING_ROUND_TWO)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:thinking", variant="json-hot", scenario=_thinking_scenario()), target)
+    assert any("reasoning" in problem for problem in cc.evaluate_case(target)["problems"])
+
+    tagged = THINKING_ROUND_TWO.replace(b'"content": "RESULT=438"', b'"content": "<think>RESULT=438</think>"')
+    target = tmp_path / "tagged"
+    cc.CompatDriver(FakeTransport(THINKING_ROUND_ONE, tagged)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:thinking", variant="json-hot", scenario=_thinking_scenario()), target)
+    assert any("thinking tag" in problem for problem in cc.evaluate_case(target)["problems"])
+
+
+def test_a08_the_fixture_material_covers_every_declared_chat_feature(tmp_path: Path) -> None:
+    scenarios = cc.compat_scenarios_for(MODEL_ID, ("chat", "tools", "thinking"), ENVELOPE, deadline_seconds=DEADLINE)
+    entries = cc.write_fixture_material(tmp_path / "fixtures", scenarios)
+
+    assert [entry["capabilities"] for entry in entries] == [["tools"], ["tools"], ["thinking"], ["thinking"]]
+    assert all(entry["artifact"]["sha256"] for entry in entries)
+    assert (tmp_path / "fixtures" / "qwen36-27b-tools.json").is_file()
+
+    digest = cc.fixture_set_digest(scenarios)
+    assert digest == cc.fixture_set_digest(
+        cc.compat_scenarios_for(MODEL_ID, ("chat", "tools", "thinking"), ENVELOPE, deadline_seconds=DEADLINE))
+    assert digest != cc.fixture_set_digest(
+        cc.compat_scenarios_for(MODEL_ID, ("chat", "tools"), ENVELOPE, deadline_seconds=DEADLINE))

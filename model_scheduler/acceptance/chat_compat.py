@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import codecs
 import hashlib
 import json
 import math
@@ -246,7 +247,7 @@ def tools_scenario(model_id: str, *, envelope, stream: bool, deadline_seconds: f
         "stream": stream,
     }
     return CompatScenario(
-        fixture_id=f"{model_id}-tools",
+        fixture_id=f"{model_id}-tools{"-sse" if stream else ""}",
         capability="tools",
         transport=TRANSPORT_COMPAT,
         model_id=model_id,
@@ -270,7 +271,7 @@ def thinking_scenario(model_id: str, *, envelope, stream: bool, deadline_seconds
         "stream": stream,
     }
     return CompatScenario(
-        fixture_id=f"{model_id}-thinking",
+        fixture_id=f"{model_id}-thinking{"-sse" if stream else ""}",
         capability="thinking",
         transport=TRANSPORT_COMPAT,
         model_id=model_id,
@@ -389,13 +390,13 @@ class CompatDriver:
 
         first_request = json.loads(scenario.first_request_json)
         first_round = self._post(scenario, scenario.first_request_json)
-        first_body = self._body(first_round, target / "round-1")
+        first_body = self._body(scenario, first_round)
         self._write_round(target / "round-1", scenario.first_request_json, first_round, first_body)
 
         call = first_tool_call(first_body) if scenario.capability == "tools" else None
         second_request_json = build_second_round(scenario, first_request=first_request, first_body=first_body)
         second_round = self._post(scenario, second_request_json)
-        second_body = self._body(second_round, target / "round-2")
+        second_body = self._body(scenario, second_round)
         self._write_round(target / "round-2", second_request_json, second_round, second_body)
 
         first_message = assistant_message_of(first_body)
@@ -428,10 +429,15 @@ class CompatDriver:
             raise CompatError(f"the compat route answered {round_record.status}, not 200")
         return round_record
 
-    def _body(self, round_record: CompatRound, directory: Path) -> Mapping[str, Any]:
-        if self.aggregator is not None and self.transport is not None and round_record.raw.startswith(b"data:"):
-            return self.aggregator.aggregate(round_record.raw)
-        return json.loads(round_record.raw.decode("utf-8"))
+    def _body(self, scenario: CompatScenario, round_record: CompatRound) -> Mapping[str, Any]:
+        if not scenario.stream:
+            return json.loads(round_record.raw.decode("utf-8"))
+        # A streamed round is recombined by a *fresh* aggregator that owns SSE:
+        # recombination state belongs to one stream, never to the driver.
+        aggregator = self.aggregator() if callable(self.aggregator) else self.aggregator
+        if aggregator is None or not hasattr(aggregator, "aggregate"):
+            raise CompatError("a streaming round needs the SSE aggregator; it is never improvised here")
+        return aggregator.aggregate(round_record.raw)
 
     def _prepare_directory(self, evidence_dir: str | Path) -> Path:
         target = Path(evidence_dir)
@@ -465,6 +471,7 @@ class CompatDriver:
             })
         document = dict(run.document())
         document.update({
+            "capability": scenario.capability,
             "location": str(target),
             "reload": spec.reload,
             "rounds": records,
@@ -577,3 +584,309 @@ def _root_of(document: Mapping[str, Any]) -> Path:
 def relay_scenario(scenario: CompatScenario, **changes: Any) -> CompatScenario:
     """A new scenario with one change; nothing about a fixture is edited in place."""
     return replace(scenario, **changes)
+
+
+# ---------------------------------------------------------------------------
+# CT08: the SSE aggregator (TC08) — recombination is material, not a guess.
+# ---------------------------------------------------------------------------
+
+
+def _index_of(choice: Mapping[str, Any], where: str) -> int:
+    index = choice.get("index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise CompatError(f"{where}: index must be an integer, got {index!r}")
+    if index != 0:
+        raise CompatError(f"{where}: index {index} is not the one generated choice")
+    return index
+
+
+def _string_fragment(value: Any, where: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise CompatError(f"{where}: a text fragment must be a string, got {type(value).__name__}")
+    return value
+
+
+class SseAggregator:
+    """Recombine one SSE completion: incremental UTF-8, per-index, once.
+
+    The service passes the stream through untouched, so the acceptance side owns
+    recombination. Every fragment counts: `id`/`type` may appear only in the first
+    fragment (a later, different id is a contradiction), `name` and `arguments`
+    are concatenated in arrival order, `content`/`reasoning_content` are separate
+    and `null` adds nothing. `[DONE]` happens exactly once and ends the stream.
+    """
+
+    def __init__(self, *, event_limit: int = 100000) -> None:
+        if isinstance(event_limit, bool) or not isinstance(event_limit, int) or event_limit < 1:
+            raise CompatError("the event limit must be a positive integer")
+        self.event_limit = event_limit
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        self._buffer = ""
+        self._events = 0
+        self._done = False
+        self._content = ""
+        self._reasoning = ""
+        self._finish_reason: str | None = None
+        self._usage: dict[str, Any] = {}
+        self._completion_id: str | None = None
+        self._calls: dict[int, dict[str, Any]] = {}
+
+    # -- feeding ----------------------------------------------------------
+
+    def feed(self, chunk: bytes) -> None:
+        if self._done:
+            if chunk.strip():
+                raise CompatError("the stream kept sending data after [DONE]")
+            return
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise CompatError("the stream feeds bytes, not text")
+        text = self._decoder.decode(bytes(chunk))
+        self._buffer += text
+        while "\n\n" in self._buffer:
+            raw_event, self._buffer = self._buffer.split("\n\n", 1)
+            self._consume(raw_event)
+
+    def aggregate(self, raw: bytes) -> Mapping[str, Any]:
+        self.feed(raw)
+        return self.finish()
+
+    def finish(self) -> dict:
+        """Close the stream: a truncation is a failure, never a partial answer."""
+        if not self._done:
+            if self._buffer.strip():
+                self._consume(self._buffer)
+                self._buffer = ""
+            if not self._done:
+                raise CompatError("the stream ended without [DONE]")
+        if self._finish_reason is None:
+            raise CompatError("the stream ended without a terminal finish_reason")
+        message: dict[str, Any] = {"role": "assistant", "content": self._content}
+        if self._reasoning:
+            message["reasoning_content"] = self._reasoning
+        if self._calls:
+            message["tool_calls"] = self._ready_calls()
+        choice: dict[str, Any] = {"index": 0, "finish_reason": self._finish_reason, "message": message}
+        body: dict[str, Any] = {"choices": [choice]}
+        if self._completion_id is not None:
+            body["id"] = self._completion_id
+        if self._usage:
+            body["usage"] = dict(self._usage)
+        return body
+
+    # -- internals --------------------------------------------------------
+
+    def _consume(self, raw_event: str) -> None:
+        if self._done:
+            raise CompatError("the stream kept sending data after [DONE]")
+        payload = "\n".join(line[len("data:"):].lstrip(" ") for line in raw_event.splitlines()
+                            if line.startswith("data:"))
+        if not payload.strip():
+            return
+        self._events += 1
+        if self._events > self.event_limit:
+            raise CompatError(f"the stream exceeded {self.event_limit} events")
+        if payload.strip() == "[DONE]":
+            self._done = True
+            return
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise CompatError(f"the stream carried unparsable JSON: {exc}") from exc
+        if not isinstance(event, Mapping):
+            raise CompatError("an SSE event must be a JSON object")
+        if isinstance(event.get("id"), str):
+            self._completion_id = event["id"]
+        usage = event.get("usage")
+        if isinstance(usage, Mapping):
+            self._usage.update(usage)
+        choices = event.get("choices")
+        if choices is None:
+            return  # a usage-only event carries no choice
+        if not isinstance(choices, list):
+            raise CompatError("the stream event's choices must be a list")
+        if len(choices) > 1:
+            raise CompatError(f"the stream produced {len(choices)} generated choices; parallel=false allows one")
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                raise CompatError("a streamed choice must be an object")
+            _index_of(choice, "the streamed choice")
+            self._apply(choice.get("delta"), choice.get("finish_reason"))
+
+    def _apply(self, delta: Any, finish_reason: Any) -> None:
+        if delta is None:
+            delta = {}
+        if not isinstance(delta, Mapping):
+            raise CompatError("a streamed delta must be an object")
+        self._content += _string_fragment(delta.get("content"), "the streamed content")
+        self._reasoning += _string_fragment(delta.get("reasoning_content"), "the streamed reasoning_content")
+        for call in delta.get("tool_calls") or ():
+            if not isinstance(call, Mapping):
+                raise CompatError("a streamed tool call must be an object")
+            index = call.get("index")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise CompatError(f"a streamed tool call needs an integer index, got {index!r}")
+            state = self._calls.setdefault(index, {"index": index, "id": None, "type": None,
+                                                   "function": {"name": "", "arguments": ""}})
+            for key in ("id", "type"):
+                value = call.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    raise CompatError(f"a streamed tool call's {key} must be a string")
+                if state[key] is not None and state[key] != value:
+                    raise CompatError(f"the streamed tool call contradicts its own {key}")
+                state[key] = value
+            function = call.get("function")
+            if function is None:
+                continue
+            if not isinstance(function, Mapping):
+                raise CompatError("a streamed tool call's function must be an object")
+            for key in ("name", "arguments"):
+                value = function.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    raise CompatError(f"a streamed tool call's {key} must be a string")
+                state["function"][key] = state["function"][key] + value
+        if finish_reason is not None:
+            if not isinstance(finish_reason, str):
+                raise CompatError("a finish_reason must be a string")
+            self._finish_reason = finish_reason
+
+    def _ready_calls(self) -> list[dict[str, Any]]:
+        calls = []
+        for index in sorted(self._calls):
+            call = self._calls[index]
+            for key in ("id", "type"):
+                if not call[key]:
+                    raise CompatError(f"the streamed tool call {index} ended without a {key}")
+            if not call["function"]["name"]:
+                raise CompatError(f"the streamed tool call {index} ended without a name")
+            calls.append(call)
+        return calls
+
+
+# ---------------------------------------------------------------------------
+# CT08: the independent evaluator — verdicts come from raw material only.
+# ---------------------------------------------------------------------------
+
+
+#: Template markers the deployment must keep out of the answer: their presence
+#: means thinking was not separated, so the answer is not the final one.
+THINKING_TAGS = ("<think>", "</think>", "<thinking>", "</thinking>", "<|thinking|>")
+
+
+def evaluate_case(root: str | Path, document: Mapping[str, Any] | None = None) -> dict:
+    """Recompute one compat scenario from its raw material and report problems.
+
+    Nothing here reads a stored status: a verdict is what the recomputation
+    produces. A missing, rewritten or re-hashed round is refused outright; the
+    returned `problems` are the semantic reasons this case is not a pass.
+    """
+    base = Path(root)
+    facts = dict(document) if document is not None else json.loads((base / COMPAT_FILE).read_text("utf-8"))
+    facts = {**facts, "location": str(base)}
+    recorded = dict(compat_material_refs(base))
+    for entry in facts.get("material", ()):
+        if recorded.get(entry["relative_path"]) != entry["sha256"]:
+            raise CompatError(f"{entry['relative_path']}: the material no longer matches the recorded digest")
+    first_request = _read_json(base / "round-1" / REQUEST_FILE)
+    first_body = _read_json(base / "round-1" / BODY_FILE)
+    second_request = _read_json(base / "round-2" / REQUEST_FILE)
+    second_body = _read_json(base / "round-2" / BODY_FILE)
+
+    problems: list[str] = []
+    problems.extend(link_problems(facts))
+    problems.extend(_round_problems(facts, first_request, first_body, second_request, second_body))
+    return {"problems": problems,
+            "checks": {"rounds": len(facts.get("rounds", ())), "capability": facts.get("capability"),
+                       "variant": facts.get("variant")}}
+
+
+def _read_json(path: Path) -> dict:
+    if not path.is_file():
+        raise CompatError(f"{path.parent.name}: {path.name} is missing")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _round_problems(facts: Mapping[str, Any], first_request: Mapping[str, Any], first_body: Mapping[str, Any],
+                    second_request: Mapping[str, Any], second_body: Mapping[str, Any]) -> list[str]:
+    problems: list[str] = []
+    capability = str(facts.get("capability", ""))
+    expected = dict(facts.get("expected", {}))
+    first_reason = _finish_reason(first_body)
+    final_reason = _finish_reason(second_body)
+    final_content = (assistant_message_of(second_body).get("content") or "").strip()
+
+    if capability == "tools":
+        if first_reason != "tool_calls":
+            problems.append(f"round 1: finish_reason {first_reason!r} is not tool_calls")
+        call = _call_of(first_body)
+        if call is None:
+            problems.append("round 1: no tool call was produced")
+        else:
+            if call.get("function", {}).get("name") != expected.get("tool_name"):
+                problems.append("round 1: the tool call is not the fixed tool")
+            arguments = call.get("function", {}).get("arguments")
+            try:
+                parsed = json.loads(arguments) if isinstance(arguments, str) else None
+            except json.JSONDecodeError:
+                parsed = None
+            if parsed != expected.get("tool_arguments"):
+                problems.append("round 1: the tool arguments are not the fixed fixture arguments")
+        if final_reason != "stop":
+            problems.append(f"round 2: finish_reason {final_reason!r} is not stop (length is not a pass)")
+        if final_content != expected.get("final_content"):
+            problems.append(f"round 2: the final answer is not the fixed marker {expected.get('final_content')!r}")
+    elif capability == "thinking":
+        first_content = (assistant_message_of(first_body).get("content") or "").strip()
+        if not (assistant_message_of(first_body).get("reasoning_content") or "").strip():
+            problems.append("round 1: the thinking round produced no reasoning")
+        if expected.get("first_content_contains") and expected["first_content_contains"] not in first_content:
+            problems.append(f"round 1: the answer does not contain {expected['first_content_contains']!r}")
+        if final_reason != "stop":
+            problems.append(f"round 2: finish_reason {final_reason!r} is not stop (length is not a pass)")
+        if final_content != expected.get("final_content"):
+            problems.append(f"round 2: the final answer is not {expected.get('final_content')!r}")
+    else:
+        problems.append(f"{capability!r} is not a compat capability")
+
+    for marker in THINKING_TAGS:
+        if marker in final_content:
+            problems.append(f"round 2: the answer carries the thinking tag {marker!r}")
+            break
+    if final_reason in ("length", "content_filter"):
+        problems.append(f"round 2: finish_reason {final_reason!r} is not a complete answer")
+    if second_request.get("messages")[:1] != first_request.get("messages")[:1]:
+        problems.append("round 2: the dialogue no longer starts with the first round's own messages")
+    return problems
+
+
+def _call_of(body: Mapping[str, Any]) -> dict | None:
+    calls = assistant_message_of(body).get("tool_calls")
+    return dict(calls[0]) if isinstance(calls, list) and calls and isinstance(calls[0], Mapping) else None
+
+
+def write_fixture_material(directory: str | Path, scenarios: Sequence[CompatScenario]) -> list[dict]:
+    """The candidate-shape fixture entries of these scenarios (size and hash)."""
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    entries: list[dict] = []
+    for scenario in scenarios:
+        payload = canonical_json_bytes(scenario.document())
+        name = f"{scenario.fixture_id}.json"
+        path = target / name
+        if path.exists() and path.read_bytes() != payload:
+            raise CompatError(f"the fixture material {name} already exists with different bytes")
+        path.write_bytes(payload)
+        entries.append({"fixture_id": scenario.fixture_id, "capabilities": [scenario.capability],
+                        "artifact": {"relative_path": name, "size_bytes": len(payload),
+                                     "sha256": _sha256(payload)}})
+    return entries
+
+
+def fixture_set_digest(scenarios: Sequence[CompatScenario]) -> str:
+    """The fixture-set digest: one value for the whole set, order-independent."""
+    return _sha256(canonical_json_bytes(sorted(scenario.digest() for scenario in scenarios)))
