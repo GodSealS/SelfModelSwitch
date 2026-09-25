@@ -413,7 +413,7 @@ def render_v3(*, candidate_path: str | Path, evidence_dir: str | Path | None, ou
     from .contracts_v2 import DeploymentSpec
     from .evidence_contracts import candidate_digest, device_digest, parse_candidate
     from .preflight_v3 import manifest_identity
-    from .runtime_profiles import render_container_launch
+    from .runtime_profiles import LaunchRenderError, render_container_launch
 
     if mode not in ("production", "lab"):
         raise DeployError("the render mode must be production or lab")
@@ -446,10 +446,13 @@ def render_v3(*, candidate_path: str | Path, evidence_dir: str | Path | None, ou
     deployment_id = f"sms-{candidate.deployment_id}"
     models: dict[str, Any] = {}
     for model in candidate.models:
-        launch = render_container_launch(registration, model.model_id, deployment_id=candidate.deployment_id,
-                                         model_directory=str(model_directory), config_sha256=candidate.config_sha256,
-                                         mode=mode, container_runtime=container_runtime,
-                                         temporary_budget_bytes=temporary_budget_bytes)
+        try:
+            launch = render_container_launch(registration, model.model_id, deployment_id=candidate.deployment_id,
+                                             model_directory=str(model_directory), config_sha256=candidate.config_sha256,
+                                             mode=mode, container_runtime=container_runtime,
+                                             temporary_budget_bytes=temporary_budget_bytes)
+        except LaunchRenderError as exc:
+            raise DeployError(f"cannot render the {mode} launch for {model.model_id!r}: {exc}") from exc
         models[model.model_id] = {"container_name": launch.container_name, "image_digest": launch.image_digest,
                                   "runtime_id": launch.runtime_id, "profile_id": launch.profile_id,
                                   "port": launch.port, "argv": list(launch.argv), "labels": dict(launch.labels),

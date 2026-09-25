@@ -99,6 +99,50 @@ def test_lab_render_writes_dynamic_scheduler_swap_and_runner_artifacts(tmp_path)
         render_lab(source, output, deployment_id="lab-orin", container_runtime="nvidia")
 
 
+def test_lab_render_binds_the_independent_chat_features_runtime(tmp_path) -> None:
+    """CT06/A07: the 27B lab candidate carries its own runtime and profile."""
+    from model_scheduler.contracts_v2 import CHAT_FEATURES_PROFILE, GGUF_PROFILE
+
+    document = lab_v2_config(port=10003)
+    registration = document["registration"]
+    registration["runtimes"].append({
+        "runtime_id": "llama-cpp-chat-features-4bc272f",
+        "profile_id": CHAT_FEATURES_PROFILE,
+        "image_digest": "sms-llama-cpp@sha256:" + "8" * 64,
+        "adapter_sha256": "b" * 64,
+        "lock_sha256": "c" * 64,
+        "startup_args": ["--load-mode", "--parallel", "--kv-unified-per-slot", "--n-gpu-layers", "--flash-attn",
+                         "--no-warmup", "--no-webui", "--host", "--port", "--jinja", "--reasoning-format"],
+    })
+    twenty_seven_b = json.loads(json.dumps(registration["models"][0]))
+    twenty_seven_b.update({
+        "model_id": "qwen36-27b",
+        "runtime_id": "llama-cpp-chat-features-4bc272f",
+        "capabilities": ["chat", "tools", "thinking"],
+    })
+    twenty_seven_b["port"] = 10003
+    registration["models"][0]["port"] = 10002
+    twenty_seven_b["assets"] = [asset for asset in twenty_seven_b["assets"] if asset["role"] == "model"]
+    twenty_seven_b["envelope"].update({"max_image_tokens": 0, "max_image_edge_pixels": 0, "max_images": 0})
+    registration["models"].append(twenty_seven_b)
+    source = tmp_path / "features.json"
+    source.write_text(json.dumps(document), encoding="utf-8")
+
+    manifest = render_lab(source, tmp_path / "features-lab", deployment_id="lab-orin", container_runtime="nvidia")
+
+    assert manifest["mode"] == "lab" and manifest["lab_only"] is True
+    entry = manifest["models"]["qwen36-27b"]
+    assert entry["runtime_id"] == "llama-cpp-chat-features-4bc272f"
+    assert entry["profile_id"] == CHAT_FEATURES_PROFILE
+    assert entry["argv"][-3:] == ["--jinja", "--reasoning-format", "deepseek"]
+    assert manifest["runtimes"]["llama-cpp-chat-features-4bc272f"]["profile_id"] == CHAT_FEATURES_PROFILE
+
+    shared = manifest["models"]["qwen25vl-7b-q4"]
+    assert shared["profile_id"] == GGUF_PROFILE
+    assert shared["runtime_id"] == "llama-cpp-cuda-sm87-4bc272f"
+    assert "--jinja" not in shared["argv"]
+
+
 def test_lab_render_refuses_production_mode_and_unmeasured_production_branch(tmp_path) -> None:
     source = tmp_path / "scheduler-v2.json"
     source.write_text(json.dumps(lab_v2_config()), encoding="utf-8")
@@ -476,6 +520,21 @@ def test_a_production_render_refuses_unverified_material_and_writes_nothing(tmp_
     with pytest.raises(deploy_module.DeployError, match="requires --evidence"):
         deploy_module.render_v3(candidate_path=candidate_path, evidence_dir=None, output=output, mode="production",
                          model_directory=tmp_path / "ssd" / "models")
+
+
+def test_a_v3_render_refuses_chat_feature_capabilities_as_a_deployment_error(tmp_path) -> None:
+    """CT06/A07: tools and thinking never reach a rendered deployment as innovation."""
+    candidate_path, _evidence, model_directory = _p26_verified_site(tmp_path)
+    document = json.loads(candidate_path.read_text(encoding="utf-8"))
+    document["models"][0]["capabilities"] = ["chat", "vision", "tools"]
+    features_candidate = tmp_path / "features-candidate.json"
+    features_candidate.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(deploy_module.DeployError, match="require profile 'llama-cpp-chat-features-v1'"):
+        deploy_module.render_v3(candidate_path=features_candidate, evidence_dir=None, output=tmp_path / "features",
+                                mode="lab", model_directory=model_directory, temporary_budget_bytes=16_000_000_000)
+
+    assert not (tmp_path / "features").exists()  # nothing launchable was written
 
 
 def test_a_non_empty_target_is_refused(tmp_path) -> None:

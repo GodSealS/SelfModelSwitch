@@ -19,6 +19,10 @@ One registered runtime profile owns the argv vocabulary of its launches:
 * the loopback port comes from the registered model, never from a fixed
   four-model table, and the deployment/model/runtime/profile/mode labels keep
   two runtime identities from ever sharing one container identity;
+* `llama-cpp-chat-features-v1` (TC07) adds the two chat-feature switches to the
+  GGUF vocabulary and nothing else: a lab-only profile for one registered model,
+  whose tools/thinking capabilities are refused here in production and whose
+  fixed values are never swapped for `auto`/`none` to make a render succeed;
 * `restart=no` plus a foreground child make the scheduler the only lifecycle
   authority: there is no auto-swap and no restart-driven eviction;
 * production renders require the model's bound measurement material, while a
@@ -33,6 +37,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .contracts_v2 import (
+    CHAT_FEATURE_CAPABILITIES,
+    CHAT_FEATURES_PROFILE,
     GGUF_PROFILE,
     ContractError,
     DeploymentSpec,
@@ -65,13 +71,18 @@ class FlagSource:
 
     `kind` is `fixed` (the constant `value`, or a value-less switch when
     `value` is None) or `envelope` (the named `Envelope` field). A flag may
-    additionally require a capability the model must declare.
+    additionally require capabilities the model must declare:
+    `requires_capability` names one mandatory capability (TC07 keeps the vision
+    image-token rule), while `requires_any_capability` is satisfied when the
+    model declares at least one capability of the set (the chat features share
+    `--jinja`). With both conditions given both must hold: they are never an OR.
     """
 
     kind: str
     value: str | None = None
     field: str | None = None
     requires_capability: str | None = None
+    requires_any_capability: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -109,14 +120,41 @@ GGUF_LAUNCH_RULES = LaunchRules(
 # Flags a capability cannot be served without. The current GGUF profile has no
 # value source for the embedding/pooling flags, so an embeddings or rerank
 # registration is refused until its own profile, fixture and measurement exist.
+# The same mechanism keeps tools/thinking off the measured profile: it has no
+# value source for their flags either (TC07).
 CAPABILITY_FLAGS: Mapping[str, tuple[str, ...]] = {
     "chat": (),
     "vision": ("--image-max-tokens",),
     "embeddings": ("--embedding", "--pooling"),
     "rerank": ("--embedding", "--pooling"),
+    "tools": ("--jinja",),
+    "thinking": ("--jinja", "--reasoning-format"),
 }
 
-LAUNCH_RULES: Mapping[str, LaunchRules] = {GGUF_PROFILE: GGUF_LAUNCH_RULES}
+# TC07: the reasoning tokens are extracted with the one format the candidate lists;
+# there is exactly one fixed value, so an unsupported value stays blocked instead
+# of being swapped for `auto`/`none` on the command line.
+CHAT_FEATURES_LAUNCH_RULES = LaunchRules(
+    flag_sources={
+        **GGUF_LAUNCH_RULES.flag_sources,
+        "--jinja": FlagSource("fixed", requires_any_capability=frozenset({"tools", "thinking"})),
+        "--reasoning-format": FlagSource(
+            "fixed", value="deepseek", requires_any_capability=frozenset({"thinking"})
+        ),
+    },
+    required_flags=("--host", "--port", "--parallel", "--kv-unified-per-slot"),
+)
+
+# A lab-only profile: it adds nothing but the chat-feature switches, and the
+# model thinking it serves must still carry its own measured material later.
+LAUNCH_RULES: Mapping[str, LaunchRules] = {
+    GGUF_PROFILE: GGUF_LAUNCH_RULES,
+    CHAT_FEATURES_PROFILE: CHAT_FEATURES_LAUNCH_RULES,
+}
+
+#: The first release registers the chat features on this model only (TC07). Any
+#: other id declaring tools or thinking is refused rather than guess-rendered.
+CHAT_FEATURE_MODEL_IDS = frozenset({"qwen36-27b"})
 
 
 @dataclass(frozen=True)
@@ -172,6 +210,7 @@ def render_container_launch(
         profile = require_startable_profile(runtime)
     except ContractError as exc:
         raise LaunchRenderError(str(exc)) from exc
+    _require_chat_feature_registration(model, runtime, mode)
     if mode == PRODUCTION:
         try:
             require_production_openable(model, runtime)
@@ -229,6 +268,32 @@ def render_container_launch(
     )
 
 
+def _require_chat_feature_registration(model: ModelSpec, runtime: RuntimeSpec, mode: str) -> None:
+    """The chat features exist only as one lab profile on one registered model (TC07)."""
+    declared = CHAT_FEATURE_CAPABILITIES & set(model.capabilities)
+    if runtime.profile_id == CHAT_FEATURES_PROFILE:
+        if mode != LAB:
+            raise LaunchRenderError(
+                f"profile {runtime.profile_id!r} is limited to lab launches; model {model.model_id!r} "
+                f"must not be rendered for {mode!r}"
+            )
+        if not declared:
+            raise LaunchRenderError(
+                f"model {model.model_id!r} declares no tools or thinking capability, so it must not use "
+                f"profile {runtime.profile_id!r}"
+            )
+    elif declared:
+        raise LaunchRenderError(
+            f"model {model.model_id!r}: capabilities {', '.join(sorted(declared))} require profile "
+            f"{CHAT_FEATURES_PROFILE!r}, not {runtime.profile_id!r}"
+        )
+    if declared and model.model_id not in CHAT_FEATURE_MODEL_IDS:
+        raise LaunchRenderError(
+            f"model {model.model_id!r}: the first release registers tools and thinking on "
+            f"{', '.join(sorted(CHAT_FEATURE_MODEL_IDS))} only"
+        )
+
+
 def _lookup(registration: DeploymentSpec, model_id: str) -> tuple[ModelSpec, RuntimeSpec]:
     if not isinstance(registration, DeploymentSpec):
         raise LaunchRenderError("a parsed deployment registration is required to render a launch")
@@ -275,6 +340,11 @@ def _render_flags(model: ModelSpec, runtime: RuntimeSpec, rules: LaunchRules) ->
         if source.requires_capability is not None and source.requires_capability not in model.capabilities:
             raise LaunchRenderError(
                 f"flag {flag!r} requires the {source.requires_capability!r} capability of model {model.model_id!r}"
+            )
+        if source.requires_any_capability and not source.requires_any_capability & set(model.capabilities):
+            raise LaunchRenderError(
+                f"flag {flag!r} requires one of the capabilities "
+                f"{', '.join(sorted(source.requires_any_capability))} of model {model.model_id!r}"
             )
         if source.kind == "fixed":
             arguments.extend((flag,) if source.value is None else (flag, source.value))

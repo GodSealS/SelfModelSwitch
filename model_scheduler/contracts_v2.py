@@ -45,10 +45,8 @@ SESSION_LIMITS = {
 
 ASSET_ROLES = frozenset({"model", "projector", "tokenizer", "config", "auxiliary"})
 
-# Startup arguments a runtime is allowed to declare. Values are derived by the
-# deployment renderer from the envelope and assets; arbitrary entrypoints,
-# extra args, model or projector paths are not part of the contract.
-ALLOWED_STARTUP_FLAGS = frozenset(
+# Legacy GGUF vocabulary: the flags the first, measured profile may declare.
+LEGACY_GGUF_FLAGS = frozenset(
     {
         "--parallel",
         "--kv-unified-per-slot",
@@ -66,6 +64,16 @@ ALLOWED_STARTUP_FLAGS = frozenset(
         "--threads",
     }
 )
+
+# TC07: the two chat-feature switches, which only ever appear on the lab-only
+# chat-features profile. Their values are fixed by that profile's value sources:
+# an unsupported value is a blocked capability, never a substituted auto/none.
+CHAT_FEATURE_FLAGS = frozenset({"--jinja", "--reasoning-format"})
+
+# Startup arguments a runtime is allowed to declare. Values are derived by the
+# deployment renderer from the envelope and assets; arbitrary entrypoints,
+# extra args, model or projector paths are not part of the contract.
+ALLOWED_STARTUP_FLAGS = LEGACY_GGUF_FLAGS | CHAT_FEATURE_FLAGS
 
 _MAX_PARALLEL = 64
 _MAX_TIMEOUT_SECONDS = 86_400
@@ -115,7 +123,13 @@ CAPABILITY_DEPENDENCIES: Mapping[str, frozenset[str]] = {
     "thinking": frozenset({"chat"}),
 }
 
+#: The chat features a model may declare, and the single lab profile allowed to
+#: serve them (TC07). They are refinements of `chat`, never new control
+#: execution operations.
+CHAT_FEATURE_CAPABILITIES = frozenset({"tools", "thinking"})
+
 GGUF_PROFILE = "llama-cpp-gguf-v1"
+CHAT_FEATURES_PROFILE = "llama-cpp-chat-features-v1"
 HF_SHARDED_PROFILE = "hf-sharded-v1"
 
 
@@ -143,6 +157,14 @@ class RuntimeProfile:
 PROFILES: Mapping[str, RuntimeProfile] = {
     GGUF_PROFILE: RuntimeProfile(
         profile_id=GGUF_PROFILE,
+        role_cardinality={"model": (1, 1), "projector": (0, 1)},
+        # The measured profile keeps its own vocabulary: the chat-feature flags
+        # belong to the lab-only profile and are refused here (TC07).
+        allowed_flags=LEGACY_GGUF_FLAGS,
+        executable=True,
+    ),
+    CHAT_FEATURES_PROFILE: RuntimeProfile(
+        profile_id=CHAT_FEATURES_PROFILE,
         role_cardinality={"model": (1, 1), "projector": (0, 1)},
         allowed_flags=ALLOWED_STARTUP_FLAGS,
         executable=True,
@@ -592,6 +614,17 @@ def require_production_openable(model: ModelSpec, runtime: RuntimeSpec) -> None:
     and a physical resident upper bound, on a startable profile.
     """
     require_startable_profile(runtime)
+    if runtime.profile_id == CHAT_FEATURES_PROFILE:
+        raise ContractError(
+            f"model {model.model_id!r}: profile {runtime.profile_id!r} is lab-only and must never be opened "
+            "for production work"
+        )
+    declared = CHAT_FEATURE_CAPABILITIES & set(model.capabilities)
+    if declared:
+        raise ContractError(
+            f"model {model.model_id!r}: capabilities {', '.join(sorted(declared))} are not openable for "
+            f"production; they stay limited to the lab-only profile {CHAT_FEATURES_PROFILE!r}"
+        )
     if not model.measured or model.measurement_ref is None or model.physical_resident_peak_bytes is None:
         raise ContractError(
             f"model {model.model_id!r}: production requires measured=true with a measurement_ref and a "
