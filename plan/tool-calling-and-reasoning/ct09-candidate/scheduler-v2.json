@@ -1,0 +1,167 @@
+schema_version: 2
+server:
+  host: 127.0.0.1
+  port: 8090
+  workers: 1
+  max_request_body_bytes: 4194304
+  body_timeout_seconds: 10
+  shutdown_grace_seconds: 30
+blobs:
+  root: /home/jtzn/self-model-switch-evidence/blobs-jtzn
+  chunk_reserve_bytes: 1073741824
+  input_ttl_seconds: 86400
+  output_ttl_seconds: 86400
+  max_blob_bytes: 1073741824
+  min_free_disk_bytes: 2147483648
+  owner_quota_bytes: 4294967296
+  total_quota_bytes: 17179869184
+candidate_sha256: null
+control:
+  allowed_uids:
+  - 1000
+  - 1001
+  peer_group: null
+  socket_path: /home/jtzn/sms-lab-jtzn/control/control.sock
+gateway:
+  close_timeout_seconds: 5
+  connect_timeout_seconds: 5
+  inference_timeout_seconds: 900
+  max_response_body_bytes: 16777216
+  max_sse_event_bytes: 1048576
+  pool_timeout_seconds: 5
+  read_idle_timeout_seconds: 60
+  write_idle_timeout_seconds: 60
+registration:
+  runtimes:
+  - adapter_sha256: 8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
+    image_digest: sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
+    lock_sha256: 186a0a4eee82935863f612aeb0a5a351de0fad3cf30de17befdd510d71075dde
+    profile_id: llama-cpp-chat-features-v1
+    runtime_id: llama-cpp-chat-features-4bc272f
+    startup_args:
+    - --no-webui
+    - --host
+    - --port
+    - --ctx-size
+    - --parallel
+    - --kv-unified-per-slot
+    - --image-max-tokens
+    - --jinja
+    - --reasoning-format
+  - adapter_sha256: 8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
+    image_digest: sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
+    lock_sha256: 186a0a4eee82935863f612aeb0a5a351de0fad3cf30de17befdd510d71075dde
+    profile_id: llama-cpp-gguf-v1
+    runtime_id: llama-cpp-1
+    startup_args:
+    - --no-webui
+    - --host
+    - --port
+    - --ctx-size
+    - --parallel
+    - --kv-unified-per-slot
+    - --image-max-tokens
+  models:
+  - model_id: qwen25vl-7b
+    assets:
+    - role: model
+      path: qwen25vl-7b-q4/Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+      sha256: 3f4513330aa7f109922bd701d773575484ae2b4a4090d6511260a2a4f8e3d069
+      size_bytes: 4683072320
+    - role: projector
+      path: qwen25vl-7b-q4/mmproj-Qwen_Qwen2.5-VL-7B-Instruct-bf16.gguf
+      sha256: d1c7588c0bdf6e7889737c01cfd54309240d54042e102275880a514ae979aea3
+      size_bytes: 1354162912
+    capabilities:
+    - chat
+    - vision
+    envelope:
+      ctx_size: 32768
+      max_input_tokens: 8192
+      max_output_tokens: 4096
+      max_parallel: 2
+      max_image_tokens: 1280
+      max_image_edge_pixels: 1024
+      max_images: 1
+    measured: false
+    measurement_ref: null
+    physical_resident_peak_bytes: null
+    port: 10002
+    reserved_bytes: 6106148045
+    runtime_id: llama-cpp-1
+    timeout_seconds: 900
+  - model_id: qwen36-27b
+    assets:
+    - role: model
+      path: qwen36-27b-q6/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q6_K.gguf
+      sha256: f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457
+      size_bytes: 23582384672
+    - role: projector
+      path: qwen36-27b-q6/mmproj-BF16.gguf
+      sha256: 05353347512982ee62317b9d8c89372bc815f4b4043580e7ef3ad411ec1a1cd3
+      size_bytes: 931146304
+    capabilities:
+    - chat
+    - vision
+    - tools
+    - thinking
+    envelope:
+      ctx_size: 8192
+      max_input_tokens: 4096
+      max_output_tokens: 1024
+      max_parallel: 1
+      max_image_tokens: 1280
+      max_image_edge_pixels: 1024
+      max_images: 1
+    measured: false
+    measurement_ref: null
+    physical_resident_peak_bytes: null
+    port: 10003
+    reserved_bytes: 29000000000
+    runtime_id: llama-cpp-chat-features-4bc272f
+    timeout_seconds: 900
+resources:
+  model_budget_bytes: 50000000000
+  provider: psutil
+  sample_interval_seconds: 1
+  sample_max_age_seconds: 2
+  system_reserve_bytes: 4294967296
+scheduler:
+  heat:
+    half_life_seconds: 1800
+    request_weight: 1.0
+    token_weight: 0.0001
+  max_evictions_per_request: 8
+  memory_reclaim_timeout_seconds: 10
+  min_free_memory_bytes: 2147483648
+  pinned_models:
+  - qwen25vl-7b
+  - qwen36-27b
+  poll_interval_seconds: 2
+  preload_models:
+  - qwen25vl-7b
+  - qwen36-27b
+  priority_aging_seconds: 30
+  queue_capacity: 128
+  request_queue_timeout_seconds: 1800
+  resource_safety_margin: 0.15
+  sessions:
+    cleanup_limit_seconds: 60
+    hard_timeout_seconds: 1800
+    heartbeat_seconds: 10
+    prepare_limit_seconds: 600
+    queue_capacity: 128
+    queue_timeout_seconds: 600
+    stop_grace_seconds: 30
+    ttl_seconds: 30
+  switch_drain_timeout_seconds: 30
+  switch_retry_seconds: 30
+  thrash:
+    cooldown_seconds: 15
+    max_switches_in_window: 3
+    switch_window_seconds: 10
+storage:
+  expected_uuid: 16d53274-d9f5-4282-9b44-7fdd43cba9ca
+  filesystem: ext4
+  mount_path: /media/jtzn/sandisk-ext4
+  model_directory: /media/jtzn/sandisk-ext4/models

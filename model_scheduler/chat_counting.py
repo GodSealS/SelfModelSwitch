@@ -22,9 +22,10 @@ is refused, never guessed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .contracts import Lease
@@ -182,6 +183,27 @@ POLICY_REGISTRY: Mapping[tuple[str, str, str], RuntimeChatPolicy] = {
                     model_sha256="f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457",
                     template_sha256="e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"),
 }
+
+
+def policy_source_digest(*, registry: Mapping[tuple[str, str, str], RuntimeChatPolicy] = POLICY_REGISTRY) -> str:
+    """One digest for the policy source: the version plus every registered policy.
+
+    CT09 freezes this as `policy_source_sha256`, so a later run can prove it
+    counted with the same policy code and values instead of a look-alike.
+    """
+    entries = []
+    for policy in sorted(registry.values(), key=lambda item: item.policy_id):
+        document = asdict(policy)
+        for key, value in document.items():
+            if isinstance(value, frozenset):
+                document[key] = sorted(value)
+            elif isinstance(value, bytes):
+                document[key] = value.decode("utf-8")
+        entries.append(document)
+    payload = {"source_revision": _LAB_SOURCE_REVISION, "policies": entries}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def resolve_policy(*, profile_id: str, image_digest: str, model_sha256: str,

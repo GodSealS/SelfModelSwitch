@@ -637,3 +637,59 @@ def test_a08_the_fixture_material_covers_every_declared_chat_feature(tmp_path: P
         cc.compat_scenarios_for(MODEL_ID, ("chat", "tools", "thinking"), ENVELOPE, deadline_seconds=DEADLINE))
     assert digest != cc.fixture_set_digest(
         cc.compat_scenarios_for(MODEL_ID, ("chat", "tools"), ENVELOPE, deadline_seconds=DEADLINE))
+
+
+# ---------------------------------------------------------------------------
+# CT09: the tools+thinking combination fixture and the frozen candidate set.
+# ---------------------------------------------------------------------------
+
+
+def _combination_scenario(stream: bool = False) -> cc.CompatScenario:
+    return cc.tools_thinking_scenario(MODEL_ID, envelope=ENVELOPE, stream=stream, deadline_seconds=DEADLINE)
+
+
+def test_a08_the_combination_fixture_reuses_the_tool_dialogue_and_demands_reasoning() -> None:
+    """Acceptance §5: the combination is the tools fixture *plus* a real reasoning round."""
+    combination = _combination_scenario()
+    plain = _tools_scenario()
+
+    assert combination.capability == "tools" and combination.stream is False
+    assert combination.expected["requires_reasoning"] is True
+    assert combination.expected["tool_name"] == plain.expected["tool_name"]
+    assert combination.first_request_json == plain.first_request_json  # the same fixed dialogue
+    assert combination.tool_result_json == plain.tool_result_json
+    assert "tools-thinking" in combination.fixture_id
+    assert combination.digest() != plain.digest()  # its own identity, not a relabelled tools fixture
+    assert _combination_scenario(stream=True).stream is True
+
+
+def test_a08_the_combination_judges_reasoning_and_the_verbatim_history(tmp_path: Path) -> None:
+    target = tmp_path / "combination"
+    cc.CompatDriver(FakeTransport(TOOLS_ROUND_ONE, TOOLS_ROUND_TWO)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:tools", variant="json-hot", scenario=_combination_scenario()),
+        target)
+    assert cc.evaluate_case(target)["problems"] == []
+
+    silent = TOOLS_ROUND_ONE.replace('"reasoning_content": "需要一个天气工具"'.encode("utf-8"),
+                                     b'"reasoning_content": ""')
+    target = tmp_path / "silent"
+    cc.CompatDriver(FakeTransport(silent, TOOLS_ROUND_TWO)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:tools", variant="json-hot", scenario=_combination_scenario()),
+        target)
+    assert any("reasoning" in problem for problem in cc.evaluate_case(target)["problems"])
+
+    dropped = tmp_path / "dropped"
+    cc.CompatDriver(FakeTransport(TOOLS_ROUND_ONE, TOOLS_ROUND_TWO)).run(
+        cc.CaseSpec(case_id=f"B:{MODEL_ID}:cap:tools", variant="json-hot", scenario=_combination_scenario()),
+        dropped)
+    request = json.loads((dropped / "round-2" / cc.REQUEST_FILE).read_text(encoding="utf-8"))
+    del request["messages"][1]["reasoning_content"]  # the history silently loses the thinking
+    (dropped / "round-2" / cc.REQUEST_FILE).write_bytes(cc.canonical_json_bytes(request))
+    facts = json.loads((dropped / cc.COMPAT_FILE).read_text(encoding="utf-8"))
+    facts["material"] = [{"relative_path": path, "sha256": digest}
+                         for path, digest in cc.compat_material_refs(dropped) if path != cc.COMPAT_FILE]
+    assert any("assistant" in problem for problem in cc.evaluate_case(dropped, facts)["problems"])
+
+    # The plain tools fixture still passes without any reasoning: the demand is the combination's own.
+    plain = _completed(tmp_path, "plain-tools")
+    assert cc.evaluate_case(plain)["problems"] == []

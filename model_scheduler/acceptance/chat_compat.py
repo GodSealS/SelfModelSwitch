@@ -285,6 +285,23 @@ def thinking_scenario(model_id: str, *, envelope, stream: bool, deadline_seconds
     )
 
 
+def tools_thinking_scenario(model_id: str, *, envelope, stream: bool,
+                            deadline_seconds: float) -> CompatScenario:
+    """The combination fixture (acceptance §5): the tools dialogue that must also reason.
+
+    It is not a second tools fixture: the identity (`fixture_id`) and the fixed
+    expectation demand a non-empty first-round reasoning as well, so a deployment
+    that serves one capability but not the other cannot reuse this material.
+    """
+    scenario = tools_scenario(model_id, envelope=envelope, stream=stream,
+                              deadline_seconds=deadline_seconds)
+    return relay_scenario(
+        scenario,
+        fixture_id=f"{model_id}-tools-thinking{'-sse' if stream else ''}",
+        expected={**scenario.expected, "requires_reasoning": True},
+    )
+
+
 def compat_scenarios_for(model_id: str, capabilities: Sequence[str], envelope, *,
                          deadline_seconds: float) -> tuple[CompatScenario, ...]:
     """One scenario per declared chat feature; old capabilities keep the old driver."""
@@ -840,6 +857,16 @@ def _round_problems(facts: Mapping[str, Any], first_request: Mapping[str, Any], 
             problems.append(f"round 2: finish_reason {final_reason!r} is not stop (length is not a pass)")
         if final_content != expected.get("final_content"):
             problems.append(f"round 2: the final answer is not the fixed marker {expected.get('final_content')!r}")
+        if expected.get("requires_reasoning"):
+            # The combination case (CT09/acceptance §5): the tool round must reason,
+            # and the history must carry that assistant turn back verbatim.
+            first_assistant = assistant_message_of(first_body)
+            if not (first_assistant.get("reasoning_content") or "").strip():
+                problems.append("round 1: the combination case produced no reasoning")
+            carried = second_request.get("messages")
+            carried = carried[1] if isinstance(carried, list) and len(carried) > 1 else None
+            if carried != first_assistant:
+                problems.append("round 2: the carried assistant turn is not round 1's own message")
     elif capability == "thinking":
         first_content = (assistant_message_of(first_body).get("content") or "").strip()
         if not (assistant_message_of(first_body).get("reasoning_content") or "").strip():
