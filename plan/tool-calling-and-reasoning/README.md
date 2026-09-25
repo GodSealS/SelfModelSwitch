@@ -470,6 +470,16 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 软件修改必须回开发机、重测、提交/push/sync后重跑受影响场景；最终共享SHA材料才能汇总。
 - 文档：validation写真实材料索引，仍仅lab；不更改06的生产S/B/O全集门槛。
 
+CT10子项（依赖顺序；父项验收全集不变，未全部通过不得进入CT11）：
+
+| 子项 | 交付 | 依赖 | 状态 |
+|---|---|---|---|
+| CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | pending |
+| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | pending |
+| CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | pending |
+| CT10d | candidate suite 运行、A01—A11 硬件项取证、validation 材料索引与状态回填 | CT10c | pending |
+
+
 ### CT11 客户端与回滚演练
 
 - CT10全部必需项通过后，按既有网关控制开放lab测试窗口；验证SDK及每个宣称支持的客户端实际版本。
