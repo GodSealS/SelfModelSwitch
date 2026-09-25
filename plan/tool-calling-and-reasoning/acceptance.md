@@ -197,6 +197,14 @@ CT09冻结的候选输入在`plan/tool-calling-and-reasoning/ct09-candidate/`：
 `freeze.json`；site的实际路径、摘要、base URL、超时、request_limit、预算上限与回滚输入以`freeze.json`为准
 （`check_freeze`为空），登记、模板或镜像变更后必须重新冻结，不能沿用旧摘要。
 
+legacy五变体的操作语义（CT10a约定；硬件断言见§4/A10，全部经service_base_url，不用上游直连代替）：
+`chat-json`/`chat-sse`为固定纯文本提示（`Reply with exactly SMS_CHAT_OK.`）的非流式与SSE各一次，判定HTTP200、
+finish_reason=stop、content非空，并把content与usage入材料，不用长度推断质量；`vision-json`用确定性PNG
+（`fixtures.render_test_png`，边长取登记`max_image_edge_pixels`）加同一提示，判定同上；`cold-count`先用管理API卸载
+并证明STOPPED（`state=unloaded`且`in_flight=0`），再经兼容API发一次请求，记录卸载前后generation与实例身份，证明计数
+发生在冷加载之后；`budget-boundary`同时发出登记`max_parallel`个单choice请求、每个`max_tokens`=登记
+`max_output_tokens`，判定各自HTTP200且completion_tokens不超过该值，并记录当时封套与并发，不修改注册或启动参数。
+
 每个artifact字段为path/bytes/sha256；相对路径必须在证据根内、regular file、无symlink；缺失/hash错配退出2。
 结构完整但HTTP/语义/身份/静默不满足退出3；全部满足退出0。evaluator从原请求/响应重新计算工具关联与结果，
 从采样重算内存/设备归属，不信任attempt.status；tamper同时更新hash也不能隐藏语义失败。

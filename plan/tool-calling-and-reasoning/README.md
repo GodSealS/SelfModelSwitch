@@ -474,7 +474,7 @@ CT10子项（依赖顺序；父项验收全集不变，未全部通过不得进�
 
 | 子项 | 交付 | 依赖 | 状态 |
 |---|---|---|---|
-| CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | pending |
+| CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | in_progress（`lab_suite`/`lab_report`/`lab_http` 已交付并通过定向测试；runner/CLI 与 legacy 变体待完成） |
 | CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | pending |
 | CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | pending |
 | CT10d | candidate suite 运行、A01—A11 硬件项取证、validation 材料索引与状态回填 | CT10c | pending |
