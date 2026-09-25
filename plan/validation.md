@@ -2111,5 +2111,8 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 检查（exit 0）：全量 `pytest tests -m 'not thor' -q` → **1194 passed、1 skipped、1 deselected**（41.64 s）；
   `ruff check .`、`run.py --check-config`、`git diff --check`。失败 12 项与 CT06 基线逐项相同（冻结报告日期过期的既有失败）。
 - 提交：`681d59892a59df4c9c5e14c6aba375a36cc8f3b0`（source + tests），文档另行回填。
-- 部署影响：未改动目标部署。
+- 目标同步与同 SHA 复跑（Python 3.12.14）：`/home/jtzn/SelfModelSwitch` 走守卫流程 →
+  `verified_target_sha=64caa99c6d0d9a5b5215620d56568ad3605585cc`、前后树为空；受影响四文件 **76 passed**（0.57 s），
+  与开发机一致；GitHub 与目标镜像 ref 相同。
+- 部署影响：未改动目标部署，未重启调度器。
 - 未完成项：真机两轮与真实网关闭环（CT10/CT11）；SSE 聚合器、evaluator 与 `run --suite` CLI 属 CT08。

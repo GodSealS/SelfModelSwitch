@@ -373,6 +373,9 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
   fixture 摘要对任何字段与期望变化敏感；第二轮随上游 id 变化（不静态填）；thinking 保留 reasoning 与固定追问；
   两轮原始字节与 usage/finish_reason 落盘；删除第二轮或改 id 后重算 hash 仍被 `link_problems`/`verify_material` 发现；
   internal execution operation 闭集与 `schemas/control-v1.json` 未变。
+- 目标同 SHA 复跑（Python 3.12.14）：checkout `/home/jtzn/SelfModelSwitch` 走守卫流程 →
+  `verified_target_sha=64caa99c6d0d9a5b5215620d56568ad3605585cc`、前后树为空；CT07/CT06 受影响四文件 **76 passed**，
+  与开发机一致；GitHub 与目标镜像 ref 相同，未重启调度器。
 - 未完成项（不宣称已验证）：真实网关/真机两轮与 SSE 聚合（CT08 的 aggregator/evaluator、CT10 候选部署）；
   `run --suite candidate` 的 CLI 与 `lab-chat-report-v1` 属 CT08；27B 新 profile 策略与 `effort_values` 仍待 CT10。
 
