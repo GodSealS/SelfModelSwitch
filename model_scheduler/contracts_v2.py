@@ -132,6 +132,12 @@ GGUF_PROFILE = "llama-cpp-gguf-v1"
 CHAT_FEATURES_PROFILE = "llama-cpp-chat-features-v1"
 HF_SHARDED_PROFILE = "hf-sharded-v1"
 
+#: The llama.cpp engine profiles. Both run the one measured engine, so they share the
+#: measured protocol fixture and the adapter that drives it; only their launch
+#: vocabulary differs (the chat-features profile is lab-only, TC07). A profile outside
+#: this set is a different engine and is refused by the adapter, never guessed.
+LLAMA_CPP_PROFILES = frozenset({GGUF_PROFILE, CHAT_FEATURES_PROFILE})
+
 
 @dataclass(frozen=True)
 class RuntimeProfile:

@@ -812,6 +812,40 @@ async def test_unknown_and_registration_only_profiles_are_refused() -> None:
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_the_lab_chat_features_profile_is_the_same_engine_and_protocol() -> None:
+    """CT10b: the 27B lab candidate's own profile needs the adapter, not a second engine."""
+    import dataclasses
+
+    from model_scheduler.adapters.llama_cpp import LlamaCppAdapter
+    from model_scheduler.contracts_v2 import CHAT_FEATURES_PROFILE
+
+    client, _transport = _client({})
+    deployment = _deployment()
+    deployment["runtimes"].append({
+        "runtime_id": "llama-cpp-chat-features-4bc272f",
+        "profile_id": CHAT_FEATURES_PROFILE,
+        "image_digest": "ghcr.io/example/llama-cuda@sha256:" + "a" * 64,
+        "adapter_sha256": "b" * 64,
+        "lock_sha256": "c" * 64,
+        "startup_args": ["--parallel", "--kv-unified-per-slot", "--image-max-tokens", "--jinja",
+                         "--reasoning-format", "--no-warmup"],
+    })
+    parsed = parse_deployment(deployment)
+    runtime = {item.runtime_id: item for item in parsed.runtimes}["llama-cpp-chat-features-4bc272f"]
+    model = dataclasses.replace({item.model_id: item for item in parsed.models}["qwen25vl-7b-q4"],
+                                runtime_id="llama-cpp-chat-features-4bc272f")
+
+    adapter = LlamaCppAdapter(runtime=runtime, model=model, inference_base_url="http://127.0.0.1:18083",
+                              client=client, identity=_identity(), fixture_path=FIXTURE)
+
+    assert adapter.profile_id == CHAT_FEATURES_PROFILE
+    # The measured protocol travels with the engine, not with the profile's launch flags.
+    assert adapter.stop_reload_cost["measured_cold_load_seconds"] == 18.07
+    assert adapter.claims_device_quiescence() is False
+    await client.aclose()
+
+
 def test_router_refuses_a_llama_adapter_on_a_runtime_without_this_profile() -> None:
     class Claimant:
         runtime_id = GGUF_RUNTIME

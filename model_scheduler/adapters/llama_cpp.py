@@ -37,6 +37,7 @@ import httpx
 
 from ..contracts_v2 import (
     GGUF_PROFILE,
+    LLAMA_CPP_PROFILES,
     ContractError,
     ModelSpec,
     RuntimeSpec,
@@ -86,14 +87,15 @@ def _finite_numbers(values: Any, where: str) -> list[float]:
     return out
 
 
-def load_protocol_fixture(path: Path | None = None) -> dict:
+def load_protocol_fixture(path: Path | None = None, *, profiles: frozenset[str] = LLAMA_CPP_PROFILES) -> dict:
     fixture_path = Path(path) if path is not None else FIXTURE_PATH
     try:
         document = json.loads(fixture_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AdapterError(f"cannot read llama.cpp protocol fixture: {exc}", "backend_failed") from exc
-    if document.get("schema_version") != 1 or document.get("profile_id") != GGUF_PROFILE:
-        raise AdapterError("llama.cpp protocol fixture does not match llama-cpp-gguf-v1", "contract_violation")
+    if document.get("schema_version") != 1 or document.get("profile_id") not in profiles:
+        raise AdapterError("llama.cpp protocol fixture does not match a llama.cpp engine profile",
+                           "contract_violation")
     if document.get("http", {}).get("follow_redirects") is not False:
         raise AdapterError("fixture must pin follow_redirects=false", "contract_violation")
     slots = document.get("slot_protocol") or {}
@@ -122,9 +124,9 @@ class LlamaCppAdapter:
             profile = require_startable_profile(runtime)
         except ContractError as exc:
             raise AdapterError(str(exc), "contract_violation") from exc
-        if profile.profile_id != GGUF_PROFILE or runtime.profile_id != GGUF_PROFILE:
+        if profile.profile_id != runtime.profile_id or runtime.profile_id not in LLAMA_CPP_PROFILES:
             raise AdapterError(
-                f"profile {runtime.profile_id!r} is not the llama.cpp GGUF profile",
+                f"profile {runtime.profile_id!r} is not a llama.cpp engine profile",
                 "contract_violation",
             )
         if model.runtime_id != runtime.runtime_id:
