@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "code_sha": "8a6230ea74ce8127eb71476b9102fe9ef166c582",
+  "lab_input": {
+    "path": "/home/jtzn/self-model-switch-evidence/ct09-candidate-20260925T151642Z/site-input.json",
+    "sha256": "09bc1428e4b78eab546a5db1d2181ae6e0765338c58fa8fd5745f2154c5cd99d"
+  },
+  "policy_source_sha256": "1324dcde991b89f58951e5638f15f340d50d47d09b9f46586613a8c3a9c053dd",
+  "fixture_set_sha256": "cb8544ca0484bfa76df42c35c14223e41f97c6898cb854f1a834fa0ecbc79f0a",
+  "template_hashes": {
+    "qwen25vl-7b": "a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb",
+    "qwen36-27b": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+  },
+  "service_base_url": "http://127.0.0.1:8090",
+  "timeouts": {
+    "connect_seconds": 5,
+    "read_idle_seconds": 60,
+    "total_seconds": 900
+  },
+  "request_limit": 64,
+  "budget_caps": {
+    "qwen25vl-7b": 4096,
+    "qwen36-27b": 1024
+  },
+  "models": {
+    "qwen25vl-7b": {
+      "capabilities": [
+        "chat",
+        "vision"
+      ],
+      "image_digest": "sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8",
+      "model_sha256": "3f4513330aa7f109922bd701d773575484ae2b4a4090d6511260a2a4f8e3d069",
+      "template_sha256": "a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb",
+      "max_parallel": 2,
+      "effort_values": []
+    },
+    "qwen36-27b": {
+      "capabilities": [
+        "chat",
+        "vision",
+        "tools",
+        "thinking"
+      ],
+      "image_digest": "sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8",
+      "model_sha256": "f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457",
+      "template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+      "max_parallel": 1,
+      "effort_values": []
+    }
+  },
+  "rollback": {
+    "input_path": "/home/jtzn/self-model-switch-evidence/qwen36-27b-lab/deploy2/manifest.json",
+    "input_sha256": "1c04f3c7051a018ed626f80f8c7e2164ce0f1ef3c8e2e76aa8ccb66d7dd51af9",
+    "code_sha": null
+  },
+  "exceptions": [
+    "the 27B chat-features policy entry (profile llama-cpp-chat-features-v1) is not registered: the runtime refuses that combination until CT10's D06 measurement registers the probed values, which supersedes policy_source_sha256 and code_sha",
+    "qwen36-27b effort_values is the fail-closed empty set, not a measurement: CT01 D06 did not run, so no allowed value is claimed",
+    "CT01 leaves 27B thinking, 27B vision and the tool+thinking combination unmeasured (D06/D07 needs_candidate); CT10 closes them on the device",
+    "rollback.code_sha is null: CT11 supplies the reviewed revert commit that keeps the budget fix and this tooling",
+    "the frozen launch_argv is the render of the committed candidate configuration; the device argv, image, template and envelope must equal it at CT10 (A07)",
+    "the 7B legacy and budget evidence is reused from CT02/CT05 for the unchanged 7B path: this freeze adds no new 7B measurement and claims none",
+    "the candidate suite's lab case ids and the lab-chat-report-v1 CLI are CT10's pending item; this freeze pins the fixtures and inputs they consume"
+  ],
+  "frozen_at_utc": "2026-09-25T15:17:12+00:00"
+}
