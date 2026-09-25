@@ -14,6 +14,11 @@ runtime 固定 image digest、adapter 实现 hash、依赖 lock hash、受限启
 每个 runtime 必填 `profile_id`，取自代码注册的有限 profile 集合，绑定允许参数、资产角色基数与 ready/terminal 协议；
 未知 profile 拒绝，runtime_id 只作部署内身份。当前可执行 capability 闭集为 chat/vision/embeddings/rerank，
 audio、Torch、ORT 属后续扩展，不得因为接受 runtime_id 就宣称任意 runtime 可用。
+CT06 起增加 `llama-cpp-chat-features-v1`：与 GGUF profile 同资产角色基数，额外有 `--jinja`（any={tools,thinking}）
+与 `--reasoning-format`（any={thinking}，固定值 `deepseek`）两个值源；该 profile **只允许 lab 渲染**，
+`--jinja`/`--reasoning-format` 不被旧 GGUF profile 承认，值不受支持时记为 blocked，不在命令行换成 auto/none。
+tools/thinking 只在首版登记模型 `qwen36-27b` 上渲染，且必须绑定独立 runtime_id；生产渲染遇到新能力或新 profile
+（`require_production_openable` 与 renderer）一律拒绝，不得凭 describe/candidate 材料放行。
 逐文件登记 role/path/size/hash，路径是唯一键（同一 role 可分片多文件）；目录展开为 regular files。
 首个 GGUF profile 恰一 model、vision 恰一 projector；HF 分片 profile 只允许登记，补齐自己的 fixture 与实测前不得启动。
 asset.path 必须相对已登记模型根目录，禁绝 symlink、绝对路径和 `..`；容器只读挂载模型，不挂 Docker socket 或完整宿主根目录。

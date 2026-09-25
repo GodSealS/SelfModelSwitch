@@ -2074,3 +2074,24 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 部署影响：目标部署现运行 CT05 代码（`3f60bc2`）；llama-swap 与 LAN 网关未改动。
 - 未完成项：`effort_values` 空集为 fail-closed 默认（CT06 补测后登记）；未注册策略的模型按请求 503；
   A05/A09 的真机列（工具/历史/图片/思考组合计数与 usage 证据）归 CT10。
+
+### CT06 27B独立runtime与能力/flag门禁（2026-09-25，交付分支 `feature/ct06-chat-features-runtime`）
+
+- Python/环境：开发机临时 venv `3.12.11`（符合发布版本要求；`.venv` 现为 3.13.5，未用于本轮检查）；无目标机器操作。
+- 软件交付：`contracts_v2.py` 拆出 `LEGACY_GGUF_FLAGS`/`CHAT_FEATURE_FLAGS`，旧 GGUF profile 冻结原词表，
+  新增仅 lab 的可执行 profile `llama-cpp-chat-features-v1`，`require_production_openable` 拒绝该 profile 与
+  任何 tools/thinking；`runtime_profiles.py` 新增新 profile 的两个固定值源（`--jinja` any={tools,thinking}、
+  `--reasoning-format=deepseek` any={thinking}）、`FlagSource.requires_any_capability`（与 `requires_capability`
+  为 AND，非 OR）、`CAPABILITY_FLAGS` 的 tools/thinking 项、渲染前的 profile⇔能力⇔mode 守卫，以及首版登记模型
+  常量 `CHAT_FEATURE_MODEL_IDS={qwen36-27b}`；`deploy.py` 的 v3 渲染把 per-model 渲染错误包成 `DeployError`。
+  `model_runner.py` 未改：argv 校验由 profile 派生，新 flag 自动纳入范围。
+- RED→GREEN：新增 `tests/test_runtime_profiles.py`（14 项 A07）在实现前失败；`tests/test_deploy_render.py` 增
+  “独立 lab runtime 的完整渲染绑定”与“v3 渲染遇新能力报 DeployError 且不写产物”两项。
+- 检查（exit 均为 0）：全量 `pytest tests -m 'not thor' -q` → **1179 passed、1 skipped、1 deselected**（45.90 s）；
+  `ruff check .`、`run.py --check-config`、`git diff --check`。
+  失败 12 项为既有且可在 HEAD 原样临时工作树逐项复现：fixture 冻结报告日期（2026-09-18/09-01）已超 7 天有效期，
+  失败集合与本改动前后完全相同（另有 1 项同族用例按时间边界偶发）。
+- 提交：`2b3257df…`（含 source 与测试的原子增量），文档另行回填。
+- 部署影响：**未改动目标部署**，本轮不渲染/不安装；输出为本地软件候选。
+- 未完成项：A07 硬件列（27B 独立 runtime 实际 argv 与 render 一致、7B 身份/镜像/模板/封套/argv 不变）属 CT10；
+  `chat_counting` 的新 profile 策略条目与 `effort_values` 仍 fail-closed，需 CT10 的 D06 实测后登记。

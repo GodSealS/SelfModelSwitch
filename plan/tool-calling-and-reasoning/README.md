@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT05 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过），CT06—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT06 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过；CT06 为本地软件候选，A07 硬件列留给 CT10），CT07—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -50,7 +50,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT03 | 模型能力与execution operation分离 | CT02 | done | `a90494e0…`；本地 1087 passed、目标同 SHA 149 passed；schema 字节一致；证据 `ct03-contract-20260924T121318Z/` |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | done | `4b7303b1…`；本地 1156 passed、目标同 SHA 297 passed；A03/A04/A06-local 全矩阵 + 本地零调用断言；证据 `ct04-contract-20260924T144322Z/` |
 | CT05 | 持租约完整计数与错误清理 | CT04 | done | `3f60bc2…`；本地 1175 passed、目标同 SHA 普通 chat/vision 回归 3/3 200；证据 `ct05-chat-regression-20260924T160538Z/` |
-| CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | pending | — |
+| CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257dfe3bd4d5bac8721937ef4b10dcba8b1f8`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；pending：A07 硬件列与 effort 登记归 CT10 |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | pending | — |
 | CT08 | SSE、evaluator及证据反篡改 | CT07 | pending | — |
 | CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | pending | — |
@@ -314,6 +314,33 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：A07四组合与负例；新旧7B完整render产物比较（排除仅由全局产物摘要变化引起的元数据，须逐字段列白名单）。
   不允许排除镜像、模板、argv、封套、资源预算差异；完整回滚配置可渲染。
 - 文档：04记录独立runtime与lab限制；输出为本地候选产物，不操作部署。
+
+### CT06 27B独立runtime与能力/flag门禁（2026-09-25 已执行，本地软件候选）
+
+- 交付：`contracts_v2.py` 把 flag 词表拆为 `LEGACY_GGUF_FLAGS` + `CHAT_FEATURE_FLAGS`（`--jinja`、`--reasoning-format`），
+  旧 GGUF profile 的 `allowed_flags` 冻结为前者（新 flag 在旧 profile 上解析即拒），新增可执行、仅 lab 的
+  `llama-cpp-chat-features-v1`（资产角色基数与 GGUF 一致）；`require_production_openable` 拒绝该 profile 与
+  任何 tools/thinking 注册。`runtime_profiles.py` 新增该 profile 的值源：`--jinja`（any={tools,thinking}，
+  无值开关）与 `--reasoning-format`（固定 `deepseek`，any={thinking}）；`FlagSource` 增 `requires_any_capability`
+  （与 `requires_capability` 同时给出时两个条件都必须成立），`CAPABILITY_FLAGS` 补 `tools: (--jinja,)`、
+  `thinking: (--jinja, --reasoning-format)`；渲染前 `_require_chat_feature_registration` 强制
+  “新 profile ⇔ tools/thinking 且 mode=lab”，首版按常量 `CHAT_FEATURE_MODEL_IDS={qwen36-27b}` 限制登记模型。
+  `deploy.py` 的 v3 渲染把 per-model 渲染错误包成 `DeployError`（含 “cannot render the <mode> launch”）。
+  `model_runner.py` 未改：运行器 argv 校验由 profile 派生（`_assert_server_arguments`），新 flag 自动纳入。
+- 验证（RED→GREEN）：新增 `tests/test_runtime_profiles.py`（14 项 A07）先失败（`CHAT_FEATURES_PROFILE` 等不存在），
+  实现后通过；`tests/test_deploy_render.py` 增两项（独立 lab runtime 的完整 render 绑定；v3 渲染遇新能力
+  报 `DeployError` 且不写出可启动目录）。全量 `pytest tests -m 'not thor' -q`（Python 3.12.11 临时 venv）
+  → **1179 passed、1 skipped、1 deselected**（45.9 s）；`ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+- A07 覆盖：四组合（无/chat+tools/chat+thinking/两者）→ 只渲染必需 flag 且各一次并集不重复；缺 chat 依赖、缺必需 flag、
+  tools 上出现 `--reasoning-format`、无能力模型用新 profile、旧 profile 登记 tools/新 flag、production 渲染、
+  非 `qwen36-27b` 登记新能力全部拒绝；THINKING 值固定 `deepseek` 且不出现 auto/none 替换；
+  7B 旧 profile 两次渲染的 argv 差异仅为白名单内的 `config-sha256` label（并以改 envelope 的反例证明比较非空转）。
+- 既有失败（与本任务无关，基线可复）：`test_verify.py`/`test_preflight_v3.py`/`test_deploy_render.py` 共 12 项，
+  原因是 fixture 冻结的报告日期 `2026-09-18`/`2026-09-01` 已超过 7 天有效期；以 HEAD 原样的临时工作树复跑，
+  失败集合与本改动后**逐项相同**（另有 1 项同族用例因时间边界偶发）。
+- 未完成项（不宣称已验证）：A07 硬件列（27B 独立 runtime 的实际 argv 与 render 相同、7B 运行身份/镜像/模板/封套/argv 不变）
+  需 CT10 候选部署后取证；`chat_counting` 的 27B 新 profile 策略条目与 `effort_values` 仍为 fail-closed 空集，
+  待 CT10 的 D06 实测登记前不得计入；因此本页 CT06 记为 `software_verified`，不是 `target_verified`。
 
 ### CT07 兼容多轮fixture/driver
 

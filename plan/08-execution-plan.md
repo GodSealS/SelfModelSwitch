@@ -643,6 +643,8 @@ M00 通过轮 run1—run3 均 `quiescent=true`，模型资产与 runtime 自校�
 `Envelope.max_images`、`ModelSpec.measurement_ref`/`physical_resident_peak_bytes`、`reserved_bytes_from_peak`、
 `physical_reserved_bytes_from_peak`、`effective_reserved_bytes`（v2 原样、v1 兼容处只乘一次原 margin）、
 `require_startable_profile`、`require_production_openable`、按 path 唯一的 asset 表。
+CT06 同步（2026-09-25）：`PROFILES` 增加 `llama-cpp-chat-features-v1`（可执行、**仅 lab**，给 27B 的 tools/thinking
+绑定独立 runtime 与 `--jinja`/`--reasoning-format` 值源）；生产渲染与 `require_production_openable` 拒绝新能力。
 文档同步：04-deployment §1、02-scheduler §5。未解决：`hf-sharded-v1` 无自身 fixture/实测因而不可启动
 （argv 渲染属 P06，测量与 fixture 属 P15/P21）；本任务不产生硬件证据也无此项。目标 checkout 已同步到同一提交。
 
