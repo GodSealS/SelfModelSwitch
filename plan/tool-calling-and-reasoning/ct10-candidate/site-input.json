@@ -4,7 +4,7 @@
   "checkout": "/home/jtzn/SelfModelSwitch",
   "client_evidence": [],
   "deployment_id": "sms-orin-lab2",
-  "expected_sha": "5b4e5dc229fa0a73a85e11022bc60080299c74ee",
+  "expected_sha": "3b2b80e225f4db60eab69e022c9fe35d257342ca",
   "fixture_set_sha256": "cb8544ca0484bfa76df42c35c14223e41f97c6898cb854f1a834fa0ecbc79f0a",
   "gateway_base_url": null,
   "hardware_file": "hardware-raw.txt",
