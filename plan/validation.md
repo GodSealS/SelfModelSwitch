@@ -2171,3 +2171,29 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   （CT02）与 chat/vision（CT05）证据因 7B 身份与 argv 未变而逐项复用，本轮未新增 7B 真机测量。
 - 记录提交边界：`code_sha` 之后只增加 `plan/tool-calling-and-reasoning/` 与本测试文件；CT10 部署前以
   `git diff --name-only 8a6230ea74ce8127eb71476b9102fe9ef166c582 <head>` 复核，运行代码与候选产物停在该 SHA。
+
+### CT10a 候选suite运行器与报告（2026-09-25，交付分支 `feature/ct09-freeze-candidate`）
+
+- 源码SHA：`3b00e2264373c8a8b9226febe30e845c78c9765a`（runner+CLI；前两片 `ac98b22`、`fee17ef`）。Python：开发机临时 venv `3.12.11`。
+- 命令与 exit（均 exit 0）：全量 `pytest tests -m 'not thor' -q` → **1240 passed、1 skipped、1 deselected、12 failed**
+  （80.90 s，`2026-09-25T15:55:04Z`—`15:56:26Z`）；`ruff check .`、`run.py --check-config`、`git diff --check`。
+  失败 12 项与 CT06 基线逐项相同（既有日期型失败）。
+- 交付：`acceptance/lab_suite.py`（从注册派生 B:/L: 用例：tools/thinking 各四变体、组合四变体、每模型 legacy 五变体；
+  请求预算；注册/身份/预算三类拒绝理由）、`acceptance/lab_report.py`（`lab-chat-report-v1` 写入与闭集校验，禁
+  summary/production_ready/device_backend_ready，attempt/final/artifact 规则，symlink/逃逸/二次写入拒绝）、
+  `acceptance/lab_http.py`（真实 loopback compat transport：逐块读流、connect/read_idle/total 三段超时、
+  `X-Request-ID`；服务端口读 `/api/status`、`POST /api/models/{id}/unload` 并给出停止证据）、
+  `acceptance/lab_runner.py`（预算先扣后发，耗尽即 `not_run` 且不再发送；reload/cold 先卸载并证明 STOPPED；
+  budget-boundary 按登记并行发起单 choice 请求；失败仍写材料）；`chat_compat` 增 `run --suite candidate` CLI
+  （退出 0/2/3，输出目录仅在输入成立后创建）并允许组合用例的 `L:<model>:tools-thinking` id（只接受带组合 fixture 的场景）。
+- 端到端证据（软件层，无真机）：`tests/test_lab_chat_runner.py` 用真实 HTTP 服务 + 真实临时 checkout/站点输入跑完整
+  22 用例：全部 passed；服务端实际收到 **35** 个生成请求（= 派生最小值 = 冻结下限）；reload/cold 带 cleanup 材料；
+  7B boundary 并发 2、27B 并发 1；报告结构校验为空。另覆盖外来 SHA/脏树/旧摘要/预算不足的 exit 2 拒绝
+  （且不创建输出目录）、`finish_reason=length` 时 exit 3 且失败材料全部保留、未知 suite 参数的 exit 2。
+- 与冻结的一致性：`tests/test_lab_chat_suite.py` 从 CT09 冻结的 site 输入派生出的用例集、fixture 摘要
+  （`cb8544ca…`）与请求下限（35）与 `freeze.json` 逐项一致；本轮未改动冻结记录。
+- 最终部署状态：**未部署、未改目标运行部署**；目标 checkout 仍停在 `8a6230ea…`（CT09 冻结代码）。包含 runner 的提交仅
+  在本地，尚未推送。
+- 未完成项（CT10 内）：CT10b 目标候选切换与 `probe --phase candidate`（前置：按 runner 提交重新冻结 site
+  `expected_sha` 与 `freeze.json` 的 `code_sha`）、CT10c 27B 策略登记与再次重冻、CT10d 真机 suite 运行与 A01—A11 取证。
+  本记录不含任何真机或网关证据。
