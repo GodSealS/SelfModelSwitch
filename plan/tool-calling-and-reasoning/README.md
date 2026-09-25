@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT07 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过；CT06 为本地软件候选，A07 硬件列留给 CT10），CT08—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT08 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过；CT06 为本地软件候选，A07 硬件列留给 CT10），CT09—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -52,7 +52,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT05 | 持租约完整计数与错误清理 | CT04 | done | `3f60bc2…`；本地 1175 passed、目标同 SHA 普通 chat/vision 回归 3/3 200；证据 `ct05-chat-regression-20260924T160538Z/` |
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257df…`/`7f0524e…`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；目标同 SHA 复跑 122 passed；pending：A07 硬件列与 effort 登记归 CT10 |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | software_verified | `681d59892a59df4c9c5e14c6aba375a36cc8f3b0`；本地全量 1194 passed（12 项既有日期型失败与基线逐项相同）；pending：真机两轮与 SSE 聚合/evaluator 归 CT08/CT10 |
-| CT08 | SSE、evaluator及证据反篡改 | CT07 | pending | — |
+| CT08 | SSE、evaluator及证据反篡改 | CT07 | software_verified | `027820e…`；本地全量 1204 passed（12 项既有日期型失败与基线逐项相同）；pending：`run --suite` CLI 与 lab-chat-report-v1 属 CT10 前补齐 |
 | CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | pending | — |
 | CT10 | 私有lab候选探测与真机验收 | CT09、CT00 | pending | — |
 | CT11 | 网关/客户端闭环与完整回滚 | CT10 | pending | — |
@@ -387,6 +387,25 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 验证：A08/A09，参数分片、非ASCII跨chunk、多id、重复DONE、缺DONE、usage-only、断连/超限的正负例；
   删除原始第二轮、替换tool_call_id、修改request hash并重算外层hash仍被evaluator拒绝。
 - 文档：06新增能力材料与派生规则；lab报告不伪装为完整report-v3发布结论。
+
+### CT08 SSE、evaluator与证据反篡改（2026-09-25 已执行，本地软件候选）
+
+- 交付：`chat_compat.py` 增 `SseAggregator`（增量 UTF-8 解码、按空行切事件、合并 data 行后解析 JSON、
+  `[DONE]` 恰一次且结束、按 `choice.index=0` 与 `tool_calls[].index` 聚合、id/type 首片为准且矛盾即拒绝、
+  name/arguments 顺序拼接、content/reasoning 分离拼接且 null 不添加、`usage`-only 合法、事件上限）、
+  `evaluate_case`（只从原始材料重算：链接、固定工具与参数、两轮 finish_reason、固定标记、thinking 非空 reasoning、
+  模板思考标记残留，且不读存储 status）、`write_fixture_material`/`fixture_set_digest`（候选形状的 fixture 条目与集合摘要）。
+  driver 改为**每轮新建聚合器**（工厂可调用对象或类），流式轮由聚合器重组；`compat.json` 增加 `capability` 字段。
+- 验证（RED→GREEN）：CT08 新增 10 项用例先失败（`SseAggregator`/`evaluate_case`/`fixture_set_digest` 不存在）；
+  实现后 `tests/test_chat_compat_acceptance.py` **25 passed**；全量 `pytest tests -m 'not thor' -q`（Python 3.12.11）
+  → **1204 passed、1 skipped、1 deselected**（42.25 s）；失败 12 项与基线逐项相同；`ruff`、`run.py --check-config`、
+  `git diff --check` 通过。
+- A09 覆盖：逐字节切块的 SSE 重组、非 ASCII 跨字节边界、仅首片带 id/name 的 arguments 片段、usage-only 与 null delta；
+  坏 JSON、索引类型错、多生成 index、缺/重复 DONE、DONE 后有数据、缺终结 finish_reason、空 call id、事件超限全部拒绝。
+- A08 覆盖：删掉第二轮即拒绝；替换 `tool_call_id` 并重算全部 hash 仍被 evaluator 发现；`length` 不算通过；
+  缺固定标记、thinking 无 reasoning、答案残留 `<think>` 均被记为问题。
+- 未完成项（不宣称已验证）：`run --suite candidate/gateway/rollback` 的 CLI 与 `lab-chat-report-v1` 仍待实现（CT10 前）；
+  真机/真实网关两轮与 lease 释放计数归 CT10/CT11；`chat_counting` 的 27B 策略与 `effort_values` 待 CT10。
 
 ### CT09 回归与候选冻结
 

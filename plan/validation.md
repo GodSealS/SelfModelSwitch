@@ -2116,3 +2116,16 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   与开发机一致；GitHub 与目标镜像 ref 相同。
 - 部署影响：未改动目标部署，未重启调度器。
 - 未完成项：真机两轮与真实网关闭环（CT10/CT11）；SSE 聚合器、evaluator 与 `run --suite` CLI 属 CT08。
+
+### CT08 SSE聚合、evaluator与证据反篡改（2026-09-25，交付分支 `feature/ct07-compat-fixtures`）
+
+- Python/环境：开发机临时 venv `3.12.11`；无目标机器部署操作。
+- 软件交付：`acceptance/chat_compat.py` 增 `SseAggregator`（增量 UTF-8、事件切分、按 index 聚合、id/type 矛盾即拒绝、
+  事件上限）、`evaluate_case`（只读原始材料重算，不读存储 status）、`write_fixture_material`/`fixture_set_digest`；
+  driver 每轮新建聚合器；`compat.json` 增 `capability`。
+- RED→GREEN：CT08 新增 10 项 A08/A09 用例先失败；实现后 `tests/test_chat_compat_acceptance.py` **25 passed**。
+- 检查（exit 0）：全量 `pytest tests -m 'not thor' -q` → **1204 passed、1 skipped、1 deselected**（42.25 s）；
+  `ruff check .`、`run.py --check-config`、`git diff --check`。失败 12 项与基线逐项相同（冻结报告日期过期）。
+- 提交：`027820e5d916e0bb9633c31fe5f624abe740934d`（source + tests），文档另行回填。
+- 部署影响：未改动目标部署。
+- 未完成项：`run --suite` CLI 与 `lab-chat-report-v1`；真机/网关两轮与 lease 释放计数（CT10/CT11）；27B 策略与 effort 登记（CT10）。

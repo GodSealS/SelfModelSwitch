@@ -56,6 +56,15 @@ request_id、usage、finish_reason 与逐文件 digest 都落盘，由 evaluator
 驱动由能力选定：chat/vision 继续 legacy driver 与其封套 fixture，tools/thinking 走 compat driver；没有 compat 驱动时该 case 记
 `unknown`，不得转为 passed。既有 B 生命周期场景不因新能力减少，`L:` 前缀的 lab 附加报告不进入本表必测集合。
 
+SSE 两轮材料（CT08 起）：服务透传不重写分片，聚合由验收侧负责——增量 UTF-8 解码、按空行切事件、合并 data 行后解析 JSON，
+`[DONE]` 恰一次且结束；按 `choice.index=0` 与 `tool_calls[].index` 聚合，`id`/`type` 只首片出现（后续不同值即矛盾），
+`name`/`arguments` 按到达顺序拼接，`content` 与 `reasoning_content` 分别拼接且 null 不添加文本；`usage`-only 且 `choices=[]` 合法。
+坏 JSON、索引类型错、矛盾 id、DONE 后有数据、缺/重复 DONE、缺终结 finish_reason、parallel=false 下多生成 index 均为失败。
+evaluator 只从原始材料重算（不读任何存储的 status）：工具轮 `finish_reason=tool_calls` 且 arguments 可解析为固定值，
+最终轮 `finish_reason=stop` 且答案等于固定标记，`length`/`content_filter` 不是通过，思考用例要求第一轮 reasoning 非空，
+答案不得残留模板思考标记；删掉第二轮、替换 `tool_call_id` 或改动 request 后重算外层 hash 仍被拒绝。
+lab 附加报告（`lab-chat-report-v1`）只提供本扩展的原始材料，不能伪装为完整 report-v3 发布结论，也不能降低本表门槛。
+
 S可用可控fake/event/时钟；B/O须真实目标设备，不用mock代替。维护故障只影响本deployment，不制造整机OOM或破坏其他磁盘/容器。
 模型infer成功只说明能力运行及基本输出契约成立，不声称转写/人脸/声纹/视频质量达标。
 
