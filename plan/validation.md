@@ -2129,3 +2129,45 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 提交：`027820e5d916e0bb9633c31fe5f624abe740934d`（source + tests），文档另行回填。
 - 部署影响：未改动目标部署。
 - 未完成项：`run --suite` CLI 与 `lab-chat-report-v1`；真机/网关两轮与 lease 释放计数（CT10/CT11）；27B 策略与 effort 登记（CT10）。
+
+### CT09 候选冻结与共享路径本地回归（2026-09-25，交付分支 `feature/ct09-freeze-candidate`）
+
+- 源码SHA：`8a6230ea74ce8127eb71476b9102fe9ef166c582`（代码 + 候选输入）；记录与 site 副本、本页在同分支的
+  后续记录提交中。Python：开发机临时 venv `3.12.11`。
+- 命令与 exit（开发机，均 exit 0）：`pytest tests -m 'not thor' -q` → **1221 passed、1 skipped、1 deselected、
+  12 failed**（43.06 s，`2026-09-25T15:18:41Z`—`15:19:25Z`）；`ruff check .`；`run.py --check-config`；`git diff --check`。
+  失败 12 项（test_deploy_render 2 / test_preflight_v3 6 / test_verify 4）为 CT06 起可复现的既有日期型失败。
+- 提交与远端：`8a6230ea74ce8127eb71476b9102fe9ef166c582`（source + tests + 候选输入）已推 GitHub 与目标镜像
+  （`git ls-remote` 两者 ref 均等于该 SHA）；本次未改运行部署。
+- 冻结（`plan/tool-calling-and-reasoning/ct09-candidate/freeze.json`，digest
+  `fec0630afcccec510e514e8e6e9e8a1bad10f4a894d5193dc118b6cee736a5e6`）：`code_sha`、
+  `policy_source_sha256=1324dcde991b89f58951e5638f15f340d50d47d09b9f46586613a8c3a9c053dd`
+  （`chat_counting.policy_source_digest()` 复算一致）、
+  `fixture_set_sha256=cb8544ca0484bfa76df42c35c14223e41f97c6898cb854f1a834fa0ecbc79f0a`（27B 六份 fixture：
+  tools/thinking/tools+thinking × json/sse，deadline 900 s、`max_tokens=min(1024,1024)`）、模板 hash 7B
+  `a0bc6f6f…`/27B `e84f32a2…`、`service_base_url=http://127.0.0.1:8090`、超时 5/60/900、`request_limit=64`
+  （suite 最小 35）、预算上限 7B 4096/27B 1024、回滚输入 `…/qwen36-27b-lab/deploy2/manifest.json`
+  （sha256 `1c04f3c7051a018ed626f80f8c7e2164ce0f1ef3c8e2e76aa8ccb66d7dd51af9`）；`check_freeze` 返回空，
+  无占位值、浮动镜像或模型占位 hash。
+- 候选部署输入（同目录）：`scheduler-v2.json`（仅 lab 的独立 runtime `llama-cpp-chat-features-4bc272f`，
+  27B 能力 chat+vision+tools+thinking 并切到该 runtime）、`manifest.json`、`llama-swap.yaml`。以提交的配置重渲染
+  与已提交产物**字节相同**；27B argv 末尾 `--jinja --reasoning-format deepseek` 各一次；7B 与目标 `deploy2/manifest.json`
+  的 argv 差异只有白名单内的 `config-sha256` label（身份/镜像/资产/封套/端口不变）。
+- RED→GREEN：`tests/test_chat_freeze.py` 11 项、`tests/test_chat_compat_acceptance.py` 组合 2 项、
+  `tests/test_ct09_candidate.py` 4 项在实现前失败；实现后定向通过。
+- 目标同 SHA（`/home/jtzn/SelfModelSwitch` 走守卫流程 → `verified_target_sha=8a6230ea…`、前后树为空；Python 3.12.14；
+  `2026-09-25T15:19:32Z`—`15:19:33Z`）：`tests/test_chat_freeze.py tests/test_chat_compat_acceptance.py
+  tests/test_chat_counting.py` **51 passed**（0.60 s）。候选 site 输入在目标以该 SHA 的代码
+  `load_site_input` + `require_probe_ready(phase='candidate')` 通过，`site_sha256=09bc1428…`（与本仓库副本逐字节相同）；
+  证据目录 `/home/jtzn/self-model-switch-evidence/ct09-candidate-20260925T151642Z/`：`site-input.json`、
+  `hardware-raw.txt`（sha256 `ebab29ab45014c5222e41645717f35e0eae7157b961ef7a9ad83175d3be92ccf`，硬件身份沿用 CT00 核实值）。
+- 部署影响与最终状态：**未重启调度器、未渲染安装、未改运行部署**；目标 checkout 停在 `8a6230ea…`（干净）。
+- 失败材料：无。本任务未产生失败用例；既有 12 项失败及其基线复现方式见 CT06 记录。
+- 未完成项（不宣称真机通过）：A01—A07 硬件列（真实两轮、工具选择、计数身份、27B 独立 runtime 实际 argv）、候选 probe
+  关闭 `needs_candidate`、27B `llama-cpp-chat-features-v1` 策略条目登记（会更新 `policy_source_sha256`/`code_sha`，
+  登记后必须重冻）属 CT10；`rollback.code_sha`、网关与客户端闭环属 CT11；`run --suite`/`lab-chat-report-v1` CLI 仍是
+  CT10 前的补齐项。
+- 记录例外（与 `freeze.json.exceptions` 一致）：27B `effort_values` 空集是 fail-closed 默认而非测量结论；7B 旧预算
+  （CT02）与 chat/vision（CT05）证据因 7B 身份与 argv 未变而逐项复用，本轮未新增 7B 真机测量。
+- 记录提交边界：`code_sha` 之后只增加 `plan/tool-calling-and-reasoning/` 与本测试文件；CT10 部署前以
+  `git diff --name-only 8a6230ea74ce8127eb71476b9102fe9ef166c582 <head>` 复核，运行代码与候选产物停在该 SHA。

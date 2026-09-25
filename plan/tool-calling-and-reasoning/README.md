@@ -53,7 +53,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257df…`/`7f0524e…`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；目标同 SHA 复跑 122 passed；pending：A07 硬件列与 effort 登记归 CT10 |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | software_verified | `681d59892a59df4c9c5e14c6aba375a36cc8f3b0`；本地全量 1194 passed（12 项既有日期型失败与基线逐项相同）；pending：真机两轮与 SSE 聚合/evaluator 归 CT08/CT10 |
 | CT08 | SSE、evaluator及证据反篡改 | CT07 | software_verified | `027820e…`；本地全量 1204 passed（12 项既有日期型失败与基线逐项相同）；pending：`run --suite` CLI 与 lab-chat-report-v1 属 CT10 前补齐 |
-| CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | pending | — |
+| CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | software_verified | `8a6230ea…`（代码+候选输入；记录 `ct09-candidate/freeze.json` digest `fec0630a…`）；本地全量 1221 passed（12 项既有日期型失败与基线逐项相同）、目标同 SHA 51 passed；候选 site `09bc1428…` 已在目标解析通过；pending：真机 A01—A07 列与 27B 策略登记（登记后需重冻）归 CT10 |
 | CT10 | 私有lab候选探测与真机验收 | CT09、CT00 | pending | — |
 | CT11 | 网关/客户端闭环与完整回滚 | CT10 | pending | — |
 | CT12 | 文档、材料索引与交付结论 | CT11 | pending | — |
@@ -414,6 +414,51 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 冻结CT10用的base URL、超时、最大请求数、预算上限及回滚输入；不使用伪造的实测passed完成冻结。
 - 验证：§5通用检查和render对比；候选中不存在未定义取值、浮动镜像或模型占位hash。
 - 文档：本页记录software_verified；记录7B旧证据逐项复用/重跑理由，不标真机passed。
+
+### CT09 回归与候选冻结（2026-09-25 已执行，本地软件候选）
+
+- 交付（候选代码+输入提交 `8a6230ea74ce8127eb71476b9102fe9ef166c582`，分支 `feature/ct09-freeze-candidate`）：
+  - `model_scheduler/acceptance/chat_freeze.py`：CT10 冻结记录的闭集 schema（`parse_freeze`）、可冻结性检查
+    （`check_freeze`：浮动镜像、占位/全零 hash、未定义 `effort_values`、模板表与模型条目不一致、预算上限缺项、
+    请求预算低于 suite 最小量、没有记例外的冻结全部拒绝）、`minimum_requests`（按注册能力、variant 与轮次展开候选
+    suite 的最小生成请求数）与 `freeze_digest`。
+  - `model_scheduler/chat_counting.py`：`policy_source_digest()`——`source_revision` 加每条已注册策略（TC01 字段）的
+    规范化摘要，作为 `policy_source_sha256` 的可复算来源。
+  - `model_scheduler/acceptance/chat_compat.py`：`tools_thinking_scenario`（组合 fixture：复用工具两轮，另要求第一轮
+    reasoning）与 evaluator 的组合判定（第一轮 reasoning 非空、第二轮历史逐字段回传第一轮 assistant 原文）。
+  - `plan/tool-calling-and-reasoning/ct09-candidate/`：候选配置 `scheduler-v2.json`（目标已部署 lab 配置的最小改动：
+    新增仅 lab 的独立 runtime `llama-cpp-chat-features-4bc272f`，27B 能力 chat+vision+tools+thinking 并切到该 runtime）、
+    渲染产物 `manifest.json`/`llama-swap.yaml`、6 个 fixture 文档、site 输入副本与 `freeze.json`。
+- 冻结值（`ct09-candidate/freeze.json`，digest `fec0630afcccec510e514e8e6e9e8a1bad10f4a894d5193dc118b6cee736a5e6`）：
+  `code_sha=8a6230ea…`、`policy_source_sha256=1324dcde…`、`fixture_set_sha256=cb8544ca…`、
+  模板 hash 7B `a0bc6f6f…` / 27B `e84f32a2…`、`service_base_url=http://127.0.0.1:8090`、超时 5/60/900、
+  `request_limit=64`（≥ suite 最小 35）、预算上限 7B 4096 / 27B 1024、回滚输入
+  `…/qwen36-27b-lab/deploy2/manifest.json`（sha256 `1c04f3c7…`）、两模型身份与 `max_parallel`；`check_freeze` 为空。
+- 验证（RED→GREEN）：`tests/test_chat_freeze.py` 11 项、`tests/test_chat_compat_acceptance.py` 组合 2 项、
+  `tests/test_ct09_candidate.py` 4 项（记录可冻结、策略与 fixture 摘要同时与代码和已提交文档一致、候选配置重渲染与
+  已提交 manifest 字节相同、site 输入与记录/渲染/自身摘要一致）在实现前失败。
+  全量 `pytest tests -m 'not thor' -q`（Python 3.12.11，`15:18:41Z`—`15:19:25Z`）→
+  **1221 passed、1 skipped、1 deselected、12 failed**（43.06 s）；失败 12 项与 CT06 基线逐项相同（冻结报告日期过期的
+  既有失败）；`ruff check .`、`run.py --check-config`、`git diff --check` 通过。
+- render 对比：候选配置重渲染与已提交 manifest/llama-swap 字节相同；27B argv 末尾为 `--jinja --reasoning-format deepseek`
+  且各一次，runtime/profile 为独立 lab 组合；7B 与目标已部署 manifest 的 argv 差异只有白名单内的 `config-sha256` label
+  （身份、镜像、资产、封套、端口不变）；production 渲染仍拒绝（既有 CT06 用例）。
+- 7B 旧证据复用理由（本轮不复测真机）：7B 的 runtime/profile/模板/封套/启动 argv 均未变（上一条渲染对比），
+  CT02 的预算耗尽材料（7B 4096）与 CT05 的普通 chat/vision 三例对同一代码路径继续有效。
+- 目标同 SHA（`8a6230ea…`，干净；Python 3.12.14，`15:19:32Z`—`15:19:33Z`）：checkout 走守卫流程 →
+  `verified_target_sha=8a6230ea…`、前后树为空；
+  `tests/test_chat_freeze.py tests/test_chat_compat_acceptance.py tests/test_chat_counting.py` **51 passed**（0.60 s）；
+  候选 site 输入在目标以该 SHA 的代码解析通过（`phase=candidate`、两个模型、模板/策略/fixture 摘要与冻结值一致）。
+  证据目录 `/home/jtzn/self-model-switch-evidence/ct09-candidate-20260925T151642Z/`：`site-input.json`（`09bc1428…`）、
+  `hardware-raw.txt`（`ebab29ab…`）。**未重启调度器、未改运行部署**。
+- 例外（同时记录在 `freeze.json.exceptions`，不在文档里淡化）：27B 的 `llama-cpp-chat-features-v1` 策略条目仍未注册
+  （fail-closed；CT10 的 D06 实测登记会更新 `policy_source_sha256` 与 `code_sha`，登记后必须重冻）；`effort_values`
+  空集不是测量结论；CT01 遗留的 27B thinking/vision/组合未测项由 CT10 关闭；`rollback.code_sha` 待 CT11 的已审查回退提交；
+  候选 suite 的 L 前缀 case id 与 `lab-chat-report-v1` CLI 仍是 CT10 前的补齐项。
+- 边界与未完成项（不宣称已验证）：本页只记 software_verified；A01—A07 真机列、工具/思考/组合的真实两轮与计数身份、
+  `needs_candidate` 关闭均属 CT10；网关/客户端闭环与完整回滚属 CT11。
+- 记录提交的边界：`code_sha` 之后只允许 `plan/tool-calling-and-reasoning/` 与冻结测试的增量，CT10 部署前用
+  `git diff --name-only 8a6230ea… <head>` 复核；运行代码、候选配置与渲染产物都停在该 SHA，之后的重冻必须显式替换记录。
 
 ### CT10 私有lab真机验证
 

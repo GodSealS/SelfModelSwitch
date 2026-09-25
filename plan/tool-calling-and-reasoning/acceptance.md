@@ -193,6 +193,9 @@ rollback suite固定集合：L:deployment:rollback一个full变体。driver只�
 首版交付要求27B登记两能力、7B登记chat/vision且无新能力，candidate缺任何上述项不能通过。
 L前缀是lab附加报告内部ID，不能写入report-v3的必测case列表。所有ID在CT07以常量/上述确定规则派生，
 未知/重复/缺失拒绝，不提供--skip或静默N/A。每个run仅证明本suite，gateway/rollback run必须校验candidate原始材料。
+CT09冻结的候选输入在`plan/tool-calling-and-reasoning/ct09-candidate/`：候选配置与渲染、fixture集、site输入副本与
+`freeze.json`；site的实际路径、摘要、base URL、超时、request_limit、预算上限与回滚输入以`freeze.json`为准
+（`check_freeze`为空），登记、模板或镜像变更后必须重新冻结，不能沿用旧摘要。
 
 每个artifact字段为path/bytes/sha256；相对路径必须在证据根内、regular file、无symlink；缺失/hash错配退出2。
 结构完整但HTTP/语义/身份/静默不满足退出3；全部满足退出0。evaluator从原请求/响应重新计算工具关联与结果，
