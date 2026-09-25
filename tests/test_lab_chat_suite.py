@@ -86,8 +86,8 @@ def test_a10_the_fixture_set_and_policy_source_must_be_the_frozen_ones() -> None
                                 fixture_set_sha256="b" * 64)
 
 
-@pytest.mark.parametrize("candidate", ["ct09-candidate", "ct10-candidate"])
-def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze(candidate: str) -> None:
+@pytest.mark.parametrize(("candidate", "current"), [("ct09-candidate", False), ("ct10-candidate", True)])
+def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze(candidate: str, current: bool) -> None:
     directory = Path(__file__).resolve().parents[1] / "plan/tool-calling-and-reasoning" / candidate
     site = json.loads((directory / "site-input.json").read_text(encoding="utf-8"))
     record = json.loads((directory / "freeze.json").read_text(encoding="utf-8"))
@@ -98,8 +98,15 @@ def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze(can
                                deadline_seconds=site["timeouts"]["total_seconds"])
 
     assert ls.candidate_registration_problems(models) == []
-    assert ls.identity_problems(suite=suite, policy_source_sha256=site["policy_source_sha256"],
-                                fixture_set_sha256=site["fixture_set_sha256"]) == []
+    problems = ls.identity_problems(suite=suite, policy_source_sha256=site["policy_source_sha256"],
+                                    fixture_set_sha256=site["fixture_set_sha256"])
+    if current:
+        assert problems == []
+    else:
+        # The CT09 staging is historical: its fixtures still hold, its policy source was superseded
+        # by the CT10c registration, and a run must never accept it as the current candidate.
+        assert not any("fixture_set_sha256" in problem for problem in problems)
+        assert any("policy_source_sha256" in problem for problem in problems)
     assert ls.budget_problems(suite=suite, request_limit=site["request_limit"]) == []
     assert cc.fixture_set_digest(suite.scenarios()) == record["fixture_set_sha256"]
     assert suite.requests() == cf.minimum_requests(record["models"]) <= site["request_limit"]
@@ -109,14 +116,17 @@ def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze(can
     assert record["code_sha"] == site["expected_sha"]
 
 
-def test_a10_the_ct10_refreeze_moves_only_the_code_sha() -> None:
+def test_a10_the_ct10_refreeze_moves_the_code_and_the_policy_source_only() -> None:
     base = Path(__file__).resolve().parents[1] / "plan/tool-calling-and-reasoning"
     ct09 = json.loads((base / "ct09-candidate/freeze.json").read_text(encoding="utf-8"))
     ct10 = json.loads((base / "ct10-candidate/freeze.json").read_text(encoding="utf-8"))
 
     assert ct10["code_sha"] != ct09["code_sha"]
-    unchanged = ("schema_version", "policy_source_sha256", "fixture_set_sha256", "template_hashes",
-                 "service_base_url", "timeouts", "request_limit", "budget_caps", "models", "rollback")
+    # CT10c registered the 27B chat-features entry: the policy source moved with it, nothing else.
+    assert ct10["policy_source_sha256"] != ct09["policy_source_sha256"]
+    assert ct10["policy_source_sha256"] == chat_counting.policy_source_digest()
+    unchanged = ("schema_version", "fixture_set_sha256", "template_hashes", "service_base_url", "timeouts",
+                 "request_limit", "budget_caps", "models", "rollback")
     assert {key: ct10[key] for key in unchanged} == {key: ct09[key] for key in unchanged}
     assert ct10["exceptions"] and all(isinstance(item, str) and item for item in ct10["exceptions"])
     assert ct10["lab_input"] != ct09["lab_input"]  # a re-freeze names its own staged input

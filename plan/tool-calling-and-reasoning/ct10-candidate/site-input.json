@@ -4,7 +4,7 @@
   "checkout": "/home/jtzn/SelfModelSwitch",
   "client_evidence": [],
   "deployment_id": "sms-orin-lab2",
-  "expected_sha": "3b2b80e225f4db60eab69e022c9fe35d257342ca",
+  "expected_sha": "3aee26ec1964b844a09fa83919b7a7c5f34ad6c2",
   "fixture_set_sha256": "cb8544ca0484bfa76df42c35c14223e41f97c6898cb854f1a834fa0ecbc79f0a",
   "gateway_base_url": null,
   "hardware_file": "hardware-raw.txt",
@@ -153,7 +153,7 @@
     }
   },
   "phase": "candidate",
-  "policy_source_sha256": "1324dcde991b89f58951e5638f15f340d50d47d09b9f46586613a8c3a9c053dd",
+  "policy_source_sha256": "ba2544238735e4032d2128d949dcff16932b3aa263080771ae059e7ab3ab3085",
   "remote_url": "https://github.com/GodSealS/SelfModelSwitch.git",
   "request_limit": 64,
   "rollback_input": "/home/jtzn/self-model-switch-evidence/qwen36-27b-lab/deploy2/manifest.json",
