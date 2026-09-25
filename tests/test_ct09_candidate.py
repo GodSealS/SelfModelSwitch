@@ -75,7 +75,9 @@ def test_the_frozen_digests_come_from_the_policy_source_and_the_fixture_set() ->
     scenarios = _scenarios(record)
     shipped = sorted((CANDIDATE / "fixtures").glob("*.json"))
 
-    assert record["policy_source_sha256"] == chat_counting.policy_source_digest()
+    # The CT09 record is the historical freeze: its fixtures still derive from this code, while its
+    # policy source was superseded by the CT10c registration — a run must not reuse it as current.
+    assert record["policy_source_sha256"] != chat_counting.policy_source_digest()
     assert record["fixture_set_sha256"] == cc.fixture_set_digest(scenarios)
     assert len(shipped) == len(scenarios)
 

@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .contracts import Lease
-from .contracts_v2 import GGUF_PROFILE, canonical_json_bytes
+from .contracts_v2 import CHAT_FEATURES_PROFILE, GGUF_PROFILE, canonical_json_bytes
 from .control_protocol_v1 import InstanceIdentity
 from .envelope_validator import PreparedChat
 
@@ -145,10 +145,11 @@ class RuntimeChatPolicy:
         return json.loads(self.tokenize_options_json.decode("utf-8"))
 
 
-def _lab_policy(*, model_sha256: str, template_sha256: str, model_id: str) -> RuntimeChatPolicy:
+def _lab_policy(*, model_sha256: str, template_sha256: str, model_id: str,
+                profile_id: str = GGUF_PROFILE, policy_suffix: str = "") -> RuntimeChatPolicy:
     return RuntimeChatPolicy(
-        policy_id=f"llama-cpp-{_LAB_SOURCE_REVISION}-{model_id}",
-        profile_id=GGUF_PROFILE,
+        policy_id=f"llama-cpp-{_LAB_SOURCE_REVISION}-{model_id}{policy_suffix}",
+        profile_id=profile_id,
         image_digest=LAB_IMAGE_DIGEST,
         model_sha256=model_sha256,
         template_sha256=template_sha256,
@@ -180,6 +181,14 @@ POLICY_REGISTRY: Mapping[tuple[str, str, str], RuntimeChatPolicy] = {
                     template_sha256="a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb"),
     (GGUF_PROFILE, LAB_IMAGE_DIGEST, "f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457"):
         _lab_policy(model_id="qwen36-27b",
+                    model_sha256="f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457",
+                    template_sha256="e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"),
+    # CT10c: the 27B lab candidate runs the same measured engine under its own profile, so
+    # every field a count depends on is the GGUF policy's — the same image, the same GGUF
+    # template, the same output fields. `effort_values` stays the fail-closed empty set until
+    # the candidate D06 run measures the effort semantics through this profile.
+    (CHAT_FEATURES_PROFILE, LAB_IMAGE_DIGEST, "f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457"):
+        _lab_policy(model_id="qwen36-27b", policy_suffix="-chat-features", profile_id=CHAT_FEATURES_PROFILE,
                     model_sha256="f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457",
                     template_sha256="e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"),
 }

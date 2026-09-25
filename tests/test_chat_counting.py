@@ -131,14 +131,40 @@ def test_policy_registry_resolution_is_keyed_and_fail_closed() -> None:
 def test_the_registered_lab_policies_are_the_ct01_material() -> None:
     from model_scheduler.chat_counting import POLICY_REGISTRY
 
-    assert len(POLICY_REGISTRY) == 2
+    assert len(POLICY_REGISTRY) == 3
     for key, policy in POLICY_REGISTRY.items():
         assert key == (policy.profile_id, policy.image_digest, policy.model_sha256)
-        assert policy.effort_values == frozenset()  # CT01 D06 did not run: never a guessed value
+        assert policy.effort_values == frozenset()  # D06 never ran: never a guessed value
         assert policy.template_sha256 in {
             "a0bc6f6fc7a29a80017a433e8f03a1cc1236e838a944a2d034295a60c4f2fddb",
             "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
         }
+
+
+def test_the_ct10_registration_serves_the_27b_chat_features_profile() -> None:
+    """CT10c: one engine, one measured template — the lab profile gets its own key, not its own rules."""
+    from model_scheduler.chat_counting import (CHAT_FEATURES_PROFILE, GGUF_PROFILE, LAB_IMAGE_DIGEST,
+                                               POLICY_REGISTRY, policy_source_digest, resolve_policy)
+
+    model_sha = "f1e1b337fda4ec8e39974f69a385f970381488e9bb41d039d85959aeb5350457"
+    feature = resolve_policy(profile_id=CHAT_FEATURES_PROFILE, image_digest=LAB_IMAGE_DIGEST,
+                             model_sha256=model_sha)
+    gguf = resolve_policy(profile_id=GGUF_PROFILE, image_digest=LAB_IMAGE_DIGEST, model_sha256=model_sha)
+
+    assert len(POLICY_REGISTRY) == 3
+    assert feature.profile_id == CHAT_FEATURES_PROFILE and feature.policy_id != gguf.policy_id
+    assert feature.template_sha256 == "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+    for field in ("source_revision", "recognized_output_fields", "supported_output_fields", "effort_values",
+                  "denied_template_fields", "template_request_fields", "template_request_constants_json",
+                  "tokenize_options_json"):
+        assert getattr(feature, field) == getattr(gguf, field), field
+    assert feature.effort_values == frozenset()  # fail-closed until the candidate D06 run measures it
+
+    # The registration is per identity: the 7B is not served by the chat-features profile.
+    with pytest.raises(ChatCountingError):
+        resolve_policy(profile_id=CHAT_FEATURES_PROFILE, image_digest=LAB_IMAGE_DIGEST,
+                       model_sha256="3f4513330aa7f109922bd701d773575484ae2b4a4090d6511260a2a4f8e3d069")
+    assert policy_source_digest() != "1324dcde991b89f58951e5638f15f340d50d47d09b9f46586613a8c3a9c053dd"
 
 
 # --------------------------------------------------------------------------- the template projection
