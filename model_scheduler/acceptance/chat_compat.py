@@ -27,10 +27,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import argparse
 import codecs
 import hashlib
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol, Sequence
 
@@ -39,6 +42,9 @@ COMPAT_CAPABILITIES = ("tools", "thinking")
 VARIANTS = ("json-hot", "sse-hot", "json-reload", "sse-reload")
 ROUNDS = 2
 CASE_PREFIX = "B:"
+#: The lab-only case prefix and the combination case's own id (acceptance §7).
+LAB_CASE_PREFIX = "L:"
+COMBINATION_CASE = "tools-thinking"
 
 REQUEST_FILE = "request.json"
 RESPONSE_FILE = "response.raw"
@@ -173,8 +179,14 @@ class CaseSpec:
         if self.variant not in VARIANTS:
             raise CompatError(f"variant {self.variant!r} is not one of {', '.join(VARIANTS)}")
         expected_case = f"{CASE_PREFIX}{self.scenario.model_id}:cap:{self.scenario.capability}"
-        if self.case_id != expected_case:
+        # CT10/acceptance §7: the tools+thinking combination is its own lab case, and it may
+        # only carry the combination fixture — a relabelled tools case is refused.
+        combination_case = f"{LAB_CASE_PREFIX}{self.scenario.model_id}:{COMBINATION_CASE}"
+        if self.case_id not in (expected_case, combination_case):
             raise CompatError(f"case id {self.case_id!r} does not match the derived case {expected_case!r}")
+        if self.case_id == combination_case and (self.scenario.capability != "tools"
+                                                 or not self.scenario.expected.get("requires_reasoning")):
+            raise CompatError("the combination case needs the combination fixture, not a plain tools scenario")
         stream = self.variant.startswith("sse-")
         if stream is not self.scenario.stream:
             raise CompatError(f"variant {self.variant!r} and the scenario's stream={self.scenario.stream!r} disagree")
@@ -917,3 +929,80 @@ def write_fixture_material(directory: str | Path, scenarios: Sequence[CompatScen
 def fixture_set_digest(scenarios: Sequence[CompatScenario]) -> str:
     """The fixture-set digest: one value for the whole set, order-independent."""
     return _sha256(canonical_json_bytes(sorted(scenario.digest() for scenario in scenarios)))
+
+
+# ---------------------------------------------------------------------------
+# CT10: the suite CLI (`python -m model_scheduler.acceptance.chat_compat run ...`).
+# The runner, the report and the ports live in their own modules; they import this
+# one, so they are imported here *inside* the command that uses them.
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m model_scheduler.acceptance.chat_compat",
+                                     description="frozen lab chat suites over the service under test (CT10)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    run_parser = sub.add_parser("run", help="run one derived suite against the frozen site input")
+    # gateway and rollback arrive with CT11; a suite that does not exist is not a skip flag.
+    run_parser.add_argument("--suite", choices=("candidate",), required=True)
+    run_parser.add_argument("--site", type=Path, required=True)
+    run_parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def _run_candidate(args: argparse.Namespace) -> int:
+    from . import EXIT_FAILED, EXIT_INPUT, EXIT_OK, lab_http, lab_report, lab_runner, lab_suite
+    from .chat_probe import SubprocessShell, SystemClock, load_site_input, prepare_output, require_probe_ready
+
+    site = load_site_input(args.site)
+    require_probe_ready(site, phase="candidate")
+    suite = lab_suite.candidate_suite(models={model_id: model.capabilities for model_id, model in site.models.items()},
+                                      envelope_of={model_id: model.envelope for model_id, model in site.models.items()},
+                                      deadline_seconds=site.timeouts.total_seconds)
+    shell = SubprocessShell()
+    git_state = lab_runner.checkout_state(shell, site.checkout)
+    problems = lab_runner.precheck_problems(site=site, suite=suite, git_state=git_state)
+    if problems:
+        for problem in problems:
+            print(f"run: {problem}", file=sys.stderr)
+        return EXIT_INPUT
+    # The output directory is created only once the inputs hold: a refused run leaves no material.
+    output = prepare_output(args.output)
+    auth = os.environ.get(site.auth_env) if site.auth_env else None
+    runner = lab_runner.LabRunner(
+        suite=suite, site=site, output=output, shell=shell, clock=SystemClock(), git_state=git_state,
+        transport=lab_http.HttpCompatTransport(base_url=site.service_base_url,
+                                              connect_seconds=site.timeouts.connect_seconds,
+                                              read_idle_seconds=site.timeouts.read_idle_seconds,
+                                              total_seconds=site.timeouts.total_seconds, auth=auth),
+        service=lab_http.LabServicePort(base_url=site.service_base_url,
+                                        timeout_seconds=site.timeouts.total_seconds))
+    document = runner.run()
+    structure = lab_report.report_problems(document, required=lab_runner.required_pairs(suite), root=output)
+    statuses = runner.final_statuses()
+    print(f"run written to {output}: requests={runner.budget.used}/{site.request_limit} "
+          f"cases={len(suite.cases)} registration_problems={len(runner.registration_problems)}")
+    for (case_id, variant), status in sorted(statuses.items()):
+        if status != "passed":
+            print(f"  {case_id}/{variant}: {status}")
+    if structure:
+        for problem in structure:
+            print(f"report: {problem}", file=sys.stderr)
+        return EXIT_INPUT
+    return EXIT_OK if runner.passed() else EXIT_FAILED
+
+
+def main(argv: list[str] | None = None) -> int:
+    from . import EXIT_INPUT
+    from .chat_probe import ProbeInputError
+
+    args = build_parser().parse_args(argv)
+    try:
+        return _run_candidate(args)
+    except ProbeInputError as exc:
+        print(f"{args.command}: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

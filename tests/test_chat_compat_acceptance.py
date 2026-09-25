@@ -662,6 +662,14 @@ def test_a08_the_combination_fixture_reuses_the_tool_dialogue_and_demands_reason
     assert combination.digest() != plain.digest()  # its own identity, not a relabelled tools fixture
     assert _combination_scenario(stream=True).stream is True
 
+    # CT10: the combination's own lab case id is legal, a relabelled tools case is not.
+    labelled = cc.CaseSpec(case_id=f"L:{MODEL_ID}:tools-thinking", variant="json-hot", scenario=combination)
+    assert labelled.case_id == f"L:{MODEL_ID}:tools-thinking"
+    with pytest.raises(cc.CompatError, match="derived case"):
+        cc.CaseSpec(case_id="L:qwen36-27b:tools", variant="json-hot", scenario=plain)
+    with pytest.raises(cc.CompatError, match="combination fixture"):
+        cc.CaseSpec(case_id=f"L:{MODEL_ID}:tools-thinking", variant="json-hot", scenario=plain)
+
 
 def test_a08_the_combination_judges_reasoning_and_the_verbatim_history(tmp_path: Path) -> None:
     target = tmp_path / "combination"
