@@ -7,6 +7,7 @@ list must be visible before a single request is sent.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -85,10 +86,11 @@ def test_a10_the_fixture_set_and_policy_source_must_be_the_frozen_ones() -> None
                                 fixture_set_sha256="b" * 64)
 
 
-def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze() -> None:
-    candidate = Path(__file__).resolve().parents[1] / "plan/tool-calling-and-reasoning/ct09-candidate"
-    site = json.loads((candidate / "site-input.json").read_text(encoding="utf-8"))
-    record = json.loads((candidate / "freeze.json").read_text(encoding="utf-8"))
+@pytest.mark.parametrize("candidate", ["ct09-candidate", "ct10-candidate"])
+def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze(candidate: str) -> None:
+    directory = Path(__file__).resolve().parents[1] / "plan/tool-calling-and-reasoning" / candidate
+    site = json.loads((directory / "site-input.json").read_text(encoding="utf-8"))
+    record = json.loads((directory / "freeze.json").read_text(encoding="utf-8"))
     models = {model_id: entry["capabilities"] for model_id, entry in site["models"].items()}
     envelopes = {model_id: Envelope(**entry["envelope"]) for model_id, entry in site["models"].items()}
 
@@ -101,6 +103,23 @@ def test_a10_the_frozen_candidate_derives_exactly_the_suite_the_record_froze() -
     assert ls.budget_problems(suite=suite, request_limit=site["request_limit"]) == []
     assert cc.fixture_set_digest(suite.scenarios()) == record["fixture_set_sha256"]
     assert suite.requests() == cf.minimum_requests(record["models"]) <= site["request_limit"]
+    assert cf.check_freeze(cf.parse_freeze(record)) == []
+    # The record names the site it froze, and the site names the commit under test.
+    assert record["lab_input"]["sha256"] == hashlib.sha256((directory / "site-input.json").read_bytes()).hexdigest()
+    assert record["code_sha"] == site["expected_sha"]
+
+
+def test_a10_the_ct10_refreeze_moves_only_the_code_sha() -> None:
+    base = Path(__file__).resolve().parents[1] / "plan/tool-calling-and-reasoning"
+    ct09 = json.loads((base / "ct09-candidate/freeze.json").read_text(encoding="utf-8"))
+    ct10 = json.loads((base / "ct10-candidate/freeze.json").read_text(encoding="utf-8"))
+
+    assert ct10["code_sha"] != ct09["code_sha"]
+    unchanged = ("schema_version", "policy_source_sha256", "fixture_set_sha256", "template_hashes",
+                 "service_base_url", "timeouts", "request_limit", "budget_caps", "models", "rollback")
+    assert {key: ct10[key] for key in unchanged} == {key: ct09[key] for key in unchanged}
+    assert ct10["exceptions"] and all(isinstance(item, str) and item for item in ct10["exceptions"])
+    assert ct10["lab_input"] != ct09["lab_input"]  # a re-freeze names its own staged input
 
 
 def test_a10_the_first_release_registration_is_required() -> None:

@@ -475,7 +475,7 @@ CT10子项（依赖顺序；父项验收全集不变，未全部通过不得进�
 | 子项 | 交付 | 依赖 | 状态 |
 |---|---|---|---|
 | CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | software_verified（`3b00e226…`，前两片 `ac98b22`/`fee17ef`；本地全量 1240 passed；端到端 22 用例全 passed、实际 35 请求=冻结下限；详见 validation CT10a） |
-| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | pending；前置：以 CT10a 提交重冻 candidate site 的 `expected_sha` 与 `freeze.json`（`code_sha` 必须等于实际部署的 runner 提交） |
+| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | in_progress：重冻已完成（`ct10-candidate/freeze.json` digest `46bd7db2…`、site `fac9a43e…`、`code_sha=5b4e5dc…`，其余冻结值与 CT09 逐项相同）；待候选切换与 probe |
 | CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | pending |
 | CT10d | candidate suite 运行、A01—A11 硬件项取证、validation 材料索引与状态回填 | CT10c | pending |
 
