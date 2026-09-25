@@ -2093,5 +2093,8 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   失败集合与本改动前后完全相同（另有 1 项同族用例按时间边界偶发）。
 - 提交：`2b3257df…`（含 source 与测试的原子增量），文档另行回填。
 - 部署影响：**未改动目标部署**，本轮不渲染/不安装；输出为本地软件候选。
+- 目标同步与同 SHA 复跑（2026-09-25T11:33:14Z—11:33:20Z，Python 3.12.14）：checkout
+  `/home/jtzn/SelfModelSwitch` 走守卫流程 → `verified_target_sha=7f0524e9ad58603835192ed457e12e62326ece40`、
+  前后树为空；受影响五文件 **122 passed**（2 项同为上述日期型既有失败），与开发机一致；GitHub 与目标镜像 ref 相同。
 - 未完成项：A07 硬件列（27B 独立 runtime 实际 argv 与 render 一致、7B 身份/镜像/模板/封套/argv 不变）属 CT10；
   `chat_counting` 的新 profile 策略条目与 `effort_values` 仍 fail-closed，需 CT10 的 D06 实测后登记。

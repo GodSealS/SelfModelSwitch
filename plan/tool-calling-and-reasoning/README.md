@@ -50,7 +50,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT03 | 模型能力与execution operation分离 | CT02 | done | `a90494e0…`；本地 1087 passed、目标同 SHA 149 passed；schema 字节一致；证据 `ct03-contract-20260924T121318Z/` |
 | CT04 | 工具/思考预检与历史状态机 | CT03 | done | `4b7303b1…`；本地 1156 passed、目标同 SHA 297 passed；A03/A04/A06-local 全矩阵 + 本地零调用断言；证据 `ct04-contract-20260924T144322Z/` |
 | CT05 | 持租约完整计数与错误清理 | CT04 | done | `3f60bc2…`；本地 1175 passed、目标同 SHA 普通 chat/vision 回归 3/3 200；证据 `ct05-chat-regression-20260924T160538Z/` |
-| CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257dfe3bd4d5bac8721937ef4b10dcba8b1f8`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；pending：A07 硬件列与 effort 登记归 CT10 |
+| CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257df…`/`7f0524e…`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；目标同 SHA 复跑 122 passed；pending：A07 硬件列与 effort 登记归 CT10 |
 | CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | pending | — |
 | CT08 | SSE、evaluator及证据反篡改 | CT07 | pending | — |
 | CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | pending | — |
@@ -341,6 +341,10 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - 未完成项（不宣称已验证）：A07 硬件列（27B 独立 runtime 的实际 argv 与 render 相同、7B 运行身份/镜像/模板/封套/argv 不变）
   需 CT10 候选部署后取证；`chat_counting` 的 27B 新 profile 策略条目与 `effort_values` 仍为 fail-closed 空集，
   待 CT10 的 D06 实测登记前不得计入；因此本页 CT06 记为 `software_verified`，不是 `target_verified`。
+- 目标同 SHA 复跑（Python 3.12.14，`2026-09-25T11:33:14Z`—`11:33:20Z`）：checkout `/home/jtzn/SelfModelSwitch`
+  → 守卫流程 → `verified_target_sha=7f0524e9ad58603835192ed457e12e62326ece40`、树为空；受影响五文件
+  **122 passed**（2 项同为上述日期型既有失败），与开发机结果一致。GitHub 与目标镜像 ref 相同。
+  **未重启调度器、未渲染安装**：CT06 不触碰运行部署，A07 的实机列仍在 CT10 候选部署时取证。
 
 ### CT07 兼容多轮fixture/driver
 
