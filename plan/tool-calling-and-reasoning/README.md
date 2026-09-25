@@ -1,6 +1,6 @@
 # Tool calling / thinking 执行计划
 
-日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT06 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过；CT06 为本地软件候选，A07 硬件列留给 CT10），CT07—CT12 未执行**。
+日期：2026-09-24。类型：兼容接口增强 + 前置预算修复。状态：**CT00—CT07 已执行（CT01 含未补齐的 27B 材料，见下；CT02 的 lab 真机预算上限、CT05 的同租约计数均在目标机以同 SHA 回归通过；CT06 为本地软件候选，A07 硬件列留给 CT10），CT08—CT12 未执行**。
 设计来源：[已修订方案](../../Idea/20260923-tool-calling-and-reasoning-plan.md)。源码基线：`854f39e1bb34ec3ce8678010d9b363a8021c6854`；
 方案基线：`4e5f51e`。本计划不代表真机、客户端或生产通过，也不替代 RP 系列剩余任务。
 
@@ -51,7 +51,7 @@ blocked记录缺少的具体输入、失败证据及恢复动作；not_run/skipp
 | CT04 | 工具/思考预检与历史状态机 | CT03 | done | `4b7303b1…`；本地 1156 passed、目标同 SHA 297 passed；A03/A04/A06-local 全矩阵 + 本地零调用断言；证据 `ct04-contract-20260924T144322Z/` |
 | CT05 | 持租约完整计数与错误清理 | CT04 | done | `3f60bc2…`；本地 1175 passed、目标同 SHA 普通 chat/vision 回归 3/3 200；证据 `ct05-chat-regression-20260924T160538Z/` |
 | CT06 | 27B独立runtime与能力/flag门禁 | CT03、CT01的flag源码证据 | software_verified | `2b3257df…`/`7f0524e…`；本地全量 1179 passed（12 项既有日期型失败与 HEAD 基线逐项相同）；目标同 SHA 复跑 122 passed；pending：A07 硬件列与 effort 登记归 CT10 |
-| CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | pending | — |
+| CT07 | 兼容HTTP多轮fixture和driver | CT05、CT06 | software_verified | `681d59892a59df4c9c5e14c6aba375a36cc8f3b0`；本地全量 1194 passed（12 项既有日期型失败与基线逐项相同）；pending：真机两轮与 SSE 聚合/evaluator 归 CT08/CT10 |
 | CT08 | SSE、evaluator及证据反篡改 | CT07 | pending | — |
 | CT09 | 7B/27B共享路径本地回归与候选冻结 | CT08 | pending | — |
 | CT10 | 私有lab候选探测与真机验收 | CT09、CT00 | pending | — |
@@ -353,6 +353,28 @@ CT11完成后才允许登记为“已验证lab能力”。硬件探测失败不�
 - driver只执行acceptance规定的固定假工具；保存原始请求/响应，不能静态填第一轮call或丢掉reasoning字段。
 - 验证：A08，模拟上游真实两轮数据关联，role/tool_call_id、transport与fixture缺失/错误即拒绝。
 - 文档：06登记新能力case语法和材料责任；existing B lifecycle场景不减少。
+
+### CT07 兼容多轮fixture/driver（2026-09-25 已执行，本地软件候选）
+
+- 交付：新增 `model_scheduler/acceptance/chat_compat.py`——`CompatScenario`（TC08 全字段 + 固定期望，`digest()`
+  覆盖每个字段与期望值）、`CaseSpec`（case/variant 绑定，variant 与 stream 必须一致、case id 由能力派生）、
+  `CompatTransport`/`CompatAggregator` 端口、`CompatDriver.run`（两轮 + 逐轮原始材料）、`build_second_round`
+  （只用实际响应构造第二轮：真实 assistant 原文含 reasoning、真实 `tool_call_id` 关联固定结果，工具场景第二轮移除
+  `tools`/`tool_choice`/`parallel_tool_calls`）、`compat_material_refs`/`link_problems`/`verify_material`。
+  固定假工具：`get_weather` → `{"city":"Beijing","marker":"SMS_WEATHER_OK_27","temperature_c":23}`；thinking 两问固定
+  `RESULT=437`/`RESULT=438`；first round 只允许 user 消息（静态预填 tool call 即拒绝）。
+- driver/fixture 选择：`fixtures.py` 的 legacy fixture 跳过 tools/thinking（未知能力仍拒绝），
+  `backend_cases.CaseExecutor` 增 `compat`/`compat_variant`：`cap:<feature>` case 交给 compat 路由，无 compat 驱动时记
+  `unknown`（带问题），既有 load/infer/envelope/cancel/stop/reload 与 `cap:chat|vision` 不变。
+- 验证（RED→GREEN）：新增 `tests/test_chat_compat_acceptance.py`（15 项 A08）先失败（`chat_compat` 不存在），实现后通过；
+  全量 `pytest tests -m 'not thor' -q`（Python 3.12.11）→ **1194 passed、1 skipped、1 deselected**（41.64 s）；
+  失败 12 项与 CT06 基线逐项相同（冻结报告日期过期的既有失败）；`ruff`、`run.py --check-config`、`git diff --check` 通过。
+- 覆盖要点：transport=compat 与 rounds=2 的闭集校验；缺 transport/scenario/SSE aggregator 与非空证据目录拒绝；
+  fixture 摘要对任何字段与期望变化敏感；第二轮随上游 id 变化（不静态填）；thinking 保留 reasoning 与固定追问；
+  两轮原始字节与 usage/finish_reason 落盘；删除第二轮或改 id 后重算 hash 仍被 `link_problems`/`verify_material` 发现；
+  internal execution operation 闭集与 `schemas/control-v1.json` 未变。
+- 未完成项（不宣称已验证）：真实网关/真机两轮与 SSE 聚合（CT08 的 aggregator/evaluator、CT10 候选部署）；
+  `run --suite candidate` 的 CLI 与 `lab-chat-report-v1` 属 CT08；27B 新 profile 策略与 `effort_values` 仍待 CT10。
 
 ### CT08 SSE、evaluator与证据核验
 

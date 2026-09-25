@@ -2098,3 +2098,18 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   前后树为空；受影响五文件 **122 passed**（2 项同为上述日期型既有失败），与开发机一致；GitHub 与目标镜像 ref 相同。
 - 未完成项：A07 硬件列（27B 独立 runtime 实际 argv 与 render 一致、7B 身份/镜像/模板/封套/argv 不变）属 CT10；
   `chat_counting` 的新 profile 策略条目与 `effort_values` 仍 fail-closed，需 CT10 的 D06 实测后登记。
+
+### CT07 兼容多轮fixture/driver（2026-09-25，交付分支 `feature/ct07-compat-fixtures`）
+
+- Python/环境：开发机临时 venv `3.12.11`；无目标机器部署操作。
+- 软件交付：`model_scheduler/acceptance/chat_compat.py`（`CompatScenario`/`CaseSpec`/`CompatTransport`/
+  `CompatAggregator` 端口/`CompatDriver`/`build_second_round`/`compat_material_refs`/`link_problems`/`verify_material`）；
+  `acceptance/fixtures.py` 的 legacy fixture 跳过 tools/thinking（未知能力仍拒绝）；`acceptance/backend_cases.py` 增
+  `compat`/`compat_variant` 路由：`cap:<feature>` case 交给 compat，无驱动记 `unknown`（带问题）。
+  固定假工具与固定结果取自 acceptance §5；internal execution operation 闭集与 `schemas/control-v1.json` 未改。
+- RED→GREEN：新增 `tests/test_chat_compat_acceptance.py`（15 项 A08）在实现前失败（`chat_compat` 不存在）。
+- 检查（exit 0）：全量 `pytest tests -m 'not thor' -q` → **1194 passed、1 skipped、1 deselected**（41.64 s）；
+  `ruff check .`、`run.py --check-config`、`git diff --check`。失败 12 项与 CT06 基线逐项相同（冻结报告日期过期的既有失败）。
+- 提交：`681d59892a59df4c9c5e14c6aba375a36cc8f3b0`（source + tests），文档另行回填。
+- 部署影响：未改动目标部署。
+- 未完成项：真机两轮与真实网关闭环（CT10/CT11）；SSE 聚合器、evaluator 与 `run --suite` CLI 属 CT08。

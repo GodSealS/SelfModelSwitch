@@ -36,7 +36,7 @@ executor 通过正式API施加动作，collector 采集真实实例/资源/事�
 | S05 | 兼容API、blob owner/hash/配额/过期/重启、路径与请求限制、迟到输出不可误用 |
 | S06 | 证据缺失/重复/伪passed/篡改、换设备/candidate、过期/未来时间、evaluator缺失 |
 | B:<model>:load/infer/envelope/cancel/stop/reload | 每个模型执行全部六类真实场景，至少3次独立冷启动及3轮完整重载 |
-| B:<model>:cap:<capability> | 每项声明能力实际消费专用输入，检查协议/shape/有限值/范围和执行设备 |
+| B:<model>:cap:<capability> | 每项声明能力实际消费专用输入，检查协议/shape/有限值/范围和执行设备；tools/thinking 走兼容两轮（见下），不用 legacy 单次 execute 顶替 |
 | O01 | 至少1800秒所有模型真实请求、切换、等待、取消；最终队列/lease/session为空且实例停止 |
 | O02 | 模型盘失效/恢复、暂存盘满/不可写、无根盘假目录写入、恢复重hash |
 | O03 | Docker不可达、未知实例/端口、stop超时；UNKNOWN/BLOCKED保预算并health503 |
@@ -47,6 +47,14 @@ executor 通过正式API施加动作，collector 采集真实实例/资源/事�
 case id 语法（P03 固定）：`S01`—`S06`、`O01`—`O06`、`B:<model_id>:<load|infer|envelope|cancel|stop|reload>`、
 `B:<model_id>:cap:<chat|vision|embeddings|rerank>`。必测集合从候选登记集合派生；报告对每个case恰映射一个存在的最终attempt，
 失败attempt永久保留且可追溯，缺case、未知case、重复最终结论、伪造summary一律拒绝。结构合法不等于passed：判定只来自evaluator对原始材料的重算。
+
+**新能力case语法与材料责任（CT07 起）**：`tools`/`thinking` 仍是 `B:<model_id>:cap:<capability>`，但它们是 chat 的细化，
+不是 internal execution operation，因此经公开兼容路由跑两轮（`transport=compat`）：第一轮只含用户消息（不得静态预填 tool call），
+第二轮用**上游实际返回**的 assistant 消息（含 `reasoning_content`）与真实 `tool_call_id` 关联固定 tool 结果；工具场景第二轮去掉
+`tools`/`tool_choice`/`parallel_tool_calls`，只允许固定假工具结果，不执行真实工具、不开子进程。每轮的原始请求/响应字节、
+request_id、usage、finish_reason 与逐文件 digest 都落盘，由 evaluator 从原始材料重算关联（删掉第二轮或改 id 后重算 hash 仍失败）。
+驱动由能力选定：chat/vision 继续 legacy driver 与其封套 fixture，tools/thinking 走 compat driver；没有 compat 驱动时该 case 记
+`unknown`，不得转为 passed。既有 B 生命周期场景不因新能力减少，`L:` 前缀的 lab 附加报告不进入本表必测集合。
 
 S可用可控fake/event/时钟；B/O须真实目标设备，不用mock代替。维护故障只影响本deployment，不制造整机OOM或破坏其他磁盘/容器。
 模型infer成功只说明能力运行及基本输出契约成立，不声称转写/人脸/声纹/视频质量达标。
