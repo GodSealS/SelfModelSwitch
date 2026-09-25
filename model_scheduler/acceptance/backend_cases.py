@@ -23,9 +23,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
+from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from ..evidence_contracts import BACKEND_CASE_MIN_COLD_STARTS, BACKEND_CASE_MIN_RELOAD_ROUNDS
+from . import chat_compat as cc
+from .chat_compat import COMPAT_CAPABILITIES, TRANSPORT_COMPAT
 from .fixtures import FillerSpec, Fixture, FixtureError, boundary_shortfalls, fixtures_for
 from .materials import CaseMaterialSink
 
@@ -52,6 +55,18 @@ class CaseDriver(Protocol):
     def stop(self, model_id: str) -> Mapping[str, Any]: ...
 
     def cleanup(self, model_id: str) -> Mapping[str, Any]: ...
+
+
+class CompatCaseRunner(Protocol):
+    """What the two-round compat driver offers the B layer (CT07).
+
+    Tools and thinking are chat features of the public route, so their case is
+    not an `execute` of an internal execution operation: the driver runs its own
+    two rounds and reports what it saw.
+    """
+
+    def run_case(self, *, model_id: str, capability: str, variant: str,
+                 directory: Path) -> Mapping[str, Any]: ...
 
 
 def _utc(clock) -> str:
@@ -184,12 +199,18 @@ class CaseExecutor:
     def __init__(self, driver: CaseDriver, *, clock=None, collector: CaseMaterialSink | None = None,
                  cold_starts: int = BACKEND_CASE_MIN_COLD_STARTS,
                  reload_rounds: int = BACKEND_CASE_MIN_RELOAD_ROUNDS,
-                 filler_of: Mapping[str, FillerSpec] | None = None) -> None:
+                 filler_of: Mapping[str, FillerSpec] | None = None,
+                 compat: CompatCaseRunner | None = None,
+                 compat_variant: str = "json-hot") -> None:
         if cold_starts < BACKEND_CASE_MIN_COLD_STARTS:
             raise BackendCaseError("the acceptance minimum is three independent cold starts")
         if reload_rounds < BACKEND_CASE_MIN_RELOAD_ROUNDS:
             raise BackendCaseError("the acceptance minimum is three full reload rounds")
+        if compat_variant not in cc.VARIANTS:
+            raise BackendCaseError(f"the compat variant must be one of {', '.join(cc.VARIANTS)}")
         self.driver = driver
+        self.compat = compat
+        self.compat_variant = compat_variant
         self._clock = clock if clock is not None else _SystemClock()
         self.collector = collector
         self.cold_starts = cold_starts
@@ -226,12 +247,63 @@ class CaseExecutor:
             attempts.append(self._attempt(model_id, f"B:{model_id}:reload", round_index, "reload",
                                           lambda: self._reload_once(model_id)))
         for capability in capabilities:
+            if capability in COMPAT_CAPABILITIES:
+                # A chat feature never runs through the internal execution
+                # surface: the compat route owns its two rounds (CT07).
+                attempts.append(self._compat_capability(model_id, capability))
+                continue
             capability_fixture = by_capability[capability]
             attempts.append(self._attempt(model_id, f"B:{model_id}:cap:{capability}", 1, "capability",
                                           lambda fixture=capability_fixture: self.driver.execute(
                                               model_id, fixture.payload),
                                           fixture=capability_fixture, capability=capability))
         return tuple(attempts)
+
+    def _compat_capability(self, model_id: str, capability: str) -> Attempt:
+        """One `cap:<feature>` case, handed to the compat route.
+
+        Without the compat runner the case stays `unknown`: a chat feature is
+        never served by the legacy driver, and an unproven case is never a pass.
+        """
+        case_id = f"B:{model_id}:cap:{capability}"
+        started_utc = _utc(self._clock)
+        started = self._clock.monotonic()
+        directory = self.collector.begin_case(case_id, attempt=1) if self.collector is not None else None
+        facts: dict[str, Any] = {"capability": capability, "transport": TRANSPORT_COMPAT}
+        problems: list[str] = []
+        failure: str | None = None
+        status = "unknown"
+        if self.compat is None:
+            problems.append(f"no compat driver: {capability} is served by the two-round compat route")
+        elif directory is None:
+            problems.append("the compat route needs a material sink for its raw rounds")
+        else:
+            try:
+                result = dict(self.compat.run_case(model_id=model_id, capability=capability,
+                                                   variant=self.compat_variant,
+                                                   directory=directory / "compat"))
+            except Exception as exc:  # noqa: BLE001 - a refusal is material, not a crash
+                failure = str(exc)
+                status = "failed"
+            else:
+                status = str(result.get("status", "unknown"))
+                problems = [str(item) for item in result.get("problems", ())]
+                failure = None if result.get("failure") is None else str(result["failure"])
+                facts.update({key: value for key, value in result.get("facts", {}).items()})
+                if status == "passed" and problems:
+                    status = "unknown"
+                    problems.append("the compat runner reported passed with unresolved problems")
+                elif status not in STATUSES:
+                    problems.append(f"the compat runner reported the unknown status {status!r}")
+                    status = "unknown"
+        if self.collector is not None:
+            if failure is not None:
+                self.collector.record_failure(stage=case_id, error=failure,
+                                              detail={"attempt": 1, "problems": problems})
+            self.collector.end_case(status=status, facts=facts, failure=failure, problems=tuple(problems))
+        return Attempt(case_id=case_id, attempt=1, status=status, started_utc=started_utc, ended_utc=_utc(self._clock),
+                       duration_seconds=self._clock.monotonic() - started, facts=facts, failure=failure,
+                       problems=tuple(problems))
 
     # -- the official-API sequences ---------------------------------------
 

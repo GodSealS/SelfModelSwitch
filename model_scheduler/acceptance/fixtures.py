@@ -27,6 +27,9 @@ import zlib
 from typing import Any, Mapping, Sequence
 
 CAPABILITY_FIXTURES = ("chat", "vision", "embeddings", "rerank")
+# CT07: tools and thinking are served by the two-round compat route
+# (`acceptance/chat_compat.py`), never by one of these legacy fixtures.
+COMPAT_CAPABILITIES = ("tools", "thinking")
 MAX_EMBEDDING_BATCH = 256
 MAX_RERANK_DOCUMENTS = 256
 FILLER_SEED = 1234
@@ -155,6 +158,8 @@ def fixtures_for(model_id: str, capabilities: Sequence[str], envelope, *,
         if capability in FORBIDDEN_FIXTURE_KINDS:
             raise FixtureError(f"{model_id}: {capability!r} is not an acceptance capability: video/audio quality is "
                                "never claimed by this plan")
+        if capability in COMPAT_CAPABILITIES:
+            continue  # the compat route owns it: a legacy fixture must never stand in for a two-round dialogue
         if capability not in CAPABILITY_FIXTURES:
             raise FixtureError(f"{model_id}: no fixture is defined for capability {capability!r}")
         if capability in ("chat", "vision") and filler is None:
