@@ -2382,3 +2382,39 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   用新配置重放"7B → 请求 27B → 回切 7B"：切换后 7B 必须是 `unloaded` 且容器确实已停（账本与现场一致）、回切先驱逐 27B 再冷加载 7B、
   不得出现 503 级联或 `error`；完成后恢复基线。**本轮两次权限提示超时，未执行**（非用户拒绝）。
 - 说明：预检发现的冻结参数问题（27B 输出上限 1024、read-idle 60 s）仍待随本次重冻一并调整后再跑候选 suite。
+
+### CT10b 修复完成并在真机验证（2026-09-27，提交 `fd7f01e` + `e006a24`）
+
+- 两个缺陷（同一条链）：
+  1. **登记谎称可共存**（策略漏洞）：7B 预留 6.1 GB + 27B 29 GB = 35.1 GB ≤ 预算 50 GB ⇒ 加载 27B 无缺口 ⇒ **从不驱逐**；运行时单实例语义在账本背后停掉旧容器 ⇒ 7B 停在
+     READY + 陈旧实例 ⇒ 计数 503 ⇒ 按 K4 记 `error`。
+  2. **驱逐路径本身是坏的**（代码缺陷）：A 之后缺口出现、驱逐**首次**被触发，`eviction_policy.candidates()`
+     （`model_scheduler/eviction_policy.py:33`）从**原始 spec** 读 `pinned`/`evictable`/`priority`，而 v2 的 `ModelSpec` 没有这些属性 ⇒
+     `AttributeError: 'ModelSpec' object has no attribute 'pinned'` ⇒ 请求 **0 秒 500**。完整回溯（run4）：
+     `app.py:565 → scheduler.py:177 → scheduler.py:211 → eviction_policy.py:48 → eviction_policy.py:33`。
+- 修复：
+  - A `fd7f01e`：`model_budget_bytes` 50 GB → **32 GB**（> 单模型最大预留 29 GB，< 两者之和 35.1 GB）。
+  - B `e006a24`：`EvictionPolicy.candidates()` 按 P19 改为从 `book.ledger` 读角色（v1/v2 同一来源，与 `scheduler._model_status`
+    的既有约定一致）；新增 RED 用例 `tests/test_eviction_policy.py::test_the_policy_reads_the_roles_from_the_ledger_not_the_raw_spec`
+    （复现的就是生产同一条 `AttributeError`），修后转绿。
+- 开发机验证：全量 `pytest tests -m 'not thor' -q` → **1245 passed、1 skipped、1 deselected、12 failed**（与 CT06 基线逐项相同）；
+  `ruff check .` 通过；`test_eviction_policy + test_scheduler_lifecycle + test_registry` 102 passed。
+- **真机验证（目标 checkout `e006a24`；证据 `/home/jtzn/self-model-switch-evidence/ct10b-a-20260926T111451Z/`，
+  脚本 sha256 `18a8049c…`，`run3`/`run4`/`run5` 各有 `replay.json` 与日志）**：
+
+  | 步骤 | 账本 | 容器 | 请求 |
+  |---|---|---|---|
+  | baseline-cold | 两模型 `unloaded` | 无 | — |
+  | 7B 加载 | 7B `ready` gen1 | 仅 7B | `chat_7b` **200**（10.9 s） |
+  | 请求 27B | **7B `unloaded` gen1**、27B `ready` gen1 | 仅 27B | `chat_27b` **200**（60.8 s） |
+  | 回切 7B | **7B `ready` gen2**、**27B `unloaded` gen1** | 仅 7B | `chat_7b_again` **200**（18.2 s） |
+
+  断言：`eviction_is_a_book_operation` true/true/true、`switch_back` 全 true、无 503、无 `error`；恢复基线后 `restored` 两项 true 且无残留容器。
+- 过程性发现（一并记录）：
+  - **run3 的暂存 bug 反而验证了身份校验**：只把 27B 换成候选 cmd 时，7B 带基线 `config-sha256` 标签被 K4 身份校验**正确拒绝**
+    （该模型 `error`、而其容器仍在跑）——说明"随便一个容器"不会被接受。
+  - **失败加载 + 活容器会卡死部署**：`error` 的模型不可被驱逐（`begin_eviction`/`freeze_for_switch` 都要求 READY），而它的容器仍占内存 ⇒
+    其它模型一直加载不了，直到 900 s 队列超时（run3 的 `chat_27b` 504）。恢复路径应能回收"失败但仍在跑"的实例——记为 CT10 后续加固项。
+  - 启动 v2 需要站点身份（`SELFMODEL_SWITCH_DEPLOYMENT_ID=sms-orin-lab2`、`SELFMODEL_SWITCH_SWAP_CONTROL_URL=http://127.0.0.1:8080`），
+    缺失即 fail-closed；本次重放脚本已按此启动。渲染里的 `${PORT}` 是 llama-swap 宏，暂存时按各模型已声明端口替换。
+- 边界：本页只记"受管切换/驱逐已修并在真机通过"；候选 suite（A 列、工具/思考两轮、计数身份、报告）**仍未运行**，CT10 不得宣称通过。
