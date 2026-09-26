@@ -2363,3 +2363,22 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - B 的定位随之修正为**恢复体验**（非根因）：`acquire` 面对"READY 且实例已消失"时，除等待/报错外应能给出可恢复的拒绝（例如引导一次显式卸载/冷加载），
   而不是让调用方在计数阶段才拿到 503。此项与用户裁定的"切换后旧思考链丢失可接受、执行中禁止切换可接受"一致，留待 CT10 修复后再评估是否必要。
 - 结论（本轮交付）：**(a) 的修复 = A（登记真话化 + 重冻 + 硬件重放验收）**；B 不在本轮实现，理由与设计取舍已记录在案。
+
+### CT10b/A 已落地（2026-09-26，提交 `fd7f01e`，仓库侧一致；硬件重放待做）
+
+- 改动（`plan/tool-calling-and-reasoning/ct09-candidate/`，5 个文件、13 行）：`scheduler-v2.json` 的
+  `resources.model_budget_bytes` 50 GB → **32 GB**（> 单模型最大预留 29 GB，< 6.1+29=35.1 GB ⇒ 任意跨模型加载必须先做账本驱逐）；
+  随之重渲染 `manifest.json` / `llama-swap.yaml`（只有 `config-sha256` 标签与 `config_sha256` 变，配置摘要
+  `f3d22fe8…` → **`7873775a…`**）；`site-input.json` 的两个模型 `launch_argv` 同步为新 manifest 的 argv（argv 内容本身未变，只有其中的
+  config 标签），并把 `freeze.json.lab_input.sha256` 更新为新站点输入摘要 **`f2358d327ab22f1a…`**。
+- 记录字段未受影响：`template_hashes`/`timeouts`/`request_limit`/`budget_caps`/`models.*`/`rollback`/`exceptions` 全部不变
+  （内存预算不在冻结记录里），`frozen_at_utc` 与 `code_sha` 保持 CT09 历史值——本记录仍按"历史冻结"语义被测试引用。
+- 验证（开发机，Python 3.12.11）：渲染幂等（输入即输出，`render_lab` 重渲染与提交产物**字节相同**）；
+  `pytest tests/test_ct09_candidate.py tests/test_chat_freeze.py` **15 passed**；
+  全量 `pytest tests -m 'not thor' -q` **1244 passed、1 skipped、1 deselected、12 failed**（失败与 CT06 基线逐项相同：
+  `test_deploy_render` 2 / `test_preflight_v3` 6 / `test_verify` 4）；`ruff check .`、`run.py --check-config` 通过。
+- 提交与远端：`fd7f01e`（分支 `feature/ct09-freeze-candidate`）已推 GitHub 与目标镜像。
+- **待做（硬件重放验收，本轮的下一步）**：把目标 checkout 同步到 `fd7f01e` → 在目标机复核渲染字节一致 →
+  用新配置重放"7B → 请求 27B → 回切 7B"：切换后 7B 必须是 `unloaded` 且容器确实已停（账本与现场一致）、回切先驱逐 27B 再冷加载 7B、
+  不得出现 503 级联或 `error`；完成后恢复基线。**本轮两次权限提示超时，未执行**（非用户拒绝）。
+- 说明：预检发现的冻结参数问题（27B 输出上限 1024、read-idle 60 s）仍待随本次重冻一并调整后再跑候选 suite。
