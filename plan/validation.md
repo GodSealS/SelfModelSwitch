@@ -2241,3 +2241,14 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   后崩溃；(b) 无预算请求触发了既有生命周期状态迁移（实例身份/generation 与期望不符）使模型进入 error 并阻塞 admission。
   区分实验（须在可恢复窗口内、留回滚输入）：单发一个无预算请求到已恢复的基线服务并读 `state`/错误明细，同时核对
   CT02 `29a894f5…` 的"缺省上限 7B=4096/27B=1024 精确耗尽"证据在**候选 code_sha** 上是否仍成立。
+- **假设 (a) 已被代码证据否定（2026-09-26）**：`app.py:590` 在 v2 模型上以 `dispatch_payload = prepared.decoded_body()`
+  转发，`prepare_chat`（含 `DEFAULT_OUTPUT_BUDGET=4096` 与封套裁剪）的规范化体确实进入上游请求；因此 `none-default`
+  的 503 不是"未注入默认预算"。
+- **新证据**：候选 llama-swap 日志对**两个模型**都记录健康检查通过（7B 10.3 s、27B 21.2 s）后紧接
+  `process exited but not StateStopping, current state: ready`——即容器进程在 llama-swap 未请求停止的情况下自行退出；
+  服务随后按实例缺失拒绝（503 `Service is not ready`），调度器侧 `state=error`/admission 阻塞。`dmesg`/`journalctl -k`
+  未显示 OOM 击杀记录（受 dmesg 可读性限制，非决定性）。剩余假设：(i) 实例生命周期/所有权冲突（停止动作未经过
+  llama-swap，故其日志记为"非 StateStopping"）；(ii) 容器内部崩溃（llama.cpp abort 类）而内核无记录。
+- **下一步（决定性实验，须留回滚输入）**：(1) 复跑时先 `docker events`/`docker logs` 或在移除 `--rm` 的情况下保留容器日志，
+  以区分"被杀"与"自崩"；(2) 只跑 D02 的受控探针，观察退出是否紧随某个具体请求；(3) 在调度器日志中打开更详细级别或读取
+  `/api/status` 的 operation/error 历史，确认是否有调度器发起的停止。修复须回开发机 TDD、全量回归、重冻后重跑。
