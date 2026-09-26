@@ -2300,3 +2300,28 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   （应触发重载或返回可重载的拒绝）；(4) 复核 llama-swap 与直接 docker 停止的所有权：`llama-swap.lab4.json` 的
   `cmd: docker run --name sms-sms-orin-lab2-…` 表明容器由 llama-swap 拥有，而调度器用 `model_runner.docker_stop_argv`
   直接 docker 停止——两条所有权必须统一或让外部代理可感知（这是本现象的结构性来源）。
+
+### CT10 真机预检：27B 工具调用与思考（2026-09-26，直连模型，**非** suite 通过）
+
+- 目的与边界：CT10 候选 suite 仍被调度器切换缺陷阻塞（见上），因此先做**直连模型**真机预检——用冻结的候选容器命令
+  （`llama-cpp-chat-features-4bc272f` / `llama-cpp-chat-features-v1`，argv 末尾 `--jinja --reasoning-format deepseek`）在目标起 27B 实例
+  （端口 10003；渲染里的 llama-swap 宏 `${PORT}` 替换为该部署已声明的端口，其余 token 与冻结渲染逐字相同），再用交付自带的
+  `HttpCompatTransport` + `CompatDriver` + `evaluate_case` 回放**冻结 fixture**（重建 fixture 集摘要 `cb8544ca…` 与 `freeze.json` 一致）。
+  本预检**不含**计数/封套/报告，**不是** CT10 suite 结果；A 列与 `needs_candidate` 均未关闭。
+- 证据目录（目标机）：`/home/jtzn/self-model-switch-evidence/ct10-precheck-20260926T100059Z/`——`realcheck.py`（sha256 `72f8f911…`）、
+  `resume.py`（sha256 `db6d7477…`）、各案例 `round-*/request.json`/`response.json`/`response.raw`、`resume/resume.json`、
+  `diagnostic-tools-sse-widened.{request.json,raw}`；容器 `sms-sms-orin-lab2-qwen36-27b`（候选标签，`config-sha256=f3d22fe8…`）。
+- 结果（6 个冻结 fixture，**3 passed / 3 failed**）：
+  | 用例 | 变体 | 结果 | 依据 |
+  |---|---|---|---|
+  | `B:qwen36-27b:cap:tools` | json-hot | **pass** | round-1 `finish_reason=tool_calls`、`get_weather({"city":"Beijing"})`、reasoning 170 字符；两轮后命中固定 marker |
+  | `L:qwen36-27b:tools-thinking` | json-hot | **pass** | 工具轮 reasoning 非空、第二轮历史逐字段回传、最终 marker 命中 |
+  | `L:qwen36-27b:tools-thinking` | sse-hot | **pass** | 同上；流式聚合后一致 |
+  | `B:qwen36-27b:cap:tools` | sse-hot | fail | 流式轮把输出预算全部用于思考并按 `length` 截断，未产出工具调用；把 `max_tokens` 放宽到 2048 的**诊断**仍为 `length`、仍无工具调用（诊断不计入判定） |
+  | `B:qwen36-27b:cap:thinking` | json-hot | fail | 传输层 status 0：非流式长答案超过冻结 read-idle 60 s，客户端断开（容器日志 `srv stop: cancel task`、`n_tokens=1171`）——**冻结超时**问题，不是模型拒答 |
+  | `B:qwen36-27b:cap:thinking` | sse-hot | fail | 第二轮 `finish_reason=stop`，内容以 `RESULT=438` 结尾但**不完全等于**该 marker（判定要求逐字） |
+- 结论（CT10 的输入）：27B 在候选 runtime 下**确实会调工具并带 reasoning**（含"工具+思考组合"的 json 与 sse 各一例通过）；但当前冻结的 site 参数对该模型不可用——
+  27B 输出上限 1024（放宽到 2048 亦不解决）不足以让它在**流式**工具轮完成调用，read-idle 60 s 不足以等非流式长答案（容器实测 4.56 tok/s）。
+  这些属**冻结参数**问题（`budget_caps`/`timeouts`），修 CT10 时必须随候选切换一起重冻，不能沿用旧摘要；marker 逐字不匹配属模型侧遵从性，验收里应如实记为失败而不是放宽判定。
+- 部署影响与最终状态：仅一次临时同名同标签直连实例；预检结束已 `docker stop`（`--rm` 自行移除），`docker ps` 为空、
+  `/api/status` 两模型 `unloaded`；未重启调度器、未改运行部署、未改任何冻结文件。
