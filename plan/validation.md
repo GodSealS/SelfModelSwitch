@@ -2274,7 +2274,23 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   `model_scheduler/model_runner.py:172`），因此 llama-swap 只能记录 `<model> process exited but not StateStopping`。
   复现中观察到的一致性缺口：7B 容器已被停止（`docker ps` 无该容器）而 `/api/status` 仍报 7B `state=ready`/`generation=1`，
   随后对该模型的请求在计数阶段失败（503 `The input could not be counted against the envelope`）并把该模型置为 `state=error`。
+- **决定性证据（2026-09-26 复核复现材料，`ct10b-coresident-20260926T042824Z/`）**：`docker-events.log` 为
+  `kill 7B`(t=1790396906) → `die`/`destroy` → `create 27B`(t=1790396907) → `start`(t=1790396908)，即"先停 7B、一秒后
+  创建 27B"的**受管驱逐切换次序**（非 OOM：OOM 只会发生在 27B 加载中/之后，不会早于其创建）；`snapshots.txt` 内存列同向
+  （before：used 11/free 18/available 30 → after：used 28/free 1/available 31GB），说明 27B 确实需要 7B 让出的内存。
+  此后四次快照（跨度 ~50 s）7B 始终 `state=ready`/`generation=1`，而容器列表只剩 27B；再接 7B 请求 → 503
+  `The input could not be counted against the envelope` → 7B `state=error`。
+- **已排除**：内核 OOM（次序 + `dmesg` 无记录）；`unfreeze_switch` 复活（`model_registry.py:378` 只在 `state is READY and
+  operation_id is None` 时清 admission 位，不可能把已停止模型写回 READY）；多调度器（目标仅 pid 348356，账本干净）；
+  llama-swap 自身停机（复现用基线 `llama-swap.lab4.json` 为 `router: null`、`ttl: 3600`，无组内互斥/换出语义）。
+- **剩余假设（下一步判据）**：驱逐的停止完成但账本写回缺失——即 `_finish_eviction`（`scheduler.py:424`）中
+  `book.stopped(operation, now)` 抛 `StaleOperation` 被 `_emit_writeback_rejection("stop", …, "stale_operation")` 吞掉
+  （事件在 `scheduler.py:823`），或停止由 `begin_cleanup`（READY/ERROR→EVICTING，`model_registry.py:387`）之类路径发起而
+  其完成路径与 `_finish_eviction` 不同。判据：目标上重跑同一驱逐，取事件汇（`runtime.py:299` 注入的 `event_sink`）输出，
+  看是否出现 `writeback_rejected`/`stop`；同时记录 `/api/status` 与 `docker ps` 的配对快照。
 - **下一步最小复现线索（开发机，TDD 起点）**：(1) 用 `Book`+`ModelScheduler` 的离线夹具断言"驱逐成功后账本与实例同时离开 READY"
-  （`book.evicted`/停止确认与 `runtime.state`、`generation`、`instance` 的同步）；(2) 断言停止确认缺失或失败时模型**不得**
-  保持 `ready` 可被计数；(3) 断言计数失败把模型置为 error 之前的判别（实例缺失应给出可重载的拒绝或触发重载，而不是把
-  模型永久置错）；(4) 复核 llama-swap 与直接 docker 停止的所有权是否应统一（本次现象说明两条停止路径会让外部代理的账本失真）。
+  （停止确认与 `runtime.state`/`generation`/`instance` 同步）；(2) 断言停止确认缺失、失败或写回被拒时，模型**不得**保持
+  `ready` 且可被计数（此刻应可重载，而不是把请求送进计数）；(3) 断言实例缺失时的计数失败不会把模型永久置为 `error`
+  （应触发重载或返回可重载的拒绝）；(4) 复核 llama-swap 与直接 docker 停止的所有权：`llama-swap.lab4.json` 的
+  `cmd: docker run --name sms-sms-orin-lab2-…` 表明容器由 llama-swap 拥有，而调度器用 `model_runner.docker_stop_argv`
+  直接 docker 停止——两条所有权必须统一或让外部代理可感知（这是本现象的结构性来源）。
