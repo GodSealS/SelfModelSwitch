@@ -2,7 +2,7 @@
   "schema_version": 1,
   "code_sha": "c1fe68e2eb522155bbe2f9e10624785e66849b9e",
   "lab_input": {
-    "path": "/home/jtzn/self-model-switch-evidence/<stamp>/site-input.json",
+    "path": "/home/jtzn/self-model-switch-evidence/ct10-freeze-20260926T161959Z/site-input.json",
     "sha256": "dba792dc1b246adf0239ab691ea99a501d538ca2f36e8e2521117d2593099315"
   },
   "policy_source_sha256": "ba2544238735e4032d2128d949dcff16932b3aa263080771ae059e7ab3ab3085",
