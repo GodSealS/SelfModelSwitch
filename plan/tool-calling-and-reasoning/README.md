@@ -475,8 +475,8 @@ CT10子项（依赖顺序；父项验收全集不变，未全部通过不得进�
 | 子项 | 交付 | 依赖 | 状态 |
 |---|---|---|---|
 | CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | software_verified（`3b00e226…`，前两片 `ac98b22`/`fee17ef`；本地全量 1240 passed；端到端 22 用例全 passed、实际 35 请求=冻结下限；详见 validation CT10a） |
-| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | in_progress：重冻已完成（`ct10-candidate/freeze.json` digest `46bd7db2…`、site `fac9a43e…`、`code_sha=5b4e5dc…`，其余冻结值与 CT09 逐项相同）；待候选切换与 probe |
-| CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | pending |
+| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | blocked：切换与两次 probe 均已执行（第1轮=27B策略未登记，第2轮=7B 无预算默认未受界致 7B `state=error` 并级联 503，exit 3）；已按计划停止候选并恢复基线；待开发机修复缺陷后重冻重跑（详见 validation CT10b/CT10c） |
+| CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | in_progress：策略已登记并重冻（`3aee26ec`/site `d8b26be2…`/记录 `65a5a644…`）；D06 的 effort 语义仍需候选复跑测量（登记为 fail-closed 空集），复跑未通过前不得视为完成 |
 | CT10d | candidate suite 运行、A01—A11 硬件项取证、validation 材料索引与状态回填 | CT10c | pending |
 
 

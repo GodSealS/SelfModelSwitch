@@ -2197,3 +2197,38 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - 未完成项（CT10 内）：CT10b 目标候选切换与 `probe --phase candidate`（前置：按 runner 提交重新冻结 site
   `expected_sha` 与 `freeze.json` 的 `code_sha`）、CT10c 27B 策略登记与再次重冻、CT10d 真机 suite 运行与 A01—A11 取证。
   本记录不含任何真机或网关证据。
+
+### CT10b/CT10c 候选切换、探测与27B策略登记（2026-09-25/26，进行中，当前 blocked）
+
+- 源码SHA：`5b4e5dc2…`（runner）→ `3b2b80e2…`（引擎profile修复）→ `3aee26ec…`（27B策略登记）；记录提交
+  `9b09a5b`/`5208132`/`2c2a3257…`。Python：开发机 `3.12.11`；目标 venv312（3.12.14）。
+- **候选切换（已执行）**：停 LAN 网关（8091 不再监听）、按生命周期停基线调度器（pid 326877）与 llama-swap（pid 16492），
+  证明静默（8090/8080/8091 空闲、无容器、无 llama-server）；随后按冻结配置启动候选。
+  证据：`…/ct10-candidate-20260925T160752Z/{pre-switch.txt,post-switch.txt,llama-swap.log,scheduler.log,deploy/}`。
+- **候选首次启动失败（真实缺陷，已修）**：`AdapterError: profile 'llama-cpp-chat-features-v1' is not the llama.cpp GGUF
+  profile`（`adapters/llama_cpp.py:126`）；llama-swap 亦拒绝仅含 `cmd` 的渲染配置（`proxy uses ${PORT} but cmd does not`），
+  需按基线实例化 `proxy`/`ttl`/`routing`（`cmd` 保持冻结 argv 不变）。修复：`contracts_v2.LLAMA_CPP_PROFILES`（两个 profile
+  同引擎同协议）+ 适配器与协议 fixture 按引擎族校验；提交 `3b2b80e2`，本地全量 1243 passed；重冻 site `6b74ad99…`/
+  记录 `a70676a5…`。目标复核：冻结配置在目标重渲染与已提交 manifest/llama-swap 逐字节相同；27B argv 末尾
+  `--jinja --reasoning-format deepseek`（A07 预检通过）。
+- **candidate probe 第 1 轮**（`…160752Z/probe`，16:32:53Z 起，40/64 请求，exit 3）：D01/D09=passed；D02=failed
+  （unbudgeted default not bounded）；D03—D06=not_run；D07/D08=failed。服务侧请求均 503
+  `The input could not be counted against the envelope` = 27B 新 profile 策略未登记（fail-closed），与 CT09 例外一致。
+- **27B策略登记（CT10c，已交付）**：`POLICY_REGISTRY` 增 `(llama-cpp-chat-features-v1, image, 27B sha)`，与 GGUF 27B 策略
+  逐字段相同（同镜像、同 GGUF 模板、同输出字段；`effort_values` 仍 fail-closed 空集）；提交 `3aee26ec`，本地全量
+  1242 passed（2 项新失败随重冻如实调整：CT09 记录视为历史、CT10 记录须携带新摘要）；重冻 site `d8b26be2…`/
+  记录 `65a5a644…`（提交 `2c2a3257`）。
+- **candidate probe 第 2 轮**（`…164025Z/probe`，02:31:53Z 起，40/64 请求，exit 3）：D01/D09=passed；
+  D02=needs_candidate；D06=failed（各 effort 值 422 `unsupported reasoning_effort`，默认 503）；D03/D04/D05/D07=not_run；
+  D08=failed。策略门已解除；新根因是**7B 进入 `state=error`**：llama-swap 日志
+  `<qwen25vl-7b> process exited but not StateStopping, current state: ready`，其后服务请求均 503
+  `Service is not ready`（admission 阻塞，`usage_unknown_requests=4`）。触发点是无预算默认请求（D02）在本部署上未
+  被有界化，7B 的 llama-server 中断后进入错误态并级联。结论：**候选未通过 candidate probe（exit 3），按计划停止候选、
+  恢复基线**；不得调大封套或换模板求通过。
+- **恢复基线（已执行）**：停候选调度器与候选 llama-swap；以基线配置重启 llama-swap（pid 347092，`llama-swap.lab4.json`）
+  与调度器（pid 347204，`deploy2/scheduler-v2.json`，boot_id `b9551030…`），恢复 LAN 网关（0.0.0.0:8091，pid 347272）；
+  8090/8080/8091 均监听，模型 unloaded；恢复使用当前 checkout 代码（保留已交付预算修复与工具）。
+- 材料索引：候选证据 `…/ct10-candidate-20260925T160752Z/`、`…/ct10-candidate-20260925T164025Z/`（site/probe/日志）；
+  探针材料 `probe.json` + `cases/D01—D09`（含每个 503/422 的原始响应）。
+- 未完成项（不得宣称通过）：7B 无预算默认有界化缺陷需回开发机定位修复后重冻重跑（CT10b 重开）；其后 CT10d 的
+  candidate suite、A01—A11 硬件项与 `needs_candidate` 关闭仍未完成。本记录不含任何"通过"结论。
