@@ -2267,3 +2267,14 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - **待开发机主线修复（CT10b 重开）**：受管切换/回切路径——A→B 切换后再 A 的加载失败（错误语义落在
   counting/envelope）并把 A 置为 error。修复须 TDD、全量回归、重冻、目标同 SHA 重跑 candidate probe；在 probe 全 passed
   之前 CT10 不得宣称任何通过，A01—A11 硬件项与 `needs_candidate` 关闭顺延至 CT10d。
+- **机制与代码区域（2026-09-26，静态定位，尚未改码）**：`scheduler._establish_or_advance_switch`（`model_scheduler/scheduler.py:207`）
+  在 `_load_deficit` 不足时用 `EvictionPolicy.choose(..., include_busy=True)` 冻结驱逐集（`book.freeze_for_switch` → `begin_eviction`），
+  再由 `_run_eviction`/`_finish_eviction`（`scheduler.py:416/424`）逐个 `backend.stop(operation, deadline)`；
+  v2 lab 路径的停止是**直接 docker 停止**（`model_runner.docker_stop_argv` = `docker stop --time 30 sms-<deployment>-<model>`，
+  `model_scheduler/model_runner.py:172`），因此 llama-swap 只能记录 `<model> process exited but not StateStopping`。
+  复现中观察到的一致性缺口：7B 容器已被停止（`docker ps` 无该容器）而 `/api/status` 仍报 7B `state=ready`/`generation=1`，
+  随后对该模型的请求在计数阶段失败（503 `The input could not be counted against the envelope`）并把该模型置为 `state=error`。
+- **下一步最小复现线索（开发机，TDD 起点）**：(1) 用 `Book`+`ModelScheduler` 的离线夹具断言"驱逐成功后账本与实例同时离开 READY"
+  （`book.evicted`/停止确认与 `runtime.state`、`generation`、`instance` 的同步）；(2) 断言停止确认缺失或失败时模型**不得**
+  保持 `ready` 可被计数；(3) 断言计数失败把模型置为 error 之前的判别（实例缺失应给出可重载的拒绝或触发重载，而不是把
+  模型永久置错）；(4) 复核 llama-swap 与直接 docker 停止的所有权是否应统一（本次现象说明两条停止路径会让外部代理的账本失真）。
