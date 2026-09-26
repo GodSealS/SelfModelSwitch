@@ -29,3 +29,25 @@ def test_policy_chooses_low_heat_unpinned_idle_prefix() -> None:
 def test_policy_never_returns_a_partial_prefix_below_deficit() -> None:
     book = _book()
     assert EvictionPolicy(book, max_evictions=2).choose(250, now=1) == []
+
+
+class _RolesMissing:
+    """The v2 shape: a raw registration spec that carries no scheduler roles (P19).
+
+    A v2 `ModelSpec` has no `priority`/`pinned`/`evictable` at all, so a policy that reads
+    the roles off the raw spec raises `AttributeError` on the first eviction a v2
+    deployment actually needs. The ledger is the only correct source.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        raise AttributeError(f"'ModelSpec' object has no attribute {name!r}")
+
+
+def test_the_policy_reads_the_roles_from_the_ledger_not_the_raw_spec() -> None:
+    book = _book()
+    book.specs = {model_id: _RolesMissing() for model_id in book.specs}  # type: ignore[assignment]
+
+    selected = EvictionPolicy(book, max_evictions=2).choose(100, now=1)
+
+    assert [candidate.model_id for candidate in selected] == ["cold"]
+    assert selected[0].priority == book.ledger["cold"].priority

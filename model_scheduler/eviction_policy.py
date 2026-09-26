@@ -27,17 +27,22 @@ class EvictionPolicy:
 
     def candidates(self, now: float, *, include_busy: bool = False) -> list[EvictionCandidate]:
         result: list[EvictionCandidate] = []
-        for model_id, spec in self.book.specs.items():
+        for model_id in self.book.specs:
             runtime = self.book.runtime[model_id]
+            # P19: a v2 registration's raw spec carries no scheduler roles at all, so the
+            # ledger copy is the one source of `pinned`/`evictable`/`priority` — for v1 and
+            # v2 alike. Reading them off the raw spec raises on the first eviction a v2
+            # deployment actually needs.
+            entry = self.book.ledger[model_id]
             if (runtime.state is not State.READY or (runtime.leases and not include_busy) or runtime.admission_blocked
-                    or spec.pinned or not spec.evictable):
+                    or entry.pinned or not entry.evictable):
                 continue
             reserved = self.book.required(model_id)
             heat = self.book.heat(model_id, now)
             # Lower priority/heat and a larger release are preferred.  model_id
             # stabilizes ties so equal clocks make equal decisions.
-            score = (heat + spec.priority) / reserved
-            result.append(EvictionCandidate(model_id, reserved, heat, spec.priority, score))
+            score = (heat + entry.priority) / reserved
+            result.append(EvictionCandidate(model_id, reserved, heat, entry.priority, score))
         return sorted(result, key=lambda candidate: (candidate.score, candidate.model_id))
 
     def choose(self, bytes_needed: int, *, now: float, include_busy: bool = False) -> list[EvictionCandidate]:
