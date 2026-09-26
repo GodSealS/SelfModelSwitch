@@ -2283,11 +2283,17 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - **已排除**：内核 OOM（次序 + `dmesg` 无记录）；`unfreeze_switch` 复活（`model_registry.py:378` 只在 `state is READY and
   operation_id is None` 时清 admission 位，不可能把已停止模型写回 READY）；多调度器（目标仅 pid 348356，账本干净）；
   llama-swap 自身停机（复现用基线 `llama-swap.lab4.json` 为 `router: null`、`ttl: 3600`，无组内互斥/换出语义）。
-- **剩余假设（下一步判据）**：驱逐的停止完成但账本写回缺失——即 `_finish_eviction`（`scheduler.py:424`）中
-  `book.stopped(operation, now)` 抛 `StaleOperation` 被 `_emit_writeback_rejection("stop", …, "stale_operation")` 吞掉
-  （事件在 `scheduler.py:823`），或停止由 `begin_cleanup`（READY/ERROR→EVICTING，`model_registry.py:387`）之类路径发起而
-  其完成路径与 `_finish_eviction` 不同。判据：目标上重跑同一驱逐，取事件汇（`runtime.py:299` 注入的 `event_sink`）输出，
-  看是否出现 `writeback_rejected`/`stop`；同时记录 `/api/status` 与 `docker ps` 的配对快照。
+- **2026-09-26 追加排除（读码 + 全量日志）**：`/api/status` 的模型 `state` 就是账本 `runtime.state.value`（`scheduler.py:1147`，`ready`+有租约才显示 `active`），
+  故快照里的 7B `ready`/`generation=1` 就是账本 READY——若走的是驱逐（`begin_eviction` 要求 READY→EVICTING，`stopped()` 要求 EVICTING→UNLOADED，
+  `failed()` 写 ERROR+admission_blocked，见 `model_registry.py:244/347/406`），账本不可能停在 READY；且该请求随后**能通过准入**并进入计数，
+  进一步排除 EVICTING/ERROR+admission_blocked。复现期 llama-swap（pid 347092，`--config …/llama-swap.lab4.json`，`router: null`、`ttl: 3600`）完整日志只有
+  "监听/两次健康检查/`/running`/**`<qwen36-27b> process exited but not StateStopping`**"，**没有任何 7B 的停止动作**——即停止 7B 的调用不是 llama-swap 自主决策。
+  调度器侧日志只有 4 条 `GET /api/status`（事件汇未接日志）。⇒ 停止是**经控制面发起、但不改账本**的路径：最可能是 `ManagedLifecycle.stop` 在
+  `identity is None` 分支调用的 `adapter.release(model_id, …)`（`backend_control.py:297`；`adapters/llama_cpp.py:457` 文档明说这是"没有已验证实例时的
+  按名卸载"，成功后**不做账本写回**），或恢复/清理路径中的同类调用。
+- **下一步（最小、可直接执行）**：在目标重跑同一"7B→请求 27B（触发驱逐/切换）→回切 7B"序列，同时 (1) 在 `ManagedLifecycle.stop` 的 `identity is None`
+  分支与 `adapter.release` 加临时审计行（或把 `event_sink` 接日志），(2) 每步记录 `/api/status` 的 `models[*].state` + `admission.switch`（`scheduler.py:1193`，
+  含 target/frozen/expires——本轮快照漏采了它）+ `docker ps` 三件套。据此判定是 `release` 还是驱逐写回丢失，再按判据 TDD 修复。
 - **下一步最小复现线索（开发机，TDD 起点）**：(1) 用 `Book`+`ModelScheduler` 的离线夹具断言"驱逐成功后账本与实例同时离开 READY"
   （停止确认与 `runtime.state`/`generation`/`instance` 同步）；(2) 断言停止确认缺失、失败或写回被拒时，模型**不得**保持
   `ready` 且可被计数（此刻应可重载，而不是把请求送进计数）；(3) 断言实例缺失时的计数失败不会把模型永久置为 `error`
