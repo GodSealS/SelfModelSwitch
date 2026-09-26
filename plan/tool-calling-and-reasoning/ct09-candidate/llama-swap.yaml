@@ -6,7 +6,7 @@ models:
       --runtime=nvidia --label io.self-model-switch.deployment=sms-orin-lab2 --label
       io.self-model-switch.runtime=llama-cpp-1 --label io.self-model-switch.profile=llama-cpp-gguf-v1
       --label io.self-model-switch.model=qwen25vl-7b --label io.self-model-switch.mode=lab
-      --label io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776
+      --label io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121
       --publish '127.0.0.1:${PORT}:8080' --mount type=bind,src=/media/jtzn/sandisk-ext4/models,dst=/models,readonly
       sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
       --model /models/qwen25vl-7b-q4/Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf --mmproj
@@ -17,7 +17,7 @@ models:
     cmd: docker run --name sms-sms-orin-lab2-qwen36-27b --init --rm --restart=no --runtime=nvidia
       --label io.self-model-switch.deployment=sms-orin-lab2 --label io.self-model-switch.runtime=llama-cpp-chat-features-4bc272f
       --label io.self-model-switch.profile=llama-cpp-chat-features-v1 --label io.self-model-switch.model=qwen36-27b
-      --label io.self-model-switch.mode=lab --label io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776
+      --label io.self-model-switch.mode=lab --label io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121
       --publish '127.0.0.1:${PORT}:8080' --mount type=bind,src=/media/jtzn/sandisk-ext4/models,dst=/models,readonly
       sms-llama-cpp@sha256:8e572bb99c19defa9218f8c07b7ab30379040f3ead87d64b3e241213597c1bc8
       --model /models/qwen36-27b-q6/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q6_K.gguf

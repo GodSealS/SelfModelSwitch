@@ -1,5 +1,5 @@
 {
-  "config_sha256": "f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776",
+  "config_sha256": "7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121",
   "container_runtime": "nvidia",
   "deployment_id": "sms-orin-lab2",
   "lab_only": true,
@@ -26,7 +26,7 @@
         "--label",
         "io.self-model-switch.mode=lab",
         "--label",
-        "io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776",
+        "io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121",
         "--publish",
         "127.0.0.1:10002:8080",
         "--mount",
@@ -50,7 +50,7 @@
         "--port",
         "8080"
       ],
-      "argv_sha256": "420ac0a2cb87883fe54b67682951547c73cc2d2c08c0a09c949a1bd5795a7efa",
+      "argv_sha256": "d7239a2830bfa08eba129e8a509e643111c0f1f2452cc42dbfedfb054ff5be02",
       "assets": [
         {
           "path": "qwen25vl-7b-q4/Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
@@ -86,7 +86,7 @@
         "--label",
         "io.self-model-switch.mode=lab",
         "--label",
-        "io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776",
+        "io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121",
         "--publish",
         "127.0.0.1:${PORT}:8080",
         "--mount",
@@ -135,7 +135,7 @@
         "--label",
         "io.self-model-switch.mode=lab",
         "--label",
-        "io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776",
+        "io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121",
         "--publish",
         "127.0.0.1:10003:8080",
         "--mount",
@@ -162,7 +162,7 @@
         "--reasoning-format",
         "deepseek"
       ],
-      "argv_sha256": "ffc28ec6ac6a9a76126b8f6cbce10e8f88ad69535a4ce12ec23514d1c537fc87",
+      "argv_sha256": "51b16592ff2bd142e28b5aea38a4a6419dc844e384b618011cb1c0542292892a",
       "assets": [
         {
           "path": "qwen36-27b-q6/Qwen3.6-27B-Fable-Fus-711-UnHeretic-NM-DAU-NEO-MAX-NEO-Q6_K.gguf",
@@ -198,7 +198,7 @@
         "--label",
         "io.self-model-switch.mode=lab",
         "--label",
-        "io.self-model-switch.config-sha256=f3d22fe8c77d2300d023f1130cfc36997589764cc1c2e46ea2d67667c1a78776",
+        "io.self-model-switch.config-sha256=7873775ac6f537979a92839eac30e65a02d8aade7b97d7ad5f0808ea7e34e121",
         "--publish",
         "127.0.0.1:${PORT}:8080",
         "--mount",

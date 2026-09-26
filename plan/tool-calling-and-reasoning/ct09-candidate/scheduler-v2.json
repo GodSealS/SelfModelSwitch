@@ -121,7 +121,7 @@ registration:
     runtime_id: llama-cpp-chat-features-4bc272f
     timeout_seconds: 900
 resources:
-  model_budget_bytes: 50000000000
+  model_budget_bytes: 32000000000
   provider: psutil
   sample_interval_seconds: 1
   sample_max_age_seconds: 2
