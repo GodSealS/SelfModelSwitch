@@ -2232,3 +2232,12 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
   探针材料 `probe.json` + `cases/D01—D09`（含每个 503/422 的原始响应）。
 - 未完成项（不得宣称通过）：7B 无预算默认有界化缺陷需回开发机定位修复后重冻重跑（CT10b 重开）；其后 CT10d 的
   candidate suite、A01—A11 硬件项与 `needs_candidate` 关闭仍未完成。本记录不含任何"通过"结论。
+- **D02 材料细化（2026-09-26，诊断用）**：第 2 轮 D02 对 **两个模型** 的带预算请求（`max_tokens`/`max_completion_tokens`/
+  `n_predict` @32/64）全部 200 且 `finish_reason=length`、`exhausted=true`（预算执行与耗尽证明成立）；**唯一失败的是
+  每个模型的 `none-default`（无预算）请求** → 503 `Service is not ready`；此后所有服务侧请求同一 503。
+  候选侧 `/api/status` 当时显示 7B `state=error`、`total_requests=5`、`usage_unknown_requests=4`，llama-swap 记录
+  7B 进程退出后其健康检查又恢复。两个假设待开发机用材料区分（不得跳过）：(a) 无预算请求在最前沿未被注入有效默认
+  （`DEFAULT_OUTPUT_BUDGET=4096` 仅在内部/policy 路径与计数投影中生效，compat 转发体可能保持原样），导致模型无界生成
+  后崩溃；(b) 无预算请求触发了既有生命周期状态迁移（实例身份/generation 与期望不符）使模型进入 error 并阻塞 admission。
+  区分实验（须在可恢复窗口内、留回滚输入）：单发一个无预算请求到已恢复的基线服务并读 `state`/错误明细，同时核对
+  CT02 `29a894f5…` 的"缺省上限 7B=4096/27B=1024 精确耗尽"证据在**候选 code_sha** 上是否仍成立。
