@@ -2252,3 +2252,18 @@ R36 rev 4.7、aarch64、kernel 5.15.148-tegra）。模型只读校验（候选�
 - **下一步（决定性实验，须留回滚输入）**：(1) 复跑时先 `docker events`/`docker logs` 或在移除 `--rm` 的情况下保留容器日志，
   以区分"被杀"与"自崩"；(2) 只跑 D02 的受控探针，观察退出是否紧随某个具体请求；(3) 在调度器日志中打开更详细级别或读取
   `/api/status` 的 operation/error 历史，确认是否有调度器发起的停止。修复须回开发机 TDD、全量回归、重冻后重跑。
+- **决定性复现与根因（2026-09-26，在当前基线部署上，材料 `ct10b-coresident-20260926T042824Z/` 与
+  `ct10b-repro-20260926T042734Z/`）**：
+  1) 单发序列（预算 32 → 无预算）7B 均 200：预算请求 `finish=length`/`completion_tokens=32`，无预算请求
+     `finish=stop`/`completion_tokens=169`（有界），容器 Up、`state=ready` → **默认预算注入与单模型路径正常**，
+     假设 (a) 及"系统性被杀"均不成立。
+  2) 两模型共驻序列（7B → 27B → 再 7B）复现探针现象：加载 27B 时 `docker events` 记录
+     `kill/die/destroy sms-sms-orin-lab2-qwen25vl-7b` 后 `create/start sms-sms-orin-lab2-qwen36-27b`——即**调度器的受管切换
+     主动停止 7B**（llama-swap 因而记 `process exited but not StateStopping`，不是容器自崩、无 OOM 记录）；随后再次请求 7B
+     → 503 `The input could not be counted against the envelope` 且 7B `state=error`（generation 1，27B 仍 ready）。
+  3) 结论：**切换到另一模型后再切回时，该模型的加载/计数失败并被置为 `error`，admission 随后的阻塞造成探针第 2 轮
+     服务侧 503 级联**；D02 的 `none-default` 只是受此影响的首个失败请求（病因在切换回切路径，不在默认预算）。
+  4) 恢复：重启调度器后两模型回到 `unloaded`/generation 0，服务健康、无 error、无 admission 阻塞。
+- **待开发机主线修复（CT10b 重开）**：受管切换/回切路径——A→B 切换后再 A 的加载失败（错误语义落在
+  counting/envelope）并把 A 置为 error。修复须 TDD、全量回归、重冻、目标同 SHA 重跑 candidate probe；在 probe 全 passed
+  之前 CT10 不得宣称任何通过，A01—A11 硬件项与 `needs_candidate` 关闭顺延至 CT10d。

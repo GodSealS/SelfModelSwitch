@@ -475,7 +475,7 @@ CT10子项（依赖顺序；父项验收全集不变，未全部通过不得进�
 | 子项 | 交付 | 依赖 | 状态 |
 |---|---|---|---|
 | CT10a | `chat_compat run --suite candidate` CLI + `lab-chat-report-v1` + 真实compat HTTP/SSE transport + 卸载/重载端口 + `request_limit` 预检与退出码 | CT08、CT09 | software_verified（`3b00e226…`，前两片 `ac98b22`/`fee17ef`；本地全量 1240 passed；端到端 22 用例全 passed、实际 35 请求=冻结下限；详见 validation CT10a） |
-| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | blocked：切换与两次 probe 均已执行（第1轮=27B策略未登记；第2轮=每个模型的无预算 `none-default` 请求 503 `Service is not ready` 并级联，7B `state=error`，exit 3）；带预算请求两模型均 200 且耗尽证明成立；已按计划停止候选并恢复基线；待开发机用区分实验定位（无默认未注入 vs 生命周期状态迁移）后修复、重冻、重跑（详见 validation） |
+| CT10b | 目标候选切换（按生命周期停旧实例、证明静默、按冻结配置启动）与 `probe --phase candidate`（关闭 needs_candidate） | CT10a | blocked（根因已复现）：切换与两次 probe 均执行（exit 3）；当前基线上受控复现证明**受管切换回切失败**——加载 27B 时调度器主动 kill 7B（`docker events`），随后再请求 7B 即 503 且 7B `state=error`、admission 阻塞，探针服务侧 503 级联由此产生；默认预算注入与单模型路径已证正常；待开发机 TDD 修复切换回切路径、全量回归、重冻、目标同 SHA 重跑 probe（详见 validation） |
 | CT10c | 27B `llama-cpp-chat-features-v1` 策略登记（D06实测值）→ 重冻 `freeze.json` → 受影响场景复跑 | CT10b | in_progress：策略已登记并重冻（`3aee26ec`/site `d8b26be2…`/记录 `65a5a644…`）；D06 的 effort 语义仍需候选复跑测量（登记为 fail-closed 空集），复跑未通过前不得视为完成 |
 | CT10d | candidate suite 运行、A01—A11 硬件项取证、validation 材料索引与状态回填 | CT10c | pending |
 
